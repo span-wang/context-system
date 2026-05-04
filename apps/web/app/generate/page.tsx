@@ -1,14 +1,31 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, RefreshCw, ShieldCheck, UploadCloud, Wand2 } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Clipboard,
+  ExternalLink,
+  FileText,
+  RefreshCw,
+  Send,
+  ShieldCheck,
+  UploadCloud,
+  Wand2,
+} from "lucide-react";
 import {
   API_BASE,
+  LAYOUT_API_BASE,
   apiFetch,
   contentTypeLabels,
   ContentType,
   GenerationJob,
+  layoutFetch,
+  LayoutMarkdownDocument,
+  LayoutMode,
+  LayoutTemplatePayload,
   LibraryFile,
+  LibraryFilePreview,
   ReviewMode,
   reviewModeLabels,
   SubjectConfig,
@@ -20,6 +37,7 @@ const generationDraftKey = "context-for-xhs:generation-draft";
 const generationJobKey = "context-for-xhs:last-generation-job";
 const generationJobIdKey = "context-for-xhs:last-generation-job-id";
 const reviewModeKey = "context-for-xhs:review-mode";
+const layoutPromptKey = "context-for-xhs:layout-prompt";
 const reviewModes = Object.keys(reviewModeLabels) as ReviewMode[];
 const activeGenerationStatuses = new Set<GenerationJob["status"]>([
   "pending",
@@ -37,6 +55,11 @@ type GenerationForm = {
   pages: string;
   user_notes: string;
   ragflow_dataset_ids: string;
+  layout_mode_id: string;
+};
+type LayoutPromptDraft = {
+  enabled: boolean;
+  modeId: string;
 };
 type GenerationDraft = {
   mode: GenerationMode;
@@ -53,6 +76,7 @@ const defaultForm: GenerationForm = {
   pages: "10",
   user_notes: "",
   ragflow_dataset_ids: "",
+  layout_mode_id: "knowledge",
 };
 
 function isActiveGeneration(job: GenerationJob) {
@@ -117,6 +141,14 @@ export default function GeneratePage() {
   const [reviewMode, setReviewMode] = useState<ReviewMode>("hybrid");
   const [form, setForm] = useState<GenerationForm>(defaultForm);
   const [subjects, setSubjects] = useState<SubjectConfig[]>([]);
+  const [layoutModes, setLayoutModes] = useState<LayoutMode[]>([]);
+  const [layoutTemplate, setLayoutTemplate] = useState<LayoutTemplatePayload | null>(null);
+  const [useLayoutPrompt, setUseLayoutPrompt] = useState(true);
+  const [layoutMessage, setLayoutMessage] = useState("");
+  const [layoutLoading, setLayoutLoading] = useState(false);
+  const [promptPreview, setPromptPreview] = useState("");
+  const [promptBuilding, setPromptBuilding] = useState(false);
+  const [publishingLayout, setPublishingLayout] = useState(false);
 
   async function loadFiles() {
     const data = await apiFetch<LibraryFile[]>("/api/library/files");
@@ -127,6 +159,15 @@ export default function GeneratePage() {
     const data = await apiFetch<SystemConfig>("/api/system/config");
     setSubjects(data.subjects);
     setForm((current) => normalizeFormSubject(current, data.subjects));
+  }
+
+  async function loadLayoutModes() {
+    const data = await layoutFetch<LayoutMode[]>("/api/v1/modes");
+    setLayoutModes(data);
+    setForm((current) => {
+      if (current.layout_mode_id && data.some((item) => item.id === current.layout_mode_id)) return current;
+      return { ...current, layout_mode_id: data[0]?.id || current.layout_mode_id };
+    });
   }
 
   const closeStream = useCallback(() => {
@@ -188,6 +229,10 @@ export default function GeneratePage() {
   useEffect(() => {
     loadFiles().catch((error) => setMessage(error.message));
     loadSubjects().catch((error) => setMessage(error.message));
+    loadLayoutModes().catch((error) => {
+      setUseLayoutPrompt(false);
+      setLayoutMessage(`排版服务未连接：${error.message}`);
+    });
   }, []);
 
   useEffect(() => {
@@ -199,6 +244,13 @@ export default function GeneratePage() {
       setForm({ ...defaultForm, ...draft.form });
     }
     setReviewMode(readMemory<ReviewMode>(reviewModeKey) || "hybrid");
+    const layoutDraft = readMemory<LayoutPromptDraft>(layoutPromptKey);
+    if (layoutDraft) {
+      setUseLayoutPrompt(layoutDraft.enabled);
+      if (layoutDraft.modeId) {
+        setForm((current) => ({ ...current, layout_mode_id: layoutDraft.modeId }));
+      }
+    }
 
     let cancelled = false;
     const rememberedJob = readMemory<GenerationJob>(generationJobKey);
@@ -238,7 +290,11 @@ export default function GeneratePage() {
       form,
     });
     writeMemory<ReviewMode>(reviewModeKey, reviewMode);
-  }, [form, memoryReady, mode, reviewMode, saveUploads, selected]);
+    writeMemory<LayoutPromptDraft>(layoutPromptKey, {
+      enabled: useLayoutPrompt,
+      modeId: form.layout_mode_id,
+    });
+  }, [form, memoryReady, mode, reviewMode, saveUploads, selected, useLayoutPrompt]);
 
   const selectedTokens = useMemo(
     () =>
@@ -251,9 +307,150 @@ export default function GeneratePage() {
     () => subjects.find((subject) => subject.name === form.subject) || null,
     [form.subject, subjects]
   );
+  const activeLayoutMode = useMemo(
+    () => layoutModes.find((layoutMode) => layoutMode.id === form.layout_mode_id) || null,
+    [form.layout_mode_id, layoutModes]
+  );
 
   function toggleFile(id: string) {
     setSelected((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+  }
+
+  async function loadLayoutTemplate(modeId = form.layout_mode_id) {
+    if (!modeId) {
+      setLayoutMessage("请先选择排版模式。");
+      return null;
+    }
+    setLayoutLoading(true);
+    setLayoutMessage("");
+    try {
+      const data = await layoutFetch<LayoutTemplatePayload>(
+        `/api/v1/modes/${encodeURIComponent(modeId)}/markdown-template`
+      );
+      setLayoutTemplate(data);
+      return data;
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "排版模板加载失败";
+      setLayoutMessage(text);
+      throw error;
+    } finally {
+      setLayoutLoading(false);
+    }
+  }
+
+  async function buildLayoutPrompt(options: { refresh?: boolean } = {}) {
+    if (!form.layout_mode_id) return "";
+    setPromptBuilding(true);
+    setLayoutMessage("");
+    try {
+      const template =
+        options.refresh || layoutTemplate?.modeId !== form.layout_mode_id
+          ? await loadLayoutTemplate(form.layout_mode_id)
+          : layoutTemplate;
+      if (!template) return "";
+      const sourceContent = await collectPromptSourceContent();
+      const prompt = composeLayoutPrompt(template.template, sourceContent);
+      setPromptPreview(prompt);
+      return prompt;
+    } catch (error) {
+      setPromptPreview("");
+      setLayoutMessage(error instanceof Error ? error.message : "提示词拼接失败");
+      return "";
+    } finally {
+      setPromptBuilding(false);
+    }
+  }
+
+  async function collectPromptSourceContent() {
+    const blocks: string[] = [];
+    blocks.push(`【任务信息】`);
+    blocks.push(`学科：${form.subject || "未填写"}`);
+    blocks.push(`类目：${form.category || "未填写"}`);
+    blocks.push(`章节：${form.chapter || "未填写"}`);
+    blocks.push(`内容类型：${contentTypeLabels[form.content_type]}`);
+    blocks.push(`目标页数：${form.pages || "未填写"}`);
+    blocks.push("");
+
+    if (form.user_notes.trim()) {
+      blocks.push("【补充说明】");
+      blocks.push(form.user_notes.trim());
+      blocks.push("");
+    }
+
+    if (mode === "direct" && selected.length) {
+      const previews = await Promise.all(
+        selected.map((fileId) => apiFetch<LibraryFilePreview>(`/api/library/files/${fileId}/preview`))
+      );
+      blocks.push("【素材库资料】");
+      previews.forEach((preview, index) => {
+        blocks.push(`--- 素材 ${index + 1}：${preview.filename}${preview.truncated ? "（已截断预览）" : ""} ---`);
+        blocks.push(preview.text.trim() || "（无可用文本）");
+      });
+      blocks.push("");
+    }
+
+    if (mode === "ragflow") {
+      blocks.push("【RAGFlow 检索要求】");
+      blocks.push(`Dataset IDs：${form.ragflow_dataset_ids || "未填写"}`);
+      blocks.push("生成时请结合后端检索到的资料正文；本预览仅包含检索条件。");
+      blocks.push("");
+    }
+
+    if (mode === "direct" && uploadFiles?.length) {
+      blocks.push("【本次新上传】");
+      const uploadBlocks = await Promise.all(
+        Array.from(uploadFiles).map(async (file, index) => {
+          const text = await readUploadPreview(file);
+          return [`--- 上传 ${index + 1}：${file.name} ---`, text || "（无法在浏览器中预览该文件，提交生成后由后端解析。）"].join("\n");
+        })
+      );
+      blocks.push(uploadBlocks.join("\n\n"));
+      blocks.push("");
+    }
+
+    if (blocks.length <= 8) {
+      blocks.push("【原始资料】");
+      blocks.push("本次未选择素材，请仅生成可复核的结构初稿，并保留未核验提示。");
+    }
+
+    return blocks.join("\n").trim();
+  }
+
+  async function copyPrompt() {
+    const prompt = promptPreview || (await buildLayoutPrompt());
+    if (!prompt) return;
+    await navigator.clipboard.writeText(prompt);
+    setLayoutMessage("完整提示词已复制。");
+  }
+
+  async function publishToLayout() {
+    if (!job?.result?.raw_markdown) return;
+    setPublishingLayout(true);
+    setLayoutMessage("");
+    try {
+      const created = await layoutFetch<LayoutMarkdownDocument>("/api/v1/markdown-documents", {
+        method: "POST",
+        body: JSON.stringify({
+          markdown: job.result.raw_markdown,
+          modeId: form.layout_mode_id || activeLayoutMode?.id,
+          title: job.result.title,
+          source: "context-for-xhs",
+          metadata: {
+            jobId: job.id,
+            subject: job.context.subject,
+            category: job.context.category,
+            chapter: job.context.chapter,
+            contentType: job.context.content_type,
+          },
+        }),
+      });
+      setLayoutMessage(`已发送到排版工具：${created.title}`);
+      window.open(`${LAYOUT_API_BASE}/`, "_blank", "noopener,noreferrer");
+    } catch (error) {
+      setLayoutMessage(error instanceof Error ? error.message : "发送到排版工具失败");
+    } finally {
+      setPublishingLayout(false);
+    }
   }
 
   async function onSubmit(event: FormEvent) {
@@ -267,8 +464,9 @@ export default function GeneratePage() {
         setMessage("请先在设置页添加学科。");
         return;
       }
+      const layoutPrompt = useLayoutPrompt ? await buildLayoutPrompt() : "";
       const hasNewUploads = mode === "direct" && Boolean(uploadFiles?.length);
-      const response = hasNewUploads ? await submitMultipart() : await submitJson();
+      const response = hasNewUploads ? await submitMultipart(layoutPrompt) : await submitJson(layoutPrompt);
       rememberJobId(response.job_id);
       setMessage(`任务已创建：${response.job_id}`);
       const createdJob = await apiFetch<GenerationJob>(`/api/generate/${response.job_id}`);
@@ -281,7 +479,7 @@ export default function GeneratePage() {
     }
   }
 
-  async function submitJson() {
+  async function submitJson(layoutPrompt: string) {
     return apiFetch<{ job_id: string }>("/api/generate", {
       method: "POST",
       body: JSON.stringify({
@@ -290,7 +488,7 @@ export default function GeneratePage() {
         category: form.category || null,
         chapter: form.chapter || null,
         content_type: form.content_type,
-        options: { pages: Number(form.pages || 10) },
+        options: buildGenerationOptions(form.pages, layoutPrompt, activeLayoutMode),
         user_notes: form.user_notes || null,
         library_file_ids: mode === "direct" ? selected : [],
         ragflow_dataset_ids:
@@ -301,13 +499,13 @@ export default function GeneratePage() {
     });
   }
 
-  async function submitMultipart() {
+  async function submitMultipart(layoutPrompt: string) {
     const body = new FormData();
     body.append("subject", form.subject);
     body.append("category", form.category);
     body.append("chapter", form.chapter);
     body.append("content_type", form.content_type);
-    body.append("options", JSON.stringify({ pages: Number(form.pages || 10) }));
+    body.append("options", JSON.stringify(buildGenerationOptions(form.pages, layoutPrompt, activeLayoutMode)));
     body.append("user_notes", form.user_notes);
     body.append("library_file_ids", JSON.stringify(selected));
     body.append("save_uploads_to_library", String(saveUploads));
@@ -492,6 +690,82 @@ export default function GeneratePage() {
               />
             </div>
 
+            <div className="layoutPromptBox">
+              <div className="layoutPromptTop">
+                <label className="checkLine">
+                  <input
+                    checked={useLayoutPrompt}
+                    type="checkbox"
+                    onChange={(event) => setUseLayoutPrompt(event.target.checked)}
+                  />
+                  使用 Layout_For_Xhs 排版提示词
+                </label>
+                <span className={layoutModes.length ? "badge high" : "badge unverified"}>
+                  {layoutModes.length ? "已连接" : "未连接"}
+                </span>
+              </div>
+              <div className="field">
+                <label>排版模式</label>
+                <select
+                  disabled={!useLayoutPrompt || !layoutModes.length}
+                  value={form.layout_mode_id}
+                  onChange={(event) => {
+                    setForm({ ...form, layout_mode_id: event.target.value });
+                    setLayoutTemplate(null);
+                    setPromptPreview("");
+                  }}
+                >
+                  {!layoutModes.length && <option value={form.layout_mode_id}>请先启动 Layout_For_Xhs</option>}
+                  {layoutModes.map((layoutMode) => (
+                    <option key={layoutMode.id} value={layoutMode.id}>
+                      {layoutMode.name} · {layoutMode.title}
+                    </option>
+                  ))}
+                </select>
+                {activeLayoutMode && <p className="muted">{activeLayoutMode.summary}</p>}
+              </div>
+              <div className="buttonRow">
+                <button
+                  className="button"
+                  disabled={!useLayoutPrompt || layoutLoading}
+                  type="button"
+                  onClick={() => loadLayoutTemplate()}
+                >
+                  <FileText size={16} />
+                  拉取模板
+                </button>
+                <button
+                  className="button"
+                  disabled={!useLayoutPrompt || promptBuilding}
+                  type="button"
+                  onClick={() => buildLayoutPrompt({ refresh: true })}
+                >
+                  <RefreshCw size={16} />
+                  拼接预览
+                </button>
+                <button
+                  className="button"
+                  disabled={!promptPreview && !useLayoutPrompt}
+                  type="button"
+                  onClick={copyPrompt}
+                >
+                  <Clipboard size={16} />
+                  复制提示词
+                </button>
+                <a className="button" href={LAYOUT_API_BASE} rel="noreferrer" target="_blank">
+                  <ExternalLink size={16} />
+                  打开排版
+                </a>
+              </div>
+              {layoutMessage && <p className="muted">{layoutMessage}</p>}
+              {promptPreview && (
+                <details className="promptPreview" open>
+                  <summary>完整提示词预览</summary>
+                  <pre>{promptPreview}</pre>
+                </details>
+              )}
+            </div>
+
             <div className="buttonRow">
               <button className="button primary" disabled={submitting} type="submit">
                 <Wand2 size={17} />
@@ -537,6 +811,17 @@ export default function GeneratePage() {
                     >
                       <ShieldCheck size={16} />
                       内容审查
+                    </button>
+                  )}
+                  {job.result && (
+                    <button
+                      className="button"
+                      disabled={publishingLayout || !form.layout_mode_id}
+                      type="button"
+                      onClick={publishToLayout}
+                    >
+                      <Send size={16} />
+                      发送排版
                     </button>
                   )}
                 </div>
@@ -603,4 +888,38 @@ function findSubject(subjects: SubjectConfig[], value: string): SubjectConfig | 
       subject.id.toLowerCase() === normalized ||
       (normalized === "cpa" && subject.id === "cpa")
   );
+}
+
+function composeLayoutPrompt(template: string, sourceContent: string) {
+  const content = sourceContent.trim() || "本次未提供原始资料，请生成可复核的结构初稿。";
+  return template.includes("{{sourceContent}}")
+    ? template.replaceAll("{{sourceContent}}", content)
+    : `${template.trim()}\n\n原始资料：\n\n${content}`;
+}
+
+async function readUploadPreview(file: File) {
+  if (!isTextLikeFile(file)) return "";
+  const text = await file.text();
+  return text.length > 80_000 ? `${text.slice(0, 80_000)}\n\n（本地预览已截断，完整文件会随生成请求提交。）` : text;
+}
+
+function isTextLikeFile(file: File) {
+  const name = file.name.toLowerCase();
+  return (
+    file.type.startsWith("text/") ||
+    file.type.includes("json") ||
+    file.type.includes("xml") ||
+    [".md", ".markdown", ".txt", ".csv", ".json"].some((suffix) => name.endsWith(suffix))
+  );
+}
+
+function buildGenerationOptions(pages: string, layoutPrompt: string, layoutMode: LayoutMode | null) {
+  return {
+    pages: Number(pages || 10),
+    layout_prompt: layoutPrompt || null,
+    layout_mode_id: layoutMode?.id || null,
+    layout_mode_name: layoutMode?.name || null,
+    layout_render_mode: layoutMode?.renderMode || null,
+    layout_template_version: layoutMode?.templateVersion || null,
+  };
 }
