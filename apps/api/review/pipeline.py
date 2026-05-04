@@ -1,6 +1,6 @@
 from schemas.context import GenerationContext
 from schemas.generation import GenerationResult
-from schemas.review import ReviewMode, ReviewReport
+from schemas.review import ReviewItem, ReviewMode, ReviewReport, make_review_item_id
 from settings import ReviewConfig
 
 from .citation import check_citations
@@ -27,6 +27,7 @@ async def review_result(
 
     issues: list[str] = []
     suggestions: list[str] = []
+    llm_items: list[dict] = []
     llm_used = False
 
     if mode == "document_only" and not context.sources:
@@ -61,9 +62,11 @@ async def review_result(
         )
         llm_used = True
         issues.extend(llm_result["issues"])
-        if not llm_result["pass_overall"] and not llm_result["issues"]:
+        issues.extend(item["issue"] for item in llm_result.get("items", []) if item.get("issue"))
+        if not llm_result["pass_overall"] and not llm_result["issues"] and not llm_result.get("items"):
             issues.append("审查模型判断整体不通过，但未返回具体问题。")
         suggestions.extend(llm_result["suggestions"])
+        llm_items.extend(llm_result.get("items", []))
 
     warning = None
     if mode == "llm_only":
@@ -76,6 +79,7 @@ async def review_result(
 
     issues = _dedupe(issues)
     suggestions = _dedupe(suggestions)
+    items = _review_items(issues, suggestions, llm_items)
 
     return ReviewReport(
         pass_overall=len(issues) == 0,
@@ -90,6 +94,7 @@ async def review_result(
         numeric_checks=numeric_checks,
         issues=issues,
         suggestions=suggestions,
+        items=items,
         unverified_warning=warning,
     )
 
@@ -114,3 +119,28 @@ def _evidence_policy(mode: ReviewMode) -> str:
 
 def _dedupe(items: list[str]) -> list[str]:
     return list(dict.fromkeys(item for item in items if item.strip()))
+
+
+def _review_items(issues: list[str], suggestions: list[str], llm_items: list[dict]) -> list[ReviewItem]:
+    llm_item_by_issue = {
+        str(item.get("issue", "")).strip(): item
+        for item in llm_items
+        if str(item.get("issue", "")).strip()
+    }
+    items: list[ReviewItem] = []
+    for index, issue in enumerate(issues):
+        llm_item = llm_item_by_issue.get(issue) or {}
+        suggestion = (
+            str(llm_item.get("suggestion") or "").strip()
+            or (suggestions[index] if index < len(suggestions) else None)
+        )
+        items.append(
+            ReviewItem(
+                id=make_review_item_id(issue, suggestion, index),
+                issue=issue,
+                suggestion=suggestion or None,
+                original_text=str(llm_item.get("original_text") or "").strip() or None,
+                replacement_text=str(llm_item.get("replacement_text") or "").strip() or None,
+            )
+        )
+    return items

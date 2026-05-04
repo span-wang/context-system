@@ -17,6 +17,8 @@ Windows 下直接双击根目录的 `一键启动.bat`。脚本会自动检查�
 
 停止服务时双击 `一键停止.bat`。
 
+如需使用外部 LLM，可复制 `.env.example` 为 `.env`，填写 `DEEPSEEK_GENERATOR_API_KEY`、`DEEPSEEK_REVIEWER_API_KEY` 或通用的 `DEEPSEEK_API_KEY` 后重新启动。后端会按 `.env.local` > `.env` > `.evn` 的优先级读取本地环境文件；`.evn` 仅用于兼容拼写误差，建议统一使用 `.env`。
+
 高级参数：
 
 ```powershell

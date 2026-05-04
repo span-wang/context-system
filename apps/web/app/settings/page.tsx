@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { CheckCircle2, KeyRound, Plus, PlugZap, RefreshCw, Save, Server, SlidersHorizontal, Trash2 } from "lucide-react";
+import { CheckCircle2, Edit2, KeyRound, Plus, PlugZap, RefreshCw, Save, Server, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { apiFetch, LLMEndpointConfig, LLMPresetConfig, SystemConfig } from "../../lib/api";
 
 type ProviderId = LLMEndpointConfig["provider"];
@@ -94,7 +94,9 @@ export default function SettingsPage() {
   const [presetDeleting, setPresetDeleting] = useState<string | null>(null);
   const [subjectName, setSubjectName] = useState("");
   const [subjectCategories, setSubjectCategories] = useState("");
+  const [editingSubjectId, setEditingSubjectId] = useState<string | null>(null);
   const [subjectSaving, setSubjectSaving] = useState(false);
+  const [subjectMessage, setSubjectMessage] = useState("");
 
   async function loadConfig() {
     setLoading(true);
@@ -270,28 +272,41 @@ export default function SettingsPage() {
     event.preventDefault();
     const name = subjectName.trim();
     if (!name) {
-      setMessage("先填写学科名称。");
+      setSubjectMessage("先填写学科名称。");
       return;
     }
     setSubjectSaving(true);
-    setMessage("");
+    setSubjectMessage("");
     try {
       const data = await apiFetch<SystemConfig>("/api/system/subjects", {
         method: "POST",
         body: JSON.stringify({
+          id: editingSubjectId,
           name,
           categories: subjectCategories.split(/[,，\s]+/).filter(Boolean),
         }),
       });
       setConfig(data);
-      setSubjectName("");
-      setSubjectCategories("");
-      setMessage(`已保存学科：${name}`);
+      resetSubjectForm();
+      setSubjectMessage(editingSubjectId ? `已更新学科：${name}` : `已保存学科：${name}`);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "保存学科失败");
+      setSubjectMessage(error instanceof Error ? error.message : "保存学科失败");
     } finally {
       setSubjectSaving(false);
     }
+  }
+
+  function editSubject(subject: SystemConfig["subjects"][number]) {
+    setEditingSubjectId(subject.id);
+    setSubjectName(subject.name);
+    setSubjectCategories(subject.categories.join("，"));
+    setSubjectMessage("");
+  }
+
+  function resetSubjectForm() {
+    setEditingSubjectId(null);
+    setSubjectName("");
+    setSubjectCategories("");
   }
 
   function renderEndpoint(target: EndpointTarget) {
@@ -497,10 +512,19 @@ export default function SettingsPage() {
                   />
                 </div>
               </div>
-              <button className="button primary" disabled={subjectSaving} type="submit">
-                <Plus size={17} />
-                {subjectSaving ? "保存中" : "添加学科"}
-              </button>
+              <div className="buttonRow">
+                <button className="button primary" disabled={subjectSaving} type="submit">
+                  <Plus size={17} />
+                  {subjectSaving ? "保存中" : editingSubjectId ? "保存修改" : "添加学科"}
+                </button>
+                {editingSubjectId && (
+                  <button className="button" type="button" onClick={resetSubjectForm}>
+                    <X size={17} />
+                    取消编辑
+                  </button>
+                )}
+              </div>
+              {subjectMessage && <p className="muted">{subjectMessage}</p>}
               <div className="subjectList">
                 {config?.subjects.length ? (
                   config.subjects.map((subject) => (
@@ -509,6 +533,10 @@ export default function SettingsPage() {
                         <strong>{subject.name}</strong>
                         <span>{subject.categories.length ? subject.categories.join(" / ") : "未设置类目"}</span>
                       </div>
+                      <button className="button" type="button" onClick={() => editSubject(subject)}>
+                        <Edit2 size={16} />
+                        编辑
+                      </button>
                     </div>
                   ))
                 ) : (

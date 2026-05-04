@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import httpx
 
-from settings import LLMEndpointConfig
+from settings import LLMEndpointConfig, LLMTarget, resolve_llm_api_key
 
 
 class AnthropicProvider:
-    def __init__(self, config: LLMEndpointConfig) -> None:
+    def __init__(self, config: LLMEndpointConfig, target: LLMTarget | None = None) -> None:
         self.config = config
-        self.api_key = config.api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.api_key = resolve_llm_api_key(config, target)
 
     async def chat(self, messages: list[dict], **kwargs: Any) -> str:
         if not self.api_key:

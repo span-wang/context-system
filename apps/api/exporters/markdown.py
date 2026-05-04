@@ -32,4 +32,10 @@ def export_markdown(job: GenerationJob) -> str:
             report_lines.append(f"- 问题：{issue}")
         for suggestion in job.review.suggestions:
             report_lines.append(f"- 建议：{suggestion}")
+        if job.review.items:
+            report_lines.extend(["", "## 审查处理记录", ""])
+            for item in job.review.items:
+                report_lines.append(f"- [{item.status}] {item.issue}")
+                if item.replace_count:
+                    report_lines.append(f"  - 已替换：{item.replace_count} 处")
     return job.result.raw_markdown.rstrip() + "\n" + "\n".join(report_lines).rstrip() + "\n"

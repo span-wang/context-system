@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Download, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import ReviewActionList from "../../components/ReviewActionList";
 import {
   API_BASE,
   apiFetch,
@@ -20,6 +21,7 @@ export default function HistoryPage() {
   const [message, setMessage] = useState("");
   const [reviewingId, setReviewingId] = useState<string | null>(null);
   const [reviewMode, setReviewMode] = useState<ReviewMode>("hybrid");
+  const markdownRef = useRef<HTMLPreElement | null>(null);
 
   async function loadJobs() {
     const data = await apiFetch<GenerationJob[]>("/api/history");
@@ -207,11 +209,12 @@ export default function HistoryPage() {
                 {!selected.review && selected.status !== "reviewing" && <div className="empty">尚未内容审查。</div>}
                 {selected.review && (
                   <>
-                    <ul className="issueList">
-                      {(selected.review.issues.length ? selected.review.issues : ["暂无审查问题。"]).map((issue) => (
-                        <li key={issue}>{issue}</li>
-                      ))}
-                    </ul>
+                    <ReviewActionList
+                      job={selected}
+                      markdownRef={markdownRef}
+                      onJobChange={updateJob}
+                      onMessage={setMessage}
+                    />
                     <h3>建议</h3>
                     <ul className="issueList">
                       {(selected.review.suggestions.length ? selected.review.suggestions : ["无需额外建议。"]).map((item) => (
@@ -237,7 +240,9 @@ export default function HistoryPage() {
             <p>Markdown 预览</p>
           </div>
           <div className="panelBody">
-            <pre className="markdown">{selected.result.raw_markdown}</pre>
+            <pre className="markdown" ref={markdownRef}>
+              {selected.result.raw_markdown}
+            </pre>
           </div>
         </section>
       )}

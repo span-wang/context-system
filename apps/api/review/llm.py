@@ -15,6 +15,19 @@ REVIEW_SCHEMA = {
         "pass_overall": {"type": "boolean"},
         "issues": {"type": "array", "items": {"type": "string"}},
         "suggestions": {"type": "array", "items": {"type": "string"}},
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "issue": {"type": "string"},
+                    "suggestion": {"type": "string"},
+                    "original_text": {"type": "string"},
+                    "replacement_text": {"type": "string"},
+                },
+                "required": ["issue"],
+            },
+        },
     },
     "required": ["pass_overall", "issues", "suggestions"],
 }
@@ -59,10 +72,12 @@ def _system_prompt(mode: ReviewMode) -> str:
         "hybrid": "优先根据审查依据文档判断；文档不足时，可以结合你的通用专业知识指出风险，但要区分依据文档问题和模型判断问题。",
     }[mode]
     return (
-        "你是严格的中文备考资料内容审查员。审查目标是发现事实错误、过时口径、数字/年份/条文风险、"
+        "你是严格的中文备考资料内容审查员。审查目标是发现文档中的事实错误、过时口径、数字/年份/条文风险、"
         "引用或依据不足，以及容易误导考生的表述。"
         f"{boundary}"
         "返回 JSON：pass_overall 为是否整体可发布；issues 为具体问题列表；suggestions 为修改建议列表。"
+        "如能定位原文，请同时返回 items。items 每项包含 issue、suggestion、original_text、replacement_text。"
+        "original_text 必须是待审查内容中可以直接搜索到的原文片段；replacement_text 是可直接替换进文中的修改稿。"
     )
 
 
@@ -115,8 +130,25 @@ def _extract_json(text: str) -> str:
 def _normalize_payload(payload: dict) -> dict:
     issues = payload.get("issues") or []
     suggestions = payload.get("suggestions") or []
+    raw_items = payload.get("items") or []
+    items = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        issue = str(item.get("issue") or "").strip()
+        if not issue:
+            continue
+        items.append(
+            {
+                "issue": issue,
+                "suggestion": str(item.get("suggestion") or "").strip() or None,
+                "original_text": str(item.get("original_text") or "").strip() or None,
+                "replacement_text": str(item.get("replacement_text") or "").strip() or None,
+            }
+        )
     return {
         "pass_overall": bool(payload.get("pass_overall")) if "pass_overall" in payload else not issues,
         "issues": [str(item) for item in issues if str(item).strip()],
         "suggestions": [str(item) for item in suggestions if str(item).strip()],
+        "items": items,
     }

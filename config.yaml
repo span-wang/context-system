@@ -1,4 +1,4 @@
-﻿app:
+app:
   name: exam-kit
   context_token_limit: 900000
 llm:
@@ -21,80 +21,93 @@ db:
   url: sqlite:///./data/app.db
 ragflow:
   enabled: true
-  base_url: http://localhost:9380
+  base_url: ${RAGFLOW_BASE_URL}
   api_key: ${RAGFLOW_KEY}
 review:
   strict_when_sources_present: true
   max_retry: 2
-  unverified_warning: '鏈鐢熸垚鏈彁渚涙潈濞佽祫鏂欙紝鍐呭鍩轰簬妯″瀷鐭ヨ瘑銆?
+  unverified_warning: '本次生成未提供权威资料，内容基于模型知识。
 
-    璇峰姟蹇呭鐓ф渶鏂板畼鏂规暀鏉?瑙勮寖鏍稿鍚庡啀浣跨敤銆?
+    请务必对照最新官方教材/规范核对后再使用。
 
     '
 subjects:
 - id: cpa
-  name: 娉ㄥ唽浼氳甯?
+  name: 注册会计师
   categories:
-  - 浼氳
-  - 瀹¤
-  - 绋庢硶
-  - 璐㈢
-  - 缁忔祹娉?
-  - 鎴樼暐
+  - 会计
+  - 审计
+  - 税法
+  - 财管
+  - 经济法
+  - 战略
 - id: intermediate
-  name: 涓骇浼氳
+  name: 中级会计
   categories:
-  - 瀹炲姟
-  - 璐㈢
-  - 缁忔祹娉?- id: primary_accounting
-  name: 鍒濈骇浼氳
-  categories: []
+  - 实务
+  - 财管
+  - 经济法
+- id: primary_accounting
+  name: 初级会计
+  categories:
+  - 实务
+  - 经济法
 - id: tax_agent
-  name: 绋庡姟甯?  categories:
-  - 绋庢硶涓€
-  - 绋庢硶浜?
-  - 璐㈠姟涓庝細璁?
-  - 娑夌◣鏈嶅姟瀹炲姟
-  - 娑夌◣鏈嶅姟鐩稿叧娉曞緥
+  name: 税务师
+  categories:
+  - 税法一
+  - 税法二
+  - 财务与会计
+  - 涉税服务实务
+  - 涉税服务相关法律
 - id: architect_1
-  name: 涓€绾ф敞鍐屽缓绛戝笀
+  name: 一级注册建筑师
   categories:
-  - 璁捐鍓嶆湡
-  - 鍦哄湴涓庡缓绛?
-  - 寤虹瓚缁撴瀯
-  - 寤虹瓚鐗╃悊
-  - 寤虹瓚璁惧
-  - 寤虹瓚鏉愭枡
+  - 设计前期
+  - 场地与建筑
+  - 建筑结构
+  - 建筑物理
+  - 建筑设备
+  - 建筑材料
 - id: constructor_1
-  name: 涓€绾у缓閫犲笀
+  name: 一级建造师
   categories:
-  - 寤虹瓚
-  - 甯傛斂
-  - 鏈虹數
-  - 鍏矾
-  - 姘村埄
+  - 建筑
+  - 市政
+  - 机电
+  - 公路
+  - 水利
 - id: gaokao
-  name: 楂樿€?
+  name: 高考
   categories:
-  - 璇枃
-  - 鏁板
-  - 鑻辫
-  - 鐗╃悊
-  - 鍖栧
-  - 鐢熺墿
-  - 鏀挎不
-  - 鍘嗗彶
-  - 鍦扮悊
+  - 语文
+  - 数学
+  - 英语
+  - 物理
+  - 化学
+  - 生物
+  - 政治
+  - 历史
+  - 地理
 - id: postgraduate
-  name: 鑰冪爺
+  name: 考研
   categories:
-  - 鏀挎不
-  - 鑻辫
-  - 鏁板
-  - 涓撲笟璇?
+  - 政治
+  - 英语
+  - 数学
+  - 专业课
 - id: civil_service
-  name: 鑰冨叕
+  name: 考公
   categories:
-  - 琛屾祴
-  - 鐢宠
-  - 闈㈣瘯
+  - 行测
+  - 申论
+  - 面试
+- id: subject_56549c3055
+  name: 注册安全工程师
+  categories:
+  - 法规
+  - 管理
+  - 其他
+  - 实务
+  - 建筑
+  - 化工

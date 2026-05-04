@@ -3,8 +3,13 @@ services:
     build: ./apps/api
     ports:
       - "8000:8000"
+    env_file:
+      - .evn
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DEEPSEEK_GENERATOR_API_KEY=${DEEPSEEK_GENERATOR_API_KEY}
+      - DEEPSEEK_REVIEWER_API_KEY=${DEEPSEEK_REVIEWER_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - RAGFLOW_KEY=${RAGFLOW_KEY}
     volumes:
       - ./data:/app/data
@@ -17,4 +22,3 @@ services:
       - NEXT_PUBLIC_API_BASE=http://localhost:8000
     depends_on:
       - api
-

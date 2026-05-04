@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import hashlib
 import re
 from typing import Literal
@@ -10,18 +9,15 @@ import yaml
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from deps import get_db
 from llm.providers import get_llm_provider
-from settings import PROJECT_ROOT, LLMEndpointConfig, get_settings
+from rag.ragflow import RAGFlowAPIError, RAGFlowProvider
+from settings import PROJECT_ROOT, LLMEndpointConfig, LLMTarget, get_settings, resolve_llm_api_key
 
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
 SUPPORTED_LLM_PROVIDERS = {"local_template", "local_rules", "openai_compat", "deepseek", "anthropic"}
-PROVIDER_ENV_KEYS = {
-    "openai_compat": "OPENAI_API_KEY",
-    "deepseek": "DEEPSEEK_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-}
 
 
 class LLMEndpointUpdate(BaseModel):
@@ -43,6 +39,7 @@ class SystemConfigUpdate(BaseModel):
 
 
 class SubjectUpdate(BaseModel):
+    id: str | None = None
     name: str = Field(min_length=1)
     categories: list[str] = Field(default_factory=list)
 
@@ -60,6 +57,24 @@ class LLMPresetApplyRequest(BaseModel):
     target: Literal["generator", "reviewer"]
 
 
+class RAGFlowDataset(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    document_count: int | None = None
+    chunk_count: int | None = None
+    token_num: int | None = None
+    status: str | None = None
+    permission: str | None = None
+    embedding_model: str | None = None
+    chunk_method: str | None = None
+    unstart_count: int | None = None
+    running_count: int | None = None
+    cancel_count: int | None = None
+    done_count: int | None = None
+    fail_count: int | None = None
+
+
 @router.get("/healthz")
 def healthz() -> dict:
     return {"ok": True, "name": get_settings().app.name}
@@ -71,8 +86,8 @@ def config() -> dict:
     return {
         "app": settings.app.model_dump(),
         "llm": {
-            "generator": _public_llm_endpoint(settings.llm.generator),
-            "reviewer": _public_llm_endpoint(settings.llm.reviewer),
+            "generator": _public_llm_endpoint(settings.llm.generator, "generator"),
+            "reviewer": _public_llm_endpoint(settings.llm.reviewer, "reviewer"),
             "presets": [_public_llm_preset(preset) for preset in settings.llm.presets],
         },
         "storage": {"type": settings.storage.type},
@@ -113,10 +128,12 @@ def upsert_subject(request: SubjectUpdate) -> dict:
     subjects_raw = raw.get("subjects") if isinstance(raw.get("subjects"), list) else []
     categories = _clean_string_list(request.categories)
 
+    requested_id = request.id.strip() if request.id else ""
     normalized_name = subject_name.casefold()
-    normalized_id = _subject_id_base(subject_name).casefold()
+    normalized_id = (requested_id or _subject_id_base(subject_name)).casefold()
     replaced = False
     next_subjects = []
+    rename_pairs: list[tuple[str, str]] = []
     existing_ids = {
         str(item.get("id", "")).strip().casefold()
         for item in subjects_raw
@@ -130,12 +147,13 @@ def upsert_subject(request: SubjectUpdate) -> dict:
         current_id = str(item.get("id", "")).strip()
         is_match = current_name.casefold() == normalized_name or current_id.casefold() == normalized_id
         if is_match:
-            current_categories = _clean_string_list(item.get("categories", []))
+            if current_name:
+                rename_pairs.append((current_name, subject_name))
             next_subjects.append(
                 {
-                    "id": current_id or _unique_subject_id(subject_name, existing_ids),
+                    "id": current_id or requested_id or _unique_subject_id(subject_name, existing_ids),
                     "name": subject_name,
-                    "categories": _clean_string_list([*current_categories, *categories]),
+                    "categories": categories,
                 }
             )
             replaced = True
@@ -143,11 +161,13 @@ def upsert_subject(request: SubjectUpdate) -> dict:
             next_subjects.append(item)
 
     if not replaced:
-        subject_id = _unique_subject_id(subject_name, existing_ids)
+        subject_id = requested_id or _unique_subject_id(subject_name, existing_ids)
         next_subjects.append({"id": subject_id, "name": subject_name, "categories": categories})
 
     raw["subjects"] = next_subjects
     _write_config_file(raw)
+    for old_subject, new_subject in rename_pairs:
+        get_db().rename_library_subject(old_subject, new_subject)
     get_settings.cache_clear()
     return config()
 
@@ -224,7 +244,7 @@ async def test_llm(request: LLMTestRequest | None = None) -> dict:
     settings = get_settings()
     target = request.target if request else "generator"
     endpoint = getattr(settings.llm, target)
-    has_key = _has_llm_api_key(endpoint)
+    has_key = _has_llm_api_key(endpoint, target)
 
     if endpoint.provider in {"local_template", "local_rules"}:
         return {
@@ -240,10 +260,10 @@ async def test_llm(request: LLMTestRequest | None = None) -> dict:
                 "ok": False,
                 "provider": endpoint.provider,
                 "model": endpoint.model,
-                "message": "provider api key or endpoint api_key is not configured",
+                "message": "provider api key or endpoint api_key is not configured; set it in /settings, .env.local/.env/.evn, or config.yaml",
             }
         if request and request.live:
-            return await _live_llm_test(endpoint)
+            return await _live_llm_test(endpoint, target)
         return {
             "ok": True,
             "provider": endpoint.provider,
@@ -260,7 +280,7 @@ async def test_llm(request: LLMTestRequest | None = None) -> dict:
                 "message": "ANTHROPIC_API_KEY or endpoint api_key is not configured",
             }
         if request and request.live:
-            return await _live_llm_test(endpoint)
+            return await _live_llm_test(endpoint, target)
         return {
             "ok": True,
             "provider": endpoint.provider,
@@ -287,9 +307,23 @@ async def test_ragflow() -> dict:
         return {"ok": False, "error": str(exc)}
 
 
-async def _live_llm_test(endpoint: LLMEndpointConfig) -> dict:
+@router.get("/ragflow/datasets")
+async def list_ragflow_datasets() -> dict:
+    settings = get_settings()
     try:
-        text = await get_llm_provider(endpoint).chat(
+        payload = await RAGFlowProvider(settings.ragflow).list_datasets()
+    except RAGFlowAPIError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"拉取 RAGFlow dataset 清单失败：{exc}") from exc
+
+    datasets = [RAGFlowDataset.model_validate(item).model_dump() for item in payload["datasets"]]
+    return {"datasets": datasets, "total": payload["total"]}
+
+
+async def _live_llm_test(endpoint: LLMEndpointConfig, target: LLMTarget) -> dict:
+    try:
+        text = await get_llm_provider(endpoint, target=target).chat(
             [
                 {"role": "system", "content": "只回复 OK。"},
                 {"role": "user", "content": "测试连通性"},
@@ -311,9 +345,9 @@ async def _live_llm_test(endpoint: LLMEndpointConfig) -> dict:
         }
 
 
-def _public_llm_endpoint(endpoint: LLMEndpointConfig) -> dict:
+def _public_llm_endpoint(endpoint: LLMEndpointConfig, target: LLMTarget | None = None) -> dict:
     data = endpoint.model_dump(exclude={"api_key"})
-    data["has_api_key"] = _has_llm_api_key(endpoint)
+    data["has_api_key"] = _has_llm_api_key(endpoint, target)
     return data
 
 
@@ -323,9 +357,8 @@ def _public_llm_preset(preset: LLMEndpointConfig) -> dict:
     return data
 
 
-def _has_llm_api_key(endpoint: LLMEndpointConfig) -> bool:
-    env_key = PROVIDER_ENV_KEYS.get(endpoint.provider)
-    return bool(endpoint.api_key) or bool(env_key and os.getenv(env_key))
+def _has_llm_api_key(endpoint: LLMEndpointConfig, target: LLMTarget | None = None) -> bool:
+    return bool(resolve_llm_api_key(endpoint, target))
 
 
 def _ensure_supported_provider(provider: str) -> None:
@@ -341,7 +374,7 @@ def _read_config_file() -> dict:
     path = _config_path()
     if not path.exists():
         return {}
-    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
 
 
 def _write_config_file(raw: dict) -> None:

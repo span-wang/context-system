@@ -149,6 +149,16 @@ class Database:
             conn.commit()
         return self.get_library_file(file_id)
 
+    def rename_library_subject(self, old_subject: str, new_subject: str) -> None:
+        if old_subject == new_subject:
+            return
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE library_files SET subject = ? WHERE subject = ?",
+                (new_subject, old_subject),
+            )
+            conn.commit()
+
     def set_parsed_text(self, file_id: str, text: str, token_count: int) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -240,4 +250,3 @@ class Database:
         data["result"] = json.loads(data["result"]) if data["result"] else None
         data["review"] = json.loads(data["review"]) if data["review"] else None
         return GenerationJob.model_validate(data)
-

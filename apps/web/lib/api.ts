@@ -10,6 +10,7 @@ export type ContentType =
   | "exam_review";
 
 export type ReviewMode = "llm_only" | "document_only" | "hybrid";
+export type ReviewItemStatus = "pending" | "confirmed" | "replaced" | "skipped";
 
 export type LibraryFile = {
   id: string;
@@ -105,7 +106,18 @@ export type ReviewReport = {
   numeric_checks: Array<Record<string, unknown>>;
   issues: string[];
   suggestions: string[];
+  items: ReviewItem[];
   unverified_warning?: string | null;
+};
+
+export type ReviewItem = {
+  id: string;
+  issue: string;
+  suggestion?: string | null;
+  original_text?: string | null;
+  replacement_text?: string | null;
+  status: ReviewItemStatus;
+  replace_count: number;
 };
 
 export type GenerationJob = {
@@ -153,6 +165,29 @@ export type SubjectConfig = {
   categories: string[];
 };
 
+export type RAGFlowDataset = {
+  id: string;
+  name: string;
+  description?: string | null;
+  document_count?: number | null;
+  chunk_count?: number | null;
+  token_num?: number | null;
+  status?: string | null;
+  permission?: string | null;
+  embedding_model?: string | null;
+  chunk_method?: string | null;
+  unstart_count?: number | null;
+  running_count?: number | null;
+  cancel_count?: number | null;
+  done_count?: number | null;
+  fail_count?: number | null;
+};
+
+export type RAGFlowDatasetList = {
+  datasets: RAGFlowDataset[];
+  total: number;
+};
+
 export type SystemConfig = {
   app: {
     name: string;
@@ -183,7 +218,7 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || response.statusText);
+    throw new Error(errorMessageFromResponse(text, response.statusText));
   }
   return response.json() as Promise<T>;
 }
@@ -202,6 +237,21 @@ export async function layoutFetch<T>(path: string, init?: RequestInit): Promise<
     throw new Error(message);
   }
   return (payload?.data ?? payload) as T;
+}
+
+function errorMessageFromResponse(text: string, fallback: string) {
+  if (!text) return fallback;
+  try {
+    const payload = JSON.parse(text);
+    const detail = payload?.detail;
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) return detail.map((item) => item?.msg || JSON.stringify(item)).join("\n");
+    if (payload?.message) return String(payload.message);
+    if (payload?.error) return String(payload.error);
+  } catch {
+    // Plain text errors are already readable.
+  }
+  return text;
 }
 
 export const contentTypeLabels: Record<ContentType, string> = {

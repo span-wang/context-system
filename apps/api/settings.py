@@ -4,7 +4,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -19,6 +19,54 @@ def _find_project_root() -> Path:
 
 
 PROJECT_ROOT = _find_project_root()
+
+
+_DOTENV_FILENAMES = (".evn", ".env", ".env.local")
+LLMTarget = Literal["generator", "reviewer"]
+_INITIAL_ENV_KEYS = set(os.environ)
+_DOTENV_MANAGED_KEYS: set[str] = set()
+
+
+def _parse_dotenv_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _load_dotenv() -> None:
+    loaded: dict[str, str] = {}
+    for filename in _DOTENV_FILENAMES:
+        loaded.update(_parse_dotenv_file(PROJECT_ROOT / filename))
+
+    for key in list(_DOTENV_MANAGED_KEYS - set(loaded)):
+        if key not in _INITIAL_ENV_KEYS:
+            os.environ.pop(key, None)
+        _DOTENV_MANAGED_KEYS.discard(key)
+
+    for key, value in loaded.items():
+        if key in _INITIAL_ENV_KEYS and key not in _DOTENV_MANAGED_KEYS:
+            continue
+        os.environ[key] = value
+        _DOTENV_MANAGED_KEYS.add(key)
+
+
+_load_dotenv()
 
 
 def _expand_env(value: Any) -> Any:
@@ -128,12 +176,43 @@ def is_known_subject(subject: str) -> bool:
     return normalize_subject_name(subject) is not None
 
 
+def resolve_llm_api_key(endpoint: LLMEndpointConfig, target: LLMTarget | None = None) -> str | None:
+    _load_dotenv()
+    if endpoint.api_key:
+        return endpoint.api_key
+    for env_key in llm_api_key_env_candidates(endpoint, target):
+        value = os.getenv(env_key)
+        if value:
+            return value
+    return None
+
+
+def llm_api_key_env_candidates(endpoint: LLMEndpointConfig, target: LLMTarget | None = None) -> tuple[str, ...]:
+    candidates: list[str] = []
+    provider = endpoint.provider.strip()
+    base_url = (endpoint.base_url or "").lower()
+    is_deepseek = provider == "deepseek" or "api.deepseek.com" in base_url
+    if provider == "anthropic":
+        candidates.append("ANTHROPIC_API_KEY")
+    elif is_deepseek:
+        if target == "generator":
+            candidates.append("DEEPSEEK_GENERATOR_API_KEY")
+        elif target == "reviewer":
+            candidates.append("DEEPSEEK_REVIEWER_API_KEY")
+        candidates.extend(("DEEPSEEK_API_KEY", "OPENAI_API_KEY"))
+    elif provider == "openai_compat":
+        candidates.append("OPENAI_API_KEY")
+
+    return tuple(dict.fromkeys(key for key in candidates if key))
+
+
 @lru_cache
 def get_settings() -> Settings:
+    _load_dotenv()
     config_path = PROJECT_ROOT / "config.yaml"
     raw: dict[str, Any] = {}
     if config_path.exists():
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
     settings = Settings.model_validate(_expand_env(raw))
     settings.storage.root_path.mkdir(parents=True, exist_ok=True)
     settings.db.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

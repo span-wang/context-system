@@ -5,25 +5,27 @@ from typing import Any
 
 import httpx
 
-from settings import LLMEndpointConfig
+from settings import LLMEndpointConfig, LLMTarget, llm_api_key_env_candidates, resolve_llm_api_key
 
 
 class OpenAICompatProvider:
-    def __init__(self, config: LLMEndpointConfig) -> None:
+    def __init__(self, config: LLMEndpointConfig, target: LLMTarget | None = None) -> None:
         self.config = config
+        configured_base_url = config.base_url or os.getenv("OPENAI_BASE_URL")
         if config.provider == "deepseek":
-            self.api_key = config.api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
             default_base_url = "https://api.deepseek.com"
         else:
-            self.api_key = config.api_key or os.getenv("OPENAI_API_KEY")
             default_base_url = "https://api.openai.com/v1"
-        self.base_url = (config.base_url or os.getenv("OPENAI_BASE_URL") or default_base_url).rstrip("/")
+        self.base_url = (configured_base_url or default_base_url).rstrip("/")
+        self.is_deepseek = config.provider == "deepseek" or "api.deepseek.com" in self.base_url.lower()
+        self.api_key = resolve_llm_api_key(config, target)
+        self.api_key_env_candidates = llm_api_key_env_candidates(config, target)
         if "api.deepseek.com" in self.base_url.lower() and self.base_url.endswith("/v1"):
             self.base_url = self.base_url[:-3]
 
     async def chat(self, messages: list[dict], **kwargs: Any) -> str:
         if not self.api_key:
-            raise RuntimeError("endpoint api_key, DEEPSEEK_API_KEY, or OPENAI_API_KEY is not configured")
+            raise RuntimeError(_missing_key_message(self.is_deepseek, self.api_key_env_candidates))
         payload = {
             "model": self.config.model,
             "messages": messages,
@@ -50,3 +52,10 @@ class OpenAICompatProvider:
         ]
         text = await self.chat(payload_messages, **kwargs)
         return json.loads(text)
+
+
+def _missing_key_message(is_deepseek: bool, env_keys: tuple[str, ...]) -> str:
+    candidates = ", ".join(env_keys) if env_keys else "provider environment variables"
+    if is_deepseek:
+        return f"endpoint api_key or one of {candidates} in .env.local/.env/.evn/config.yaml is not configured"
+    return f"endpoint api_key or {candidates} is not configured"

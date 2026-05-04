@@ -18,7 +18,7 @@ from review.pipeline import review_result
 from schemas.context import ContentType, GenerationContext
 from schemas.generation import GenerationJob, GenerationRequest
 from schemas.library import FileMetadata
-from schemas.review import ReviewRequest
+from schemas.review import ReviewItemReplaceRequest, ReviewItemUpdateRequest, ReviewRequest
 from settings import get_settings, normalize_subject_name
 
 
@@ -146,7 +146,7 @@ async def review_generation(job_id: str, request: ReviewRequest | None = None) -
         endpoint = settings.llm.reviewer
         llm_provider = None
         if endpoint.provider not in {"local_template", "local_rules"}:
-            llm_provider = get_llm_provider(endpoint)
+            llm_provider = get_llm_provider(endpoint, target="reviewer")
         job.review = await review_result(
             job.result,
             job.context,
@@ -163,6 +163,47 @@ async def review_generation(job_id: str, request: ReviewRequest | None = None) -
         job.error = str(exc)
         get_db().update_job(job)
         raise HTTPException(status_code=500, detail=f"content review failed: {exc}") from exc
+
+
+@router.patch("/{job_id}/review/items/{item_id}", response_model=GenerationJob)
+def update_review_item(job_id: str, item_id: str, request: ReviewItemUpdateRequest) -> GenerationJob:
+    job = _get_reviewable_job(job_id)
+    item = _find_review_item(job, item_id)
+    if request.status is not None:
+        item.status = request.status
+    if request.original_text is not None:
+        item.original_text = request.original_text if request.original_text.strip() else None
+    if request.replacement_text is not None:
+        item.replacement_text = request.replacement_text if request.replacement_text.strip() else None
+    get_db().update_job(job)
+    return job
+
+
+@router.post("/{job_id}/review/items/{item_id}/replace", response_model=GenerationJob)
+def replace_review_item(job_id: str, item_id: str, request: ReviewItemReplaceRequest) -> GenerationJob:
+    job = _get_reviewable_job(job_id)
+    if not job.result:
+        raise HTTPException(status_code=409, detail="generation result is not ready")
+    item = _find_review_item(job, item_id)
+    original_text = (request.original_text if request.original_text is not None else item.original_text) or ""
+    replacement_text = (request.replacement_text if request.replacement_text is not None else item.replacement_text) or ""
+    if not original_text.strip():
+        raise HTTPException(status_code=422, detail="original_text is required before replacing")
+    if original_text not in job.result.raw_markdown:
+        raise HTTPException(status_code=409, detail="original_text was not found in the current Markdown")
+
+    item.original_text = original_text
+    item.replacement_text = replacement_text
+    if request.replace_all:
+        replace_count = job.result.raw_markdown.count(original_text)
+        job.result.raw_markdown = job.result.raw_markdown.replace(original_text, replacement_text)
+    else:
+        replace_count = 1
+        job.result.raw_markdown = job.result.raw_markdown.replace(original_text, replacement_text, 1)
+    item.replace_count += replace_count
+    item.status = "replaced"
+    get_db().update_job(job)
+    return job
 
 
 @router.get("/{job_id}/export")
@@ -286,7 +327,7 @@ async def _generate_result(context: GenerationContext):
     endpoint = get_settings().llm.generator
     if endpoint.provider in {"local_template", "local_rules"}:
         return await get_generator(context.content_type).generate(context)
-    provider = get_llm_provider(endpoint)
+    provider = get_llm_provider(endpoint, target="generator")
     return await LLMContentGenerator(provider, endpoint).generate(context)
 
 
@@ -299,6 +340,24 @@ def _create_job(context: GenerationContext) -> GenerationJob:
     )
     get_db().create_job(job)
     return job
+
+
+def _get_reviewable_job(job_id: str) -> GenerationJob:
+    job = get_db().get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="generation job not found")
+    if not job.review:
+        raise HTTPException(status_code=409, detail="content review is not ready")
+    return job
+
+
+def _find_review_item(job: GenerationJob, item_id: str):
+    if not job.review:
+        raise HTTPException(status_code=409, detail="content review is not ready")
+    for item in job.review.items:
+        if item.id == item_id:
+            return item
+    raise HTTPException(status_code=404, detail="review item not found")
 
 
 def _ensure_context_size(context: GenerationContext) -> None:

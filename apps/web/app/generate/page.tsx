@@ -4,15 +4,19 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
   Clipboard,
+  Database,
   ExternalLink,
   FileText,
   RefreshCw,
   Send,
   ShieldCheck,
+  SquareCheck,
   UploadCloud,
   Wand2,
 } from "lucide-react";
+import ReviewActionList from "../../components/ReviewActionList";
 import {
   API_BASE,
   LAYOUT_API_BASE,
@@ -26,6 +30,8 @@ import {
   LayoutTemplatePayload,
   LibraryFile,
   LibraryFilePreview,
+  RAGFlowDataset,
+  RAGFlowDatasetList,
   ReviewMode,
   reviewModeLabels,
   SubjectConfig,
@@ -128,6 +134,9 @@ function forgetRememberedJob() {
 
 export default function GeneratePage() {
   const streamRef = useRef<EventSource | null>(null);
+  const markdownRef = useRef<HTMLPreElement | null>(null);
+  const librarySelectRef = useRef<HTMLDivElement | null>(null);
+  const ragflowSelectRef = useRef<HTMLDivElement | null>(null);
   const [memoryReady, setMemoryReady] = useState(false);
   const [mode, setMode] = useState<GenerationMode>("direct");
   const [files, setFiles] = useState<LibraryFile[]>([]);
@@ -149,6 +158,10 @@ export default function GeneratePage() {
   const [promptPreview, setPromptPreview] = useState("");
   const [promptBuilding, setPromptBuilding] = useState(false);
   const [publishingLayout, setPublishingLayout] = useState(false);
+  const [ragflowDatasets, setRagflowDatasets] = useState<RAGFlowDataset[]>([]);
+  const [ragflowLoading, setRagflowLoading] = useState(false);
+  const [ragflowMessage, setRagflowMessage] = useState("");
+  const [openMultiSelect, setOpenMultiSelect] = useState<"library" | "ragflow" | null>(null);
 
   async function loadFiles() {
     const data = await apiFetch<LibraryFile[]>("/api/library/files");
@@ -168,6 +181,22 @@ export default function GeneratePage() {
       if (current.layout_mode_id && data.some((item) => item.id === current.layout_mode_id)) return current;
       return { ...current, layout_mode_id: data[0]?.id || current.layout_mode_id };
     });
+  }
+
+  async function loadRagflowDatasets() {
+    setRagflowLoading(true);
+    setRagflowMessage("");
+    try {
+      const data = await apiFetch<RAGFlowDatasetList>("/api/system/ragflow/datasets");
+      setRagflowDatasets(data.datasets);
+      setRagflowMessage(data.datasets.length ? `已拉取 ${data.datasets.length} 个 dataset。` : "RAGFlow 暂无可用 dataset。");
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "拉取 RAGFlow dataset 清单失败";
+      setRagflowMessage(text);
+      throw error;
+    } finally {
+      setRagflowLoading(false);
+    }
   }
 
   const closeStream = useCallback(() => {
@@ -236,6 +265,39 @@ export default function GeneratePage() {
   }, []);
 
   useEffect(() => {
+    if (mode !== "ragflow" || ragflowDatasets.length || ragflowLoading) return;
+    loadRagflowDatasets().catch((error) => setMessage(error.message));
+  }, [mode, ragflowDatasets.length, ragflowLoading]);
+
+  useEffect(() => {
+    setOpenMultiSelect(null);
+  }, [mode]);
+
+  useEffect(() => {
+    function handlePointerDown(event: PointerEvent) {
+      const target = event.target as Node;
+      if (
+        librarySelectRef.current?.contains(target) ||
+        ragflowSelectRef.current?.contains(target)
+      ) {
+        return;
+      }
+      setOpenMultiSelect(null);
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpenMultiSelect(null);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  useEffect(() => {
     const draft = readMemory<GenerationDraft>(generationDraftKey);
     if (draft) {
       setMode(draft.mode);
@@ -296,12 +358,23 @@ export default function GeneratePage() {
     });
   }, [form, memoryReady, mode, reviewMode, saveUploads, selected, useLayoutPrompt]);
 
-  const selectedTokens = useMemo(
-    () =>
-      files
-        .filter((file) => selected.includes(file.id))
-        .reduce((sum, file) => sum + (file.token_count || 0), 0),
+  const selectedFiles = useMemo(() => files.filter((file) => selected.includes(file.id)), [files, selected]);
+  const selectedMissingFileIds = useMemo(
+    () => selected.filter((fileId) => !files.some((file) => file.id === fileId)),
     [files, selected]
+  );
+  const selectedFileNames = useMemo(
+    () => [...selectedFiles.map((file) => file.source_title || file.filename), ...selectedMissingFileIds],
+    [selectedFiles, selectedMissingFileIds]
+  );
+  const selectedFileSummary = selected.length
+    ? `${selected.length} 个素材：${selectedFileNames.slice(0, 2).join("、")}${selected.length > 2 ? " 等" : ""}`
+    : files.length
+      ? "选择素材库资料"
+      : "暂无素材库资料";
+  const selectedTokens = useMemo(
+    () => selectedFiles.reduce((sum, file) => sum + (file.token_count || 0), 0),
+    [selectedFiles]
   );
   const activeSubject = useMemo(
     () => subjects.find((subject) => subject.name === form.subject) || null,
@@ -311,9 +384,45 @@ export default function GeneratePage() {
     () => layoutModes.find((layoutMode) => layoutMode.id === form.layout_mode_id) || null,
     [form.layout_mode_id, layoutModes]
   );
+  const selectedRagflowDatasetIds = useMemo(
+    () => parseDatasetIds(form.ragflow_dataset_ids),
+    [form.ragflow_dataset_ids]
+  );
+  const selectedRagflowDatasets = useMemo(
+    () => ragflowDatasets.filter((dataset) => selectedRagflowDatasetIds.includes(dataset.id)),
+    [ragflowDatasets, selectedRagflowDatasetIds]
+  );
+  const selectedRagflowDatasetMissingIds = useMemo(
+    () => selectedRagflowDatasetIds.filter((datasetId) => !ragflowDatasets.some((dataset) => dataset.id === datasetId)),
+    [ragflowDatasets, selectedRagflowDatasetIds]
+  );
+  const selectedRagflowDatasetNames = useMemo(
+    () => [
+      ...selectedRagflowDatasets.map((dataset) => dataset.name || dataset.id),
+      ...selectedRagflowDatasetMissingIds,
+    ],
+    [selectedRagflowDatasets, selectedRagflowDatasetMissingIds]
+  );
+  const ragflowDatasetSummary = selectedRagflowDatasetIds.length
+    ? `${selectedRagflowDatasetIds.length} 个 dataset：${selectedRagflowDatasetNames.slice(0, 2).join("、")}${
+        selectedRagflowDatasetIds.length > 2 ? " 等" : ""
+      }`
+    : ragflowLoading
+      ? "正在拉取 RAGFlow dataset 清单..."
+      : ragflowDatasets.length
+        ? "选择 RAGFlow dataset"
+        : "还没有拉取到可用 dataset";
 
   function toggleFile(id: string) {
     setSelected((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+  }
+
+  function toggleRagflowDataset(id: string) {
+    setForm((current) => {
+      const datasetIds = parseDatasetIds(current.ragflow_dataset_ids);
+      const nextIds = datasetIds.includes(id) ? datasetIds.filter((item) => item !== id) : [...datasetIds, id];
+      return { ...current, ragflow_dataset_ids: nextIds.join(", ") };
+    });
   }
 
   async function loadLayoutTemplate(modeId = form.layout_mode_id) {
@@ -391,7 +500,7 @@ export default function GeneratePage() {
 
     if (mode === "ragflow") {
       blocks.push("【RAGFlow 检索要求】");
-      blocks.push(`Dataset IDs：${form.ragflow_dataset_ids || "未填写"}`);
+      blocks.push(`Dataset IDs：${selectedRagflowDatasetIds.join(", ") || "未填写"}`);
       blocks.push("生成时请结合后端检索到的资料正文；本预览仅包含检索条件。");
       blocks.push("");
     }
@@ -464,7 +573,15 @@ export default function GeneratePage() {
         setMessage("请先在设置页添加学科。");
         return;
       }
+      if (mode === "ragflow" && !selectedRagflowDatasetIds.length) {
+        setMessage("请先选择一个 RAGFlow dataset。");
+        return;
+      }
       const layoutPrompt = useLayoutPrompt ? await buildLayoutPrompt() : "";
+      if (useLayoutPrompt && !layoutPrompt) {
+        setMessage("排版提示词未生成，请确认 Layout_For_Xhs 已启动并能拉取模板。");
+        return;
+      }
       const hasNewUploads = mode === "direct" && Boolean(uploadFiles?.length);
       const response = hasNewUploads ? await submitMultipart(layoutPrompt) : await submitJson(layoutPrompt);
       rememberJobId(response.job_id);
@@ -491,10 +608,7 @@ export default function GeneratePage() {
         options: buildGenerationOptions(form.pages, layoutPrompt, activeLayoutMode),
         user_notes: form.user_notes || null,
         library_file_ids: mode === "direct" ? selected : [],
-        ragflow_dataset_ids:
-          mode === "ragflow"
-            ? form.ragflow_dataset_ids.split(/[,\s，]+/).map((item) => item.trim()).filter(Boolean)
-            : [],
+        ragflow_dataset_ids: mode === "ragflow" ? selectedRagflowDatasetIds : [],
       }),
     });
   }
@@ -627,32 +741,143 @@ export default function GeneratePage() {
 
             {mode === "ragflow" ? (
               <div className="field">
-                <label>RAGFlow Dataset IDs</label>
-                <input
-                  value={form.ragflow_dataset_ids}
-                  onChange={(e) => setForm({ ...form, ragflow_dataset_ids: e.target.value })}
-                  placeholder="dataset_1, dataset_2"
-                />
+                <div className="fieldHeader">
+                  <label>RAGFlow Dataset</label>
+                  <button className="button small" disabled={ragflowLoading} type="button" onClick={loadRagflowDatasets}>
+                    <RefreshCw size={15} />
+                    刷新
+                  </button>
+                </div>
+                <div className="multiSelect" ref={ragflowSelectRef}>
+                  <button
+                    aria-expanded={openMultiSelect === "ragflow"}
+                    className="multiSelectButton"
+                    disabled={ragflowLoading || (!ragflowDatasets.length && !selectedRagflowDatasetMissingIds.length)}
+                    type="button"
+                    onClick={() => setOpenMultiSelect((current) => (current === "ragflow" ? null : "ragflow"))}
+                  >
+                    <span className="multiSelectIcon">
+                      <Database size={17} />
+                    </span>
+                    <span>
+                      <strong>{ragflowDatasetSummary}</strong>
+                      <small>{selectedRagflowDatasetIds.length ? "可继续选择多个 dataset" : "RAGFlow 检索会使用选中的 dataset"}</small>
+                    </span>
+                    <ChevronDown size={16} />
+                  </button>
+                  {openMultiSelect === "ragflow" && (
+                    <div className="multiSelectPanel">
+                      {ragflowDatasets.map((dataset) => (
+                        <label className="multiSelectOption" key={dataset.id}>
+                          <input
+                            checked={selectedRagflowDatasetIds.includes(dataset.id)}
+                            type="checkbox"
+                            onChange={() => toggleRagflowDataset(dataset.id)}
+                          />
+                          <span className="multiSelectCheck">
+                            <SquareCheck size={15} />
+                          </span>
+                          <span className="multiSelectOptionBody">
+                            <strong>{dataset.name || dataset.id}</strong>
+                            <small>{dataset.id}</small>
+                          </span>
+                          <span className="multiSelectBadges">
+                            {dataset.document_count != null && <span className="badge">{dataset.document_count} docs</span>}
+                            {dataset.chunk_count != null && <span className="badge">{dataset.chunk_count} chunks</span>}
+                            {dataset.running_count ? <span className="badge medium">{dataset.running_count} parsing</span> : null}
+                            {dataset.fail_count ? <span className="badge low">{dataset.fail_count} failed</span> : null}
+                          </span>
+                        </label>
+                      ))}
+                      {selectedRagflowDatasetMissingIds.map((datasetId) => (
+                        <label className="multiSelectOption" key={datasetId}>
+                          <input checked type="checkbox" onChange={() => toggleRagflowDataset(datasetId)} />
+                          <span className="multiSelectCheck">
+                            <SquareCheck size={15} />
+                          </span>
+                          <span className="multiSelectOptionBody">
+                            <strong>{datasetId}</strong>
+                            <small>已保存的 dataset id</small>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="selectMetaLine">
+                  <span>{selectedRagflowDatasetIds.length ? `已选 ${selectedRagflowDatasetIds.length} 个 dataset` : "未选择 dataset"}</span>
+                  {selectedRagflowDatasets.reduce((sum, dataset) => sum + (dataset.document_count || 0), 0) > 0 && (
+                    <span>{selectedRagflowDatasets.reduce((sum, dataset) => sum + (dataset.document_count || 0), 0)} docs</span>
+                  )}
+                  {selectedRagflowDatasets.reduce((sum, dataset) => sum + (dataset.chunk_count || 0), 0) > 0 && (
+                    <span>{selectedRagflowDatasets.reduce((sum, dataset) => sum + (dataset.chunk_count || 0), 0)} chunks</span>
+                  )}
+                </div>
+                {ragflowMessage && <p className="muted">{ragflowMessage}</p>}
               </div>
             ) : (
               <div className="field">
                 <label>选择素材</label>
-                <div className="filePickList">
-                  {files.map((file) => (
-                    <label className="filePick" key={file.id}>
-                      <input checked={selected.includes(file.id)} type="checkbox" onChange={() => toggleFile(file.id)} />
-                      <span>
-                        <strong>{file.source_title || file.filename}</strong>
-                        <span className="muted" style={{ display: "block" }}>
-                          {file.subject} / {file.category || "未分类"} / {file.chapter || "未填章节"}
-                        </span>
-                      </span>
-                      <span className={`badge ${file.source_authority}`}>{file.source_authority}</span>
-                    </label>
-                  ))}
-                  {!files.length && <div className="empty">先去素材库上传资料，或直接无资料生成。</div>}
+                <div className="multiSelect" ref={librarySelectRef}>
+                  <button
+                    aria-expanded={openMultiSelect === "library"}
+                    className="multiSelectButton"
+                    disabled={!files.length && !selectedMissingFileIds.length}
+                    type="button"
+                    onClick={() => setOpenMultiSelect((current) => (current === "library" ? null : "library"))}
+                  >
+                    <span className="multiSelectIcon">
+                      <FileText size={17} />
+                    </span>
+                    <span>
+                      <strong>{selectedFileSummary}</strong>
+                      <small>{selected.length ? `${selectedTokens.toLocaleString()} token` : "可与本次新上传资料混合使用"}</small>
+                    </span>
+                    <ChevronDown size={16} />
+                  </button>
+                  {openMultiSelect === "library" && (
+                    <div className="multiSelectPanel">
+                      {files.map((file) => (
+                        <label className="multiSelectOption" key={file.id}>
+                          <input checked={selected.includes(file.id)} type="checkbox" onChange={() => toggleFile(file.id)} />
+                          <span className="multiSelectCheck">
+                            <SquareCheck size={15} />
+                          </span>
+                          <span className="multiSelectOptionBody">
+                            <strong>{file.source_title || file.filename}</strong>
+                            <small>
+                              {file.subject} / {file.category || "未分类"} / {file.chapter || "未填章节"}
+                            </small>
+                          </span>
+                          <span className="multiSelectBadges">
+                            <span className={`badge ${file.source_authority}`}>{file.source_authority}</span>
+                            {file.token_count != null && <span className="badge">{file.token_count.toLocaleString()} token</span>}
+                          </span>
+                        </label>
+                      ))}
+                      {selectedMissingFileIds.map((fileId) => (
+                        <label className="multiSelectOption" key={fileId}>
+                          <input checked type="checkbox" onChange={() => toggleFile(fileId)} />
+                          <span className="multiSelectCheck">
+                            <SquareCheck size={15} />
+                          </span>
+                          <span className="multiSelectOptionBody">
+                            <strong>{fileId}</strong>
+                            <small>已保存的素材 id</small>
+                          </span>
+                        </label>
+                      ))}
+                      {!files.length && !selectedMissingFileIds.length && (
+                        <div className="multiSelectEmpty">先去素材库上传资料，或直接无资料生成。</div>
+                      )}
+                    </div>
+                  )}
                 </div>
-                <p className="muted">已解析素材估算：{selectedTokens.toLocaleString()} token。未解析文件会在提交时解析并拦截超限。</p>
+                <div className="selectMetaLine">
+                  <span>已选 {selected.length} 个素材</span>
+                  <span>{selectedTokens.toLocaleString()} token</span>
+                  <span>未解析文件会在提交时解析并拦截超限</span>
+                </div>
               </div>
             )}
 
@@ -839,17 +1064,28 @@ export default function GeneratePage() {
                     ))}
                   </div>
                 )}
-                {job.result && <pre className="markdown">{job.result.raw_markdown}</pre>}
+                {job.error && (
+                  <div className="errorPanel">
+                    <strong>{job.status === "failed" ? "失败原因" : "提示"}</strong>
+                    <span>{job.error}</span>
+                  </div>
+                )}
+                {job.result && (
+                  <pre className="markdown" ref={markdownRef}>
+                    {job.result.raw_markdown}
+                  </pre>
+                )}
                 {job.result && !job.review && job.status !== "reviewing" && (
                   <div className="empty">尚未内容审查。</div>
                 )}
                 {job.status === "reviewing" && <div className="empty">正在内容审查...</div>}
                 {job.review && (
-                  <ul className="issueList">
-                    {(job.review.issues.length ? job.review.issues : ["暂未发现审查问题。"]).map((issue) => (
-                      <li key={issue}>{issue}</li>
-                    ))}
-                  </ul>
+                  <ReviewActionList
+                    job={job}
+                    markdownRef={markdownRef}
+                    onJobChange={applyJob}
+                    onMessage={setMessage}
+                  />
                 )}
               </div>
             )}
@@ -888,6 +1124,13 @@ function findSubject(subjects: SubjectConfig[], value: string): SubjectConfig | 
       subject.id.toLowerCase() === normalized ||
       (normalized === "cpa" && subject.id === "cpa")
   );
+}
+
+function parseDatasetIds(value: string) {
+  return value
+    .split(/[,\s，]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function composeLayoutPrompt(template: string, sourceContent: string) {

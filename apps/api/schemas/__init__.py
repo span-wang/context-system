@@ -1,7 +1,7 @@
 from .context import ContextSource, GenerationContext
 from .generation import Citation, Claim, GenerationJob, GenerationRequest, GenerationResult
 from .library import FileMetadata, LibraryFile, LibraryFilePatch
-from .review import ReviewReport
+from .review import ReviewItem, ReviewItemReplaceRequest, ReviewItemUpdateRequest, ReviewReport
 
 __all__ = [
     "Citation",
@@ -14,6 +14,8 @@ __all__ = [
     "GenerationResult",
     "LibraryFile",
     "LibraryFilePatch",
+    "ReviewItem",
+    "ReviewItemReplaceRequest",
+    "ReviewItemUpdateRequest",
     "ReviewReport",
 ]
-
