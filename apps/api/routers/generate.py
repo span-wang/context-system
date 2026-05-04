@@ -302,7 +302,11 @@ def _create_job(context: GenerationContext) -> GenerationJob:
 
 
 def _ensure_context_size(context: GenerationContext) -> None:
-    total_tokens = estimate_sources_tokens([source.text for source in context.sources], context.user_notes)
+    layout_prompt = context.options.get("layout_prompt")
+    total_tokens = estimate_sources_tokens(
+        [source.text for source in context.sources],
+        "\n".join(item for item in [context.user_notes, layout_prompt if isinstance(layout_prompt, str) else None] if item),
+    )
     limit = get_settings().app.context_token_limit
     if total_tokens > limit:
         raise HTTPException(

@@ -343,6 +343,53 @@ textarea {
   font-weight: 700;
 }
 
+.layoutPromptBox {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #c8d8ee;
+  border-radius: 8px;
+  background: #f8fbff;
+  padding: 12px;
+}
+
+.layoutPromptTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.layoutPromptTop .checkLine {
+  margin-top: 0;
+}
+
+.promptPreview {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.promptPreview summary {
+  min-height: 40px;
+  padding: 10px 12px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.promptPreview pre {
+  max-height: 340px;
+  margin: 0;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  background: #fbfcfe;
+  padding: 14px;
+  white-space: pre-wrap;
+  line-height: 1.7;
+}
+
 .tableWrap {
   overflow-x: auto;
 }

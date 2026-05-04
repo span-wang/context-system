@@ -66,6 +66,10 @@ def _system_prompt() -> str:
 
 
 def _user_prompt(context: GenerationContext, title: str) -> str:
+    layout_prompt = str(context.options.get("layout_prompt") or "").strip()
+    if layout_prompt:
+        return _layout_user_prompt(context, title, layout_prompt)
+
     pages = context.options.get("pages", 8)
     parts = [
         f"标题：{title}",
@@ -96,6 +100,37 @@ def _user_prompt(context: GenerationContext, title: str) -> str:
             [
                 "- 本次没有权威素材，开头必须包含：> 未核验：本次未提供权威资料，请对照最新官方教材/规范核对后使用。",
                 "- 不要写引用来源章节。",
+            ]
+        )
+    return "\n".join(parts)
+
+
+def _layout_user_prompt(context: GenerationContext, title: str, layout_prompt: str) -> str:
+    parts = [
+        f"标题：{title}",
+        f"学科：{context.subject}",
+        f"类目：{context.category or '未填写'}",
+        f"章节：{context.chapter or '未填写'}",
+        f"排版模式：{context.options.get('layout_mode_name') or context.options.get('layout_mode_id') or 'Layout_For_Xhs'}",
+        "",
+        "请严格按照下面的 Layout_For_Xhs 完整提示词生成 Markdown。最终回答只输出 Markdown 正文。",
+        "",
+        layout_prompt,
+    ]
+    source_block = _format_sources(context)
+    if source_block and source_block != "无可用素材正文。":
+        parts.extend(
+            [
+                "",
+                "后端已解析/检索到的完整素材如下。如与上方预览资料重复，以本段完整素材为准：",
+                source_block,
+            ]
+        )
+    if not context.sources:
+        parts.extend(
+            [
+                "",
+                "本次没有权威素材，开头必须包含：> 未核验：本次未提供权威资料，请对照最新官方教材/规范核对后使用。",
             ]
         )
     return "\n".join(parts)
