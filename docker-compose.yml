@@ -1,0 +1,20 @@
+services:
+  api:
+    build: ./apps/api
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - RAGFLOW_KEY=${RAGFLOW_KEY}
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml
+  web:
+    build: ./apps/web
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_BASE=http://localhost:8000
+    depends_on:
+      - api
+

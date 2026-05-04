@@ -1,0 +1,100 @@
+﻿app:
+  name: exam-kit
+  context_token_limit: 900000
+llm:
+  generator:
+    provider: openai_compat
+    model: deepseek-v4-flash
+    max_tokens: 100000
+    api_key: ${DEEPSEEK_GENERATOR_API_KEY}
+    base_url: https://api.deepseek.com/v1
+  reviewer:
+    provider: openai_compat
+    model: deepseek-v4-flash
+    max_tokens: 100000
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_REVIEWER_API_KEY}
+storage:
+  type: local
+  root: ./data
+db:
+  url: sqlite:///./data/app.db
+ragflow:
+  enabled: true
+  base_url: http://localhost:9380
+  api_key: ${RAGFLOW_KEY}
+review:
+  strict_when_sources_present: true
+  max_retry: 2
+  unverified_warning: '鏈鐢熸垚鏈彁渚涙潈濞佽祫鏂欙紝鍐呭鍩轰簬妯″瀷鐭ヨ瘑銆?
+
+    璇峰姟蹇呭鐓ф渶鏂板畼鏂规暀鏉?瑙勮寖鏍稿鍚庡啀浣跨敤銆?
+
+    '
+subjects:
+- id: cpa
+  name: 娉ㄥ唽浼氳甯?
+  categories:
+  - 浼氳
+  - 瀹¤
+  - 绋庢硶
+  - 璐㈢
+  - 缁忔祹娉?
+  - 鎴樼暐
+- id: intermediate
+  name: 涓骇浼氳
+  categories:
+  - 瀹炲姟
+  - 璐㈢
+  - 缁忔祹娉?- id: primary_accounting
+  name: 鍒濈骇浼氳
+  categories: []
+- id: tax_agent
+  name: 绋庡姟甯?  categories:
+  - 绋庢硶涓€
+  - 绋庢硶浜?
+  - 璐㈠姟涓庝細璁?
+  - 娑夌◣鏈嶅姟瀹炲姟
+  - 娑夌◣鏈嶅姟鐩稿叧娉曞緥
+- id: architect_1
+  name: 涓€绾ф敞鍐屽缓绛戝笀
+  categories:
+  - 璁捐鍓嶆湡
+  - 鍦哄湴涓庡缓绛?
+  - 寤虹瓚缁撴瀯
+  - 寤虹瓚鐗╃悊
+  - 寤虹瓚璁惧
+  - 寤虹瓚鏉愭枡
+- id: constructor_1
+  name: 涓€绾у缓閫犲笀
+  categories:
+  - 寤虹瓚
+  - 甯傛斂
+  - 鏈虹數
+  - 鍏矾
+  - 姘村埄
+- id: gaokao
+  name: 楂樿€?
+  categories:
+  - 璇枃
+  - 鏁板
+  - 鑻辫
+  - 鐗╃悊
+  - 鍖栧
+  - 鐢熺墿
+  - 鏀挎不
+  - 鍘嗗彶
+  - 鍦扮悊
+- id: postgraduate
+  name: 鑰冪爺
+  categories:
+  - 鏀挎不
+  - 鑻辫
+  - 鏁板
+  - 涓撲笟璇?
+- id: civil_service
+  name: 鑰冨叕
+  categories:
+  - 琛屾祴
+  - 鐢宠
+  - 闈㈣瘯
