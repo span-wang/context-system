@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Download, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { Clipboard, Download, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import ReviewActionList from "../../components/ReviewActionList";
 import {
   API_BASE,
@@ -79,6 +79,12 @@ export default function HistoryPage() {
     }
   }
 
+  async function copyResult(markdown: string) {
+    if (!markdown) return;
+    await navigator.clipboard.writeText(markdown);
+    setMessage("产出内容已复制。");
+  }
+
   return (
     <>
       <header className="pageHeader">
@@ -133,6 +139,20 @@ export default function HistoryPage() {
                       <td>
                         <div className="buttonRow">
                           {job.result && (
+                            <button
+                              aria-label="复制产出内容"
+                              className="button"
+                              title="复制产出内容"
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                copyResult(job.result?.raw_markdown || "").catch((error) => setMessage(error.message));
+                              }}
+                            >
+                              <Clipboard size={16} />
+                            </button>
+                          )}
+                          {job.result && (
                             <a className="button" href={`${API_BASE}/api/generate/${job.id}/export?format=md`}>
                               <Download size={16} />
                             </a>
@@ -178,6 +198,12 @@ export default function HistoryPage() {
                   {selected.review?.strict_mode ? <span className="badge high">严格</span> : null}
                   {selected.review && !selected.review.strict_mode ? <span className="badge unverified">非严格</span> : null}
                   {selected.review && <span className="badge">{reviewModeLabels[selected.review.mode || "hybrid"]}</span>}
+                  {selected.result && (
+                    <button className="button" type="button" onClick={() => copyResult(selected.result?.raw_markdown || "")}>
+                      <Clipboard size={16} />
+                      复制内容
+                    </button>
+                  )}
                   {selected.result && (
                     <button
                       className="button"
@@ -236,8 +262,16 @@ export default function HistoryPage() {
       {selected?.result && (
         <section className="panel" style={{ marginTop: 18 }}>
           <div className="panelHeader">
-            <h2>{selected.result.title}</h2>
-            <p>Markdown 预览</p>
+            <div className="panelHeaderActions">
+              <div>
+                <h2>{selected.result.title}</h2>
+                <p>Markdown 预览</p>
+              </div>
+              <button className="button" type="button" onClick={() => copyResult(selected.result?.raw_markdown || "")}>
+                <Clipboard size={16} />
+                复制内容
+              </button>
+            </div>
           </div>
           <div className="panelBody">
             <pre className="markdown" ref={markdownRef}>

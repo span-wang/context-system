@@ -14,6 +14,12 @@ llm:
     max_tokens: 100000
     base_url: https://api.deepseek.com/v1
     api_key: ${DEEPSEEK_REVIEWER_API_KEY}
+  presets:
+  - provider: openai_compat
+    model: deepseek-v4-flash
+    max_tokens: 100000
+    base_url: https://api.deepseek.com/v1
+    name: DD预设
 storage:
   type: local
   root: ./data

@@ -532,6 +532,12 @@ export default function GeneratePage() {
     setLayoutMessage("完整提示词已复制。");
   }
 
+  async function copyResult() {
+    if (!job?.result?.raw_markdown) return;
+    await navigator.clipboard.writeText(job.result.raw_markdown);
+    setMessage("产出内容已复制。");
+  }
+
   async function publishToLayout() {
     if (!job?.result?.raw_markdown) return;
     setPublishingLayout(true);
@@ -1027,6 +1033,12 @@ export default function GeneratePage() {
                     </span>
                   ) : null}
                   {job.review && <span className="badge">{reviewModeLabels[job.review.mode]}</span>}
+                  {job.result && (
+                    <button className="button" type="button" onClick={copyResult}>
+                      <Clipboard size={16} />
+                      复制内容
+                    </button>
+                  )}
                   {job.result && (
                     <button
                       className="button"

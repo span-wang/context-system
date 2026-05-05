@@ -169,6 +169,21 @@ textarea {
   font-size: 13px;
 }
 
+.panelHeaderActions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panelHeaderActions > div {
+  min-width: 0;
+}
+
+.panelHeaderActions .button {
+  flex: 0 0 auto;
+}
+
 .formGrid {
   display: grid;
   gap: 12px;
