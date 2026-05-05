@@ -20,12 +20,22 @@ class Claim(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
 
 
+class XiaohongshuPublishPackage(BaseModel):
+    title_options: list[str] = Field(default_factory=list)
+    body: str = ""
+    cover_text: str = ""
+    carousel_pages: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    comment_guides: list[str] = Field(default_factory=list)
+
+
 class GenerationResult(BaseModel):
     content_type: str
     title: str
     sections: list[dict] = Field(default_factory=list)
     claims: list[Claim] = Field(default_factory=list)
     raw_markdown: str
+    publish_package: XiaohongshuPublishPackage | None = None
     unverified: bool = False
 
 
@@ -56,4 +66,3 @@ class GenerationJob(BaseModel):
     review: ReviewReport | None = None
     created_at: datetime
     error: str | None = None
-

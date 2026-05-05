@@ -37,6 +37,11 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
+说明：
+- 素材库现在支持上传 `PDF / 图片 / DOCX / Markdown / TXT`。
+- 普通 PDF 会优先提取可选中文本；扫描版 PDF 和图片会自动尝试 OCR。
+- 如果扫描件预览仍为空，通常是图片清晰度过低，或 OCR 依赖没有安装成功。
+
 ### 前端
 
 ```powershell
@@ -50,8 +55,9 @@ npm run dev
 ## 主要页面
 
 - `/library`：上传、筛选、预览和管理素材。
+- `/workflow`：管理选题库、内容日历、审核状态、责任人、素材引用和版本记录，并串起生成、审查、确认、导出发布包。
 - `/generate`：选择模式 A/RAGFlow 或模式 B/直通生成，提交生成任务。
-- `/history`：查看生成历史、Markdown 结果和审查报告。
+- `/history`：查看生成历史、小红书发布包和审查报告。
 - `/settings`：在前端配置生成模型和审查模型。
 
 ## 数据位置
@@ -72,7 +78,15 @@ npm run dev
 - `GET /api/generate/{id}/stream`
 - `GET /api/generate/{id}`
 - `POST /api/generate/{id}/review`，可传 `{ "mode": "llm_only" | "document_only" | "hybrid" }`
-- `GET /api/generate/{id}/export?format=md`
+- `GET /api/generate/{id}/export?format=md`（导出 Markdown 格式的小红书发布包）
+- `GET /api/workflow/topics`
+- `POST /api/workflow/topics`
+- `PATCH /api/workflow/topics/{id}`
+- `POST /api/workflow/topics/{id}/generate`
+- `POST /api/workflow/topics/{id}/review`
+- `POST /api/workflow/topics/{id}/confirm`
+- `POST /api/workflow/topics/{id}/export`
+- `GET /api/workflow/topics/{id}/events`
 - `GET /api/history`
 - `GET /api/system/config`
 - `POST /api/system/config`

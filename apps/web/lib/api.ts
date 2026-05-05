@@ -11,6 +11,20 @@ export type ContentType =
 
 export type ReviewMode = "llm_only" | "document_only" | "hybrid";
 export type ReviewItemStatus = "pending" | "confirmed" | "replaced" | "skipped";
+export type WorkflowTopicStatus =
+  | "idea"
+  | "planned"
+  | "drafting"
+  | "generated"
+  | "reviewing"
+  | "needs_changes"
+  | "awaiting_confirm"
+  | "approved"
+  | "exported"
+  | "published"
+  | "archived";
+export type WorkflowReviewStatus = "not_started" | "reviewing" | "passed" | "needs_changes" | "waived";
+export type WorkflowPriority = "low" | "medium" | "high" | "urgent";
 
 export type LibraryFile = {
   id: string;
@@ -120,6 +134,15 @@ export type ReviewItem = {
   replace_count: number;
 };
 
+export type XiaohongshuPublishPackage = {
+  title_options: string[];
+  body: string;
+  cover_text: string;
+  carousel_pages: string[];
+  tags: string[];
+  comment_guides: string[];
+};
+
 export type GenerationJob = {
   id: string;
   context: {
@@ -140,11 +163,84 @@ export type GenerationJob = {
     sections: Array<Record<string, unknown>>;
     claims: Array<Record<string, unknown>>;
     raw_markdown: string;
+    publish_package?: XiaohongshuPublishPackage | null;
     unverified: boolean;
   } | null;
   review?: ReviewReport | null;
   created_at: string;
   error?: string | null;
+};
+
+export type WorkflowTopic = {
+  id: string;
+  title: string;
+  brief?: string | null;
+  subject: string;
+  category?: string | null;
+  chapter?: string | null;
+  content_type: ContentType;
+  owner?: string | null;
+  status: WorkflowTopicStatus;
+  review_status: WorkflowReviewStatus;
+  priority: WorkflowPriority;
+  scheduled_date?: string | null;
+  due_date?: string | null;
+  publish_channel: string;
+  content_goal?: string | null;
+  audience?: string | null;
+  material_file_ids: string[];
+  ragflow_dataset_ids: string[];
+  generation_job_id?: string | null;
+  confirmed_by?: string | null;
+  confirmed_at?: string | null;
+  published_at?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WorkflowTopicCreate = {
+  title: string;
+  brief?: string | null;
+  subject: string;
+  category?: string | null;
+  chapter?: string | null;
+  content_type: ContentType;
+  owner?: string | null;
+  status?: WorkflowTopicStatus;
+  review_status?: WorkflowReviewStatus;
+  priority?: WorkflowPriority;
+  scheduled_date?: string | null;
+  due_date?: string | null;
+  publish_channel?: string;
+  content_goal?: string | null;
+  audience?: string | null;
+  material_file_ids?: string[];
+  ragflow_dataset_ids?: string[];
+};
+
+export type WorkflowTopicPatch = Partial<WorkflowTopicCreate> & {
+  generation_job_id?: string | null;
+  confirmed_by?: string | null;
+  confirmed_at?: string | null;
+  published_at?: string | null;
+  actor?: string | null;
+  note?: string | null;
+};
+
+export type WorkflowEvent = {
+  id: string;
+  topic_id: string;
+  version: number;
+  event_type: string;
+  note?: string | null;
+  actor?: string | null;
+  snapshot: Record<string, unknown>;
+  created_at: string;
+};
+
+export type WorkflowGenerateResponse = {
+  topic: WorkflowTopic;
+  job_id: string;
 };
 
 export type LLMEndpointConfig = {
@@ -267,4 +363,33 @@ export const reviewModeLabels: Record<ReviewMode, string> = {
   llm_only: "纯大模型",
   document_only: "仅依据文档",
   hybrid: "混合审查",
+};
+
+export const workflowStatusLabels: Record<WorkflowTopicStatus, string> = {
+  idea: "选题池",
+  planned: "已排期",
+  drafting: "生成中",
+  generated: "待审查",
+  reviewing: "审查中",
+  needs_changes: "需修改",
+  awaiting_confirm: "待确认",
+  approved: "已确认",
+  exported: "已导出",
+  published: "已发布",
+  archived: "已归档",
+};
+
+export const workflowReviewStatusLabels: Record<WorkflowReviewStatus, string> = {
+  not_started: "未审查",
+  reviewing: "审查中",
+  passed: "已通过",
+  needs_changes: "需修改",
+  waived: "跳过审查",
+};
+
+export const workflowPriorityLabels: Record<WorkflowPriority, string> = {
+  low: "低",
+  medium: "中",
+  high: "高",
+  urgent: "紧急",
 };

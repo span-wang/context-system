@@ -46,6 +46,5 @@ async def delete_file(file_id: str) -> dict:
 
 
 @router.get("/files/{file_id}/preview")
-async def preview_file(file_id: str) -> dict:
-    return await get_library_service().preview(file_id)
-
+async def preview_file(file_id: str, max_chars: int = Query(4000, ge=1, le=500_000)) -> dict:
+    return await get_library_service().preview(file_id, max_chars=max_chars)

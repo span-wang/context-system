@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 
+from exporters.xiaohongshu import (
+    build_publish_package_from_markdown,
+    normalize_publish_package,
+    package_from_json_payload,
+)
 from llm.base import LLMProvider
 from schemas.context import GenerationContext
 from schemas.generation import Citation, Claim, GenerationResult
@@ -31,38 +37,85 @@ class LLMContentGenerator(BaseGenerator):
     async def generate(self, context: GenerationContext) -> GenerationResult:
         title = self.template._title(context)
         citations = self.template._citations(context)
-        markdown = await self.provider.chat(
+        layout_prompt = str(context.options.get("layout_prompt") or "").strip()
+        response = await self.provider.chat(
             [
-                {"role": "system", "content": _system_prompt()},
+                {"role": "system", "content": _system_prompt(structured=not layout_prompt)},
                 {"role": "user", "content": _user_prompt(context, title)},
             ],
             max_tokens=_max_output_tokens(context, self.endpoint.max_tokens),
         )
+        payload = None if layout_prompt else _parse_json_object(response)
+        if payload:
+            package = package_from_json_payload(payload)
+            markdown = _normalize_markdown(
+                str(payload.get("raw_markdown") or package.body or ""),
+                title,
+                unverified=not context.sources,
+            )
+            package = normalize_publish_package(
+                package,
+                title=title,
+                markdown=markdown,
+                context=context,
+                sections=[],
+                unverified=not context.sources,
+            )
+        else:
+            markdown = _normalize_markdown(response, title, unverified=not context.sources)
+            package = build_publish_package_from_markdown(
+                title=title,
+                markdown=markdown,
+                context=context,
+                sections=[],
+                unverified=not context.sources,
+            )
         markdown = _normalize_markdown(markdown, title, unverified=not context.sources)
         claims = _claims_from_markdown(markdown, citations)
+        sections = [
+            {
+                "title": "LLM 生成结果",
+                "items": [claim.text for claim in claims[:12]],
+                "citations": [c.model_dump() for c in citations],
+            }
+        ]
+        if not payload:
+            package = build_publish_package_from_markdown(
+                title=title,
+                markdown=markdown,
+                context=context,
+                sections=sections,
+                unverified=not context.sources,
+            )
+        else:
+            package = normalize_publish_package(
+                package,
+                title=title,
+                markdown=markdown,
+                context=context,
+                sections=sections,
+                unverified=not context.sources,
+            )
         return GenerationResult(
             content_type=context.content_type,
             title=title,
-            sections=[
-                {
-                    "title": "LLM 生成结果",
-                    "items": [claim.text for claim in claims[:12]],
-                    "citations": [c.model_dump() for c in citations],
-                }
-            ],
+            sections=sections,
             claims=claims,
             raw_markdown=markdown,
+            publish_package=package,
             unverified=not context.sources,
         )
 
 
-def _system_prompt() -> str:
-    return (
+def _system_prompt(*, structured: bool) -> str:
+    common = (
         "你是严谨的中文备考资料编辑，擅长把考试资料改写成小红书风格但不牺牲准确性。"
-        "只输出 Markdown 正文，不要包裹代码块，不要解释自己是模型。"
         "如果没有提供权威资料，必须在开头保留未核验提示，并避免编造具体条文、年份、税率或官方口径。"
         "如果提供了素材，优先依据素材，不确定的内容写成待核对。"
     )
+    if structured:
+        return common + "只输出合法 JSON，不要包裹代码块，不要解释自己是模型。"
+    return common + "只输出 Markdown 正文，不要包裹代码块，不要解释自己是模型。"
 
 
 def _user_prompt(context: GenerationContext, title: str) -> str:
@@ -81,8 +134,16 @@ def _user_prompt(context: GenerationContext, title: str) -> str:
         f"补充说明：{context.user_notes or '无'}",
         "",
         "输出要求：",
+        "- 只输出一个合法 JSON 对象，不要 Markdown 代码块。",
+        "- JSON 字段必须包含：title_options、body、cover_text、tags。",
+        "- title_options 必须是 5 个小红书笔记标题备选。",
+        "- body 是可直接发布的正文，保留 Markdown 标题、列表和表格。",
+        "- body 里只允许写正文，不要包含笔记标题备选、封面文案或标签建议。",
+        "- cover_text 是封面文案，适合放在封面图上，尽量 1-2 行。",
+        "- tags 是标签建议，不要带 #。",
+        "- 不要生成轮播图逐页文案，不要生成评论区引导。",
         f"- {CONTENT_GUIDANCE.get(context.content_type, '输出结构化备考资料。')}",
-        "- 标题层级清晰，适合直接复制到 Markdown 编辑器。",
+        "- 正文标题层级清晰，适合直接复制到 Markdown 编辑器。",
         "- 多用短段落、列表、表格，避免空泛套话。",
         "- 重要结论后补一句易错提醒或使用条件。",
     ]
@@ -167,6 +228,25 @@ def _normalize_markdown(markdown: str, title: str, unverified: bool) -> str:
         lines[insert_at:insert_at] = ["", warning, ""]
         text = "\n".join(lines)
     return text.strip() + "\n"
+
+
+def _parse_json_object(text: str) -> dict | None:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    candidates = [cleaned]
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(cleaned[start : end + 1])
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
 def _claims_from_markdown(markdown: str, citations: list[Citation]) -> list[Claim]:

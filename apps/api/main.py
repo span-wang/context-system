@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from deps import get_db, get_storage
-from routers import generate_router, history_router, library_router, system_router
+from routers import generate_router, history_router, library_router, system_router, workflow_router
 from settings import get_settings
 
 
@@ -25,6 +25,7 @@ app.add_middleware(
 app.include_router(library_router)
 app.include_router(generate_router)
 app.include_router(history_router)
+app.include_router(workflow_router)
 app.include_router(system_router)
 
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import unicodedata
 from datetime import datetime
 from uuid import uuid4
 
@@ -10,6 +12,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from deps import get_db, get_library_service, get_ragflow_provider
 from exporters.markdown import export_markdown
+from exporters.xiaohongshu import build_publish_package_from_markdown
 from generators import get_generator
 from generators.llm import LLMContentGenerator
 from llm.providers import get_llm_provider
@@ -189,17 +192,46 @@ def replace_review_item(job_id: str, item_id: str, request: ReviewItemReplaceReq
     replacement_text = (request.replacement_text if request.replacement_text is not None else item.replacement_text) or ""
     if not original_text.strip():
         raise HTTPException(status_code=422, detail="original_text is required before replacing")
-    if original_text not in job.result.raw_markdown:
+    body_slice = _body_slice(job.result.raw_markdown)
+    matches = _find_markdown_matches(body_slice["body"], original_text)
+    if not matches:
         raise HTTPException(status_code=409, detail="original_text was not found in the current Markdown")
+    matched_original = matches[0]
 
-    item.original_text = original_text
+    item.original_text = matched_original
     item.replacement_text = replacement_text
     if request.replace_all:
-        replace_count = job.result.raw_markdown.count(original_text)
-        job.result.raw_markdown = job.result.raw_markdown.replace(original_text, replacement_text)
+        replace_count = len(matches)
+        updated_body = _replace_matched_segments(body_slice["body"], matches, replacement_text)
+        job.result.raw_markdown = _merge_body_slice(job.result.raw_markdown, body_slice, updated_body)
+        if job.result.publish_package:
+            publish_matches = _find_markdown_matches(job.result.publish_package.body, original_text)
+            if publish_matches:
+                job.result.publish_package.body = _replace_matched_segments(
+                    job.result.publish_package.body,
+                    publish_matches,
+                    replacement_text,
+                )
     else:
         replace_count = 1
-        job.result.raw_markdown = job.result.raw_markdown.replace(original_text, replacement_text, 1)
+        updated_body = _replace_matched_segments(body_slice["body"], [matched_original], replacement_text)
+        job.result.raw_markdown = _merge_body_slice(job.result.raw_markdown, body_slice, updated_body)
+        if job.result.publish_package:
+            publish_matches = _find_markdown_matches(job.result.publish_package.body, original_text)
+            if publish_matches:
+                job.result.publish_package.body = _replace_matched_segments(
+                    job.result.publish_package.body,
+                    [publish_matches[0]],
+                    replacement_text,
+                )
+    if not job.result.publish_package:
+        job.result.publish_package = build_publish_package_from_markdown(
+            title=job.result.title,
+            markdown=job.result.raw_markdown,
+            context=job.context,
+            sections=job.result.sections,
+            unverified=job.result.unverified,
+        )
     item.replace_count += replace_count
     item.status = "replaced"
     get_db().update_job(job)
@@ -391,7 +423,7 @@ def _metadata_from_form(
     raw.setdefault("chapter", chapter)
     raw.setdefault("source_type", "other")
     raw.setdefault("source_authority", "medium")
-    raw.setdefault("source_title", "uploaded source")
+    raw.setdefault("source_title", "")
     raw.setdefault("tags", [])
     return FileMetadata.model_validate(raw)
 
@@ -425,3 +457,128 @@ def _loads_list(raw: str, field: str) -> list[str]:
     if not isinstance(value, list):
         raise HTTPException(status_code=422, detail=f"{field} must be a list")
     return [str(item) for item in value if item]
+
+
+def _find_markdown_matches(markdown: str, original_text: str) -> list[str]:
+    if not markdown or not original_text:
+        return []
+    if original_text in markdown:
+        return [original_text]
+
+    normalized_markdown, markdown_positions = _normalize_for_match(markdown)
+    normalized_original, _ = _normalize_for_match(original_text)
+    if not normalized_original:
+        return []
+
+    matches: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    start = 0
+    while True:
+        index = normalized_markdown.find(normalized_original, start)
+        if index < 0:
+            break
+        start_pos = markdown_positions[index]
+        end_index = index + len(normalized_original) - 1
+        end_pos = markdown_positions[end_index] + 1
+        key = (start_pos, end_pos)
+        if key not in seen:
+            seen.add(key)
+            matches.append(markdown[start_pos:end_pos])
+        start = index + 1
+    return matches
+
+
+def _replace_matched_segments(text: str, targets: list[str], replacement: str) -> str:
+    updated = text
+    for target in targets:
+        updated = updated.replace(target, replacement, 1)
+    return updated
+
+
+def _body_slice(markdown: str) -> dict[str, int | str]:
+    if not markdown:
+        return {"body": "", "start": 0, "end": 0}
+
+    body_section_pattern = re.compile(r"^\s{0,3}#{1,6}\s*(?:正文|发布正文)\s*$", flags=re.MULTILINE)
+    non_body_section_pattern = re.compile(
+        r"^\s{0,3}#{1,6}\s*(?:"
+        r"笔记标题(?:\s*5\s*个)?备选|"
+        r"标题(?:备选|建议)?|"
+        r"封面文案|"
+        r"轮播图逐页文案|"
+        r"轮播图|"
+        r"标签建议|"
+        r"评论区引导|"
+        r"评论引导"
+        r")\s*$",
+        flags=re.MULTILINE,
+    )
+
+    body_match = body_section_pattern.search(markdown)
+    if body_match:
+        start = body_match.end()
+        next_non_body = non_body_section_pattern.search(markdown, start)
+        end = next_non_body.start() if next_non_body else len(markdown)
+        return {"body": markdown[start:end].strip(), "start": start, "end": end}
+
+    first_non_body = non_body_section_pattern.search(markdown)
+    end = first_non_body.start() if first_non_body else len(markdown)
+    return {"body": markdown[:end].strip(), "start": 0, "end": end}
+
+
+def _merge_body_slice(markdown: str, body_slice: dict[str, int | str], new_body: str) -> str:
+    start = int(body_slice["start"])
+    end = int(body_slice["end"])
+
+    if start == 0:
+        suffix = markdown[end:]
+        return f"{new_body}{suffix}"
+
+    raw_segment = markdown[start:end]
+    leading_len = len(raw_segment) - len(raw_segment.lstrip())
+    trailing_len = len(raw_segment) - len(raw_segment.rstrip())
+    leading = raw_segment[:leading_len]
+    trailing = raw_segment[len(raw_segment) - trailing_len :] if trailing_len else ""
+    replacement = f"{leading}{new_body}{trailing}"
+    return f"{markdown[:start]}{replacement}{markdown[end:]}"
+
+
+def _normalize_for_match(text: str) -> tuple[str, list[int]]:
+    normalized_chars: list[str] = []
+    positions: list[int] = []
+    punctuation_map = {
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+        "（": "(",
+        "）": ")",
+        "：": ":",
+        "，": ",",
+        "；": ";",
+        "。": ".",
+        "、": ",",
+        "＋": "+",
+        "－": "-",
+        "—": "-",
+        "–": "-",
+        "−": "-",
+        "＝": "=",
+        "…": "...",
+        "·": ".",
+    }
+    for index, char in enumerate(text):
+        if char.isspace():
+            continue
+        if char in {"*", "`", "_"}:
+            continue
+        normalized = punctuation_map.get(char, char)
+        normalized = unicodedata.normalize("NFKC", normalized)
+        if normalized.isspace():
+            continue
+        for normalized_char in normalized:
+            if normalized_char.isspace():
+                continue
+            normalized_chars.append(normalized_char)
+            positions.append(index)
+    return "".join(normalized_chars), positions

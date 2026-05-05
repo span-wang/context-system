@@ -16,7 +16,9 @@ import {
   UploadCloud,
   Wand2,
 } from "lucide-react";
+import PublishPackagePreview, { formatPublishBody } from "../../components/PublishPackagePreview";
 import ReviewActionList from "../../components/ReviewActionList";
+import ReviewFloatingPanel from "../../components/ReviewFloatingPanel";
 import {
   API_BASE,
   LAYOUT_API_BASE,
@@ -43,6 +45,7 @@ const generationDraftKey = "context-for-xhs:generation-draft";
 const generationJobKey = "context-for-xhs:last-generation-job";
 const generationJobIdKey = "context-for-xhs:last-generation-job-id";
 const reviewModeKey = "context-for-xhs:review-mode";
+const promptSourcePreviewChars = 200_000;
 const layoutPromptKey = "context-for-xhs:layout-prompt";
 const reviewModes = Object.keys(reviewModeLabels) as ReviewMode[];
 const activeGenerationStatuses = new Set<GenerationJob["status"]>([
@@ -51,6 +54,7 @@ const activeGenerationStatuses = new Set<GenerationJob["status"]>([
   "generating",
   "reviewing",
 ]);
+const placeholderSourceTitles = new Set(["批量上传资料", "uploaded source"]);
 
 type GenerationMode = "direct" | "ragflow";
 type GenerationForm = {
@@ -87,6 +91,11 @@ const defaultForm: GenerationForm = {
 
 function isActiveGeneration(job: GenerationJob) {
   return activeGenerationStatuses.has(job.status);
+}
+
+function displayLibraryFileTitle(file: Pick<LibraryFile, "source_title" | "filename">) {
+  const title = file.source_title?.trim();
+  return title && !placeholderSourceTitles.has(title) ? title : file.filename;
 }
 
 function readMemory<T>(key: string): T | null {
@@ -162,6 +171,8 @@ export default function GeneratePage() {
   const [ragflowLoading, setRagflowLoading] = useState(false);
   const [ragflowMessage, setRagflowMessage] = useState("");
   const [openMultiSelect, setOpenMultiSelect] = useState<"library" | "ragflow" | null>(null);
+  const [reviewPanelOpen, setReviewPanelOpen] = useState(false);
+  const [highlightText, setHighlightText] = useState("");
 
   async function loadFiles() {
     const data = await apiFetch<LibraryFile[]>("/api/library/files");
@@ -364,7 +375,7 @@ export default function GeneratePage() {
     [files, selected]
   );
   const selectedFileNames = useMemo(
-    () => [...selectedFiles.map((file) => file.source_title || file.filename), ...selectedMissingFileIds],
+    () => [...selectedFiles.map((file) => displayLibraryFileTitle(file)), ...selectedMissingFileIds],
     [selectedFiles, selectedMissingFileIds]
   );
   const selectedFileSummary = selected.length
@@ -488,7 +499,9 @@ export default function GeneratePage() {
 
     if (mode === "direct" && selected.length) {
       const previews = await Promise.all(
-        selected.map((fileId) => apiFetch<LibraryFilePreview>(`/api/library/files/${fileId}/preview`))
+        selected.map((fileId) =>
+          apiFetch<LibraryFilePreview>(`/api/library/files/${fileId}/preview?max_chars=${promptSourcePreviewChars}`)
+        )
       );
       blocks.push("【素材库资料】");
       previews.forEach((preview, index) => {
@@ -533,9 +546,9 @@ export default function GeneratePage() {
   }
 
   async function copyResult() {
-    if (!job?.result?.raw_markdown) return;
-    await navigator.clipboard.writeText(job.result.raw_markdown);
-    setMessage("产出内容已复制。");
+    if (!job?.result) return;
+    await navigator.clipboard.writeText(formatPublishBody(job.result.publish_package, job.result.raw_markdown));
+    setMessage("正文已复制。");
   }
 
   async function publishToLayout() {
@@ -631,16 +644,16 @@ export default function GeneratePage() {
     body.append("save_uploads_to_library", String(saveUploads));
     body.append(
       "batch_meta",
-      JSON.stringify({
-        subject: form.subject,
-        category: form.category || null,
-        chapter: form.chapter || null,
-        source_type: "note",
-        source_authority: "medium",
-        source_title: `${form.subject}-${form.chapter || form.category || "uploaded"}`,
-        tags: ["direct-upload"],
-      })
-    );
+        JSON.stringify({
+          subject: form.subject,
+          category: form.category || null,
+          chapter: form.chapter || null,
+          source_type: "note",
+          source_authority: "medium",
+          source_title: "",
+          tags: ["direct-upload"],
+        })
+      );
     Array.from(uploadFiles || []).forEach((file) => body.append("new_uploads", file));
     return apiFetch<{ job_id: string }>("/api/generate/multipart", { method: "POST", body });
   }
@@ -648,6 +661,8 @@ export default function GeneratePage() {
   async function runContentReview() {
     if (!job?.result) return;
     setReviewing(true);
+    setHighlightText("");
+    setReviewPanelOpen(true);
     setMessage("正在内容审查...");
     setJob((current) => {
       const nextJob = current ? { ...current, status: "reviewing" as const } : current;
@@ -661,6 +676,7 @@ export default function GeneratePage() {
       });
       applyJob(updated);
       setMessage("内容审查完成。");
+      setReviewPanelOpen(true);
     } catch (error) {
       const fallback = await apiFetch<GenerationJob>(`/api/generate/${job.id}`).catch(() => null);
       if (fallback) applyJob(fallback);
@@ -668,6 +684,11 @@ export default function GeneratePage() {
     } finally {
       setReviewing(false);
     }
+  }
+
+  function openReviewPanel() {
+    if (!job?.review) return;
+    setReviewPanelOpen(true);
   }
 
   return (
@@ -850,7 +871,7 @@ export default function GeneratePage() {
                             <SquareCheck size={15} />
                           </span>
                           <span className="multiSelectOptionBody">
-                            <strong>{file.source_title || file.filename}</strong>
+                            <strong>{displayLibraryFileTitle(file)}</strong>
                             <small>
                               {file.subject} / {file.category || "未分类"} / {file.chapter || "未填章节"}
                             </small>
@@ -898,6 +919,7 @@ export default function GeneratePage() {
                     hidden
                     multiple
                     type="file"
+                    accept=".pdf,.doc,.docx,.md,.markdown,.txt,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,application/pdf,image/*"
                     onChange={(event) => setUploadFiles(event.target.files)}
                   />
                 </label>
@@ -1014,7 +1036,7 @@ export default function GeneratePage() {
         <div className="panel">
           <div className="panelHeader">
             <h2>生成结果</h2>
-            <p>任务完成后展示 Markdown，可手动发起内容审查。</p>
+            <p>任务完成后展示小红书发布包，可手动发起内容审查。</p>
           </div>
           <div className="panelBody">
             {!job && <div className="empty">还没有生成任务。</div>}
@@ -1036,7 +1058,7 @@ export default function GeneratePage() {
                   {job.result && (
                     <button className="button" type="button" onClick={copyResult}>
                       <Clipboard size={16} />
-                      复制内容
+                      复制正文
                     </button>
                   )}
                   {job.result && (
@@ -1044,7 +1066,7 @@ export default function GeneratePage() {
                       className="button"
                       disabled={reviewing || job.status === "reviewing"}
                       type="button"
-                      onClick={runContentReview}
+                      onClick={job.review ? openReviewPanel : runContentReview}
                     >
                       <ShieldCheck size={16} />
                       内容审查
@@ -1083,20 +1105,12 @@ export default function GeneratePage() {
                   </div>
                 )}
                 {job.result && (
-                  <pre className="markdown" ref={markdownRef}>
-                    {job.result.raw_markdown}
-                  </pre>
-                )}
-                {job.result && !job.review && job.status !== "reviewing" && (
-                  <div className="empty">尚未内容审查。</div>
-                )}
-                {job.status === "reviewing" && <div className="empty">正在内容审查...</div>}
-                {job.review && (
-                  <ReviewActionList
-                    job={job}
-                    markdownRef={markdownRef}
-                    onJobChange={applyJob}
-                    onMessage={setMessage}
+                  <PublishPackagePreview
+                    fallbackMarkdown={job.result.raw_markdown}
+                    fallbackTitle={job.result.title}
+                    packageData={job.result.publish_package}
+                    refEl={markdownRef}
+                    highlightText={highlightText}
                   />
                 )}
               </div>
@@ -1104,6 +1118,51 @@ export default function GeneratePage() {
           </div>
         </div>
       </section>
+      <ReviewFloatingPanel
+        open={reviewPanelOpen}
+        title="内容审查"
+        subtitle={
+          job?.status === "reviewing"
+            ? "正在内容审查..."
+            : job?.result?.title || "当前生成结果"
+        }
+        onClose={() => {
+          setReviewPanelOpen(false);
+        }}
+      >
+        {!job || (!job.review && job.status !== "reviewing") ? (
+          <div className="empty compact">还没有可查看的审查结果。</div>
+        ) : job.status === "reviewing" && !job.review ? (
+          <div className="empty compact">正在内容审查...</div>
+        ) : job.review ? (
+          <div className="formGrid">
+            <div className="buttonRow">
+              <span className={job.review.pass_overall ? "badge pass" : "badge low"}>
+                {job.review.pass_overall ? "审查通过" : "需复核"}
+              </span>
+              <span className="badge">{reviewModeLabels[job.review.mode]}</span>
+              {job.review.strict_mode ? <span className="badge high">严格</span> : <span className="badge unverified">非严格</span>}
+              <button
+                className="button"
+                disabled={reviewing || job.status === "reviewing"}
+                type="button"
+                onClick={runContentReview}
+              >
+                <RefreshCw size={16} />
+                重新审查
+              </button>
+            </div>
+            {job.review.unverified_warning ? <p className="muted">{job.review.unverified_warning}</p> : null}
+            <ReviewActionList
+              job={job}
+              markdownRef={markdownRef}
+              onJobChange={applyJob}
+              onLocate={setHighlightText}
+              onMessage={setMessage}
+            />
+          </div>
+        ) : null}
+      </ReviewFloatingPanel>
     </>
   );
 }

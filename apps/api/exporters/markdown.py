@@ -1,3 +1,4 @@
+from exporters.xiaohongshu import build_publish_package_from_markdown, render_publish_package
 from schemas.generation import GenerationJob
 
 
@@ -11,6 +12,14 @@ MODE_LABELS = {
 def export_markdown(job: GenerationJob) -> str:
     if not job.result:
         return "# 生成尚未完成\n"
+    publish_package = job.result.publish_package or build_publish_package_from_markdown(
+        title=job.result.title,
+        markdown=job.result.raw_markdown,
+        context=job.context,
+        sections=job.result.sections,
+        unverified=job.result.unverified,
+    )
+    content = render_publish_package(publish_package, fallback_title=job.result.title)
     report_lines = []
     if job.review:
         status = "通过" if job.review.pass_overall else "需复核"
@@ -38,4 +47,5 @@ def export_markdown(job: GenerationJob) -> str:
                 report_lines.append(f"- [{item.status}] {item.issue}")
                 if item.replace_count:
                     report_lines.append(f"  - 已替换：{item.replace_count} 处")
-    return job.result.raw_markdown.rstrip() + "\n" + "\n".join(report_lines).rstrip() + "\n"
+    report = "\n".join(report_lines).rstrip()
+    return content.rstrip() + "\n" + (report + "\n" if report else "")

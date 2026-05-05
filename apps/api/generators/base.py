@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 
+from exporters.xiaohongshu import build_publish_package_from_markdown
 from schemas.context import GenerationContext
 from schemas.generation import Citation, Claim, GenerationResult
 
@@ -35,12 +36,20 @@ class TemplateGenerator(BaseGenerator):
         title = self._title(context)
         sections = self._sections(context, outline, citations)
         markdown = self._markdown(title, sections, citations, unverified=not context.sources)
+        publish_package = build_publish_package_from_markdown(
+            title=title,
+            markdown=markdown,
+            context=context,
+            sections=sections,
+            unverified=not context.sources,
+        )
         return GenerationResult(
             content_type=context.content_type,
             title=title,
             sections=sections,
             claims=claims,
             raw_markdown=markdown,
+            publish_package=publish_package,
             unverified=not context.sources,
         )
 
@@ -128,4 +137,3 @@ def _sentences(text: str) -> list[str]:
             continue
         sentences.append(item[:220])
     return sentences
-

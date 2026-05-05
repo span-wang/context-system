@@ -2,7 +2,9 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { FileText, RefreshCw, Trash2, UploadCloud } from "lucide-react";
-import { apiFetch, LibraryFile, SubjectConfig, SystemConfig } from "../../lib/api";
+import { apiFetch, LibraryFile, LibraryFilePreview, SubjectConfig, SystemConfig } from "../../lib/api";
+
+const libraryPreviewChars = 200_000;
 
 const sourceTypes = [
   ["textbook", "教材"],
@@ -18,7 +20,7 @@ export default function LibraryPage() {
   const [uploadFiles, setUploadFiles] = useState<FileList | null>(null);
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
-  const [preview, setPreview] = useState<{ filename: string; text: string; token_count: number } | null>(null);
+  const [preview, setPreview] = useState<LibraryFilePreview | null>(null);
   const [subjects, setSubjects] = useState<SubjectConfig[]>([]);
   const [meta, setMeta] = useState({
     subject: "",
@@ -79,7 +81,7 @@ export default function LibraryPage() {
         "batch_meta",
         JSON.stringify({
           ...meta,
-          source_title: meta.source_title || "批量上传资料",
+          source_title: meta.source_title.trim(),
           year: meta.year ? Number(meta.year) : null,
           tags: meta.tags.split(/[，,\s]+/).filter(Boolean),
         })
@@ -100,8 +102,8 @@ export default function LibraryPage() {
   }
 
   async function showPreview(file: LibraryFile) {
-    const data = await apiFetch<{ filename: string; text: string; token_count: number }>(
-      `/api/library/files/${file.id}/preview`
+    const data = await apiFetch<LibraryFilePreview>(
+      `/api/library/files/${file.id}/preview?max_chars=${libraryPreviewChars}`
     );
     setPreview(data);
     await loadFiles();
@@ -130,11 +132,12 @@ export default function LibraryPage() {
             <label className="dropzone">
               <UploadCloud size={28} />
               <strong>{uploadFiles?.length ? `${uploadFiles.length} 个文件已选择` : "选择或拖入资料"}</strong>
-              <span>PDF / DOCX / Markdown / TXT</span>
+              <span>PDF / 图片 / DOCX / Markdown / TXT</span>
               <input
                 hidden
                 multiple
                 type="file"
+                accept=".pdf,.doc,.docx,.md,.markdown,.txt,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,application/pdf,image/*"
                 onChange={(event) => setUploadFiles(event.target.files)}
               />
             </label>
@@ -285,7 +288,7 @@ export default function LibraryPage() {
                         <span className={`badge ${file.source_authority}`}>{file.source_authority}</span>
                         <div className="muted">{file.source_title}</div>
                       </td>
-                      <td>{file.token_count ? file.token_count.toLocaleString() : "未解析"}</td>
+                      <td>{renderTokenStatus(file)}</td>
                       <td>
                         <div className="buttonRow">
                           <button className="button" type="button" onClick={() => showPreview(file)}>
@@ -319,6 +322,12 @@ export default function LibraryPage() {
       )}
     </>
   );
+}
+
+function renderTokenStatus(file: LibraryFile) {
+  if (file.token_count == null) return "未解析";
+  if (file.token_count === 0) return "解析为空";
+  return file.token_count.toLocaleString();
 }
 
 type LibraryMeta = {

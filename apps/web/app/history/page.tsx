@@ -2,7 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Clipboard, Download, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import PublishPackagePreview, { formatPublishBody } from "../../components/PublishPackagePreview";
 import ReviewActionList from "../../components/ReviewActionList";
+import ReviewFloatingPanel from "../../components/ReviewFloatingPanel";
 import {
   API_BASE,
   apiFetch,
@@ -21,6 +23,8 @@ export default function HistoryPage() {
   const [message, setMessage] = useState("");
   const [reviewingId, setReviewingId] = useState<string | null>(null);
   const [reviewMode, setReviewMode] = useState<ReviewMode>("hybrid");
+  const [reviewPanelOpen, setReviewPanelOpen] = useState(false);
+  const [highlightText, setHighlightText] = useState("");
   const markdownRef = useRef<HTMLPreElement | null>(null);
 
   async function loadJobs() {
@@ -61,6 +65,8 @@ export default function HistoryPage() {
   async function runContentReview(job: GenerationJob) {
     if (!job.result) return;
     setReviewingId(job.id);
+    setHighlightText("");
+    setReviewPanelOpen(true);
     setMessage("正在内容审查...");
     updateJob({ ...job, status: "reviewing" });
     try {
@@ -70,6 +76,8 @@ export default function HistoryPage() {
       });
       updateJob(updated);
       setMessage("内容审查完成。");
+      setSelected(updated);
+      setReviewPanelOpen(true);
     } catch (error) {
       const fallback = await apiFetch<GenerationJob>(`/api/generate/${job.id}`).catch(() => null);
       if (fallback) updateJob(fallback);
@@ -79,10 +87,17 @@ export default function HistoryPage() {
     }
   }
 
-  async function copyResult(markdown: string) {
-    if (!markdown) return;
-    await navigator.clipboard.writeText(markdown);
-    setMessage("产出内容已复制。");
+  function openReviewPanel() {
+    if (!selected?.review) return;
+    setReviewPanelOpen(true);
+  }
+
+  async function copyResult(job: GenerationJob) {
+    if (!job.result) return;
+    await navigator.clipboard.writeText(
+      formatPublishBody(job.result.publish_package, job.result.raw_markdown)
+    );
+    setMessage("正文已复制。");
   }
 
   return (
@@ -90,7 +105,7 @@ export default function HistoryPage() {
       <header className="pageHeader">
         <div>
           <h1>历史 & 审查</h1>
-          <p>回看所有生成任务，定位未核验结果、审查问题和 Markdown 导出。</p>
+          <p>回看所有生成任务，定位未核验结果、审查问题和发布包导出。</p>
         </div>
         <button className="button" type="button" onClick={loadJobs}>
           <RefreshCw size={17} />
@@ -140,13 +155,13 @@ export default function HistoryPage() {
                         <div className="buttonRow">
                           {job.result && (
                             <button
-                              aria-label="复制产出内容"
+                              aria-label="复制正文"
                               className="button"
-                              title="复制产出内容"
+                              title="复制正文"
                               type="button"
                               onClick={(event) => {
                                 event.stopPropagation();
-                                copyResult(job.result?.raw_markdown || "").catch((error) => setMessage(error.message));
+                                copyResult(job).catch((error) => setMessage(error.message));
                               }}
                             >
                               <Clipboard size={16} />
@@ -199,9 +214,9 @@ export default function HistoryPage() {
                   {selected.review && !selected.review.strict_mode ? <span className="badge unverified">非严格</span> : null}
                   {selected.review && <span className="badge">{reviewModeLabels[selected.review.mode || "hybrid"]}</span>}
                   {selected.result && (
-                    <button className="button" type="button" onClick={() => copyResult(selected.result?.raw_markdown || "")}>
+                    <button className="button" type="button" onClick={() => copyResult(selected)}>
                       <Clipboard size={16} />
-                      复制内容
+                      复制正文
                     </button>
                   )}
                   {selected.result && (
@@ -209,7 +224,7 @@ export default function HistoryPage() {
                       className="button"
                       disabled={reviewingId === selected.id || selected.status === "reviewing"}
                       type="button"
-                      onClick={() => runContentReview(selected)}
+                      onClick={() => (selected.review ? openReviewPanel() : runContentReview(selected))}
                     >
                       <ShieldCheck size={16} />
                       内容审查
@@ -231,28 +246,6 @@ export default function HistoryPage() {
                   </div>
                 )}
                 {selected.review?.unverified_warning && <p className="muted">{selected.review.unverified_warning}</p>}
-                {!selected.review && selected.status === "reviewing" && <div className="empty">正在内容审查...</div>}
-                {!selected.review && selected.status !== "reviewing" && <div className="empty">尚未内容审查。</div>}
-                {selected.review && (
-                  <>
-                    <ReviewActionList
-                      job={selected}
-                      markdownRef={markdownRef}
-                      onJobChange={updateJob}
-                      onMessage={setMessage}
-                    />
-                    <h3>建议</h3>
-                    <ul className="issueList">
-                      {(selected.review.suggestions.length ? selected.review.suggestions : ["无需额外建议。"]).map((item) => (
-                        <li key={item}>{item}</li>
-                      ))}
-                    </ul>
-                    <div className="reviewMeta">
-                      <span>审查模型：{selected.review.llm_used ? "已使用" : "未使用"}</span>
-                      <span>依据文档：{selected.review.evidence_source_count} 份</span>
-                    </div>
-                  </>
-                )}
               </>
             )}
           </div>
@@ -265,21 +258,81 @@ export default function HistoryPage() {
             <div className="panelHeaderActions">
               <div>
                 <h2>{selected.result.title}</h2>
-                <p>Markdown 预览</p>
+                <p>小红书发布包预览</p>
               </div>
-              <button className="button" type="button" onClick={() => copyResult(selected.result?.raw_markdown || "")}>
+              <button className="button" type="button" onClick={() => copyResult(selected)}>
                 <Clipboard size={16} />
-                复制内容
+                复制正文
               </button>
             </div>
           </div>
           <div className="panelBody">
-            <pre className="markdown" ref={markdownRef}>
-              {selected.result.raw_markdown}
-            </pre>
+            <PublishPackagePreview
+              fallbackMarkdown={selected.result.raw_markdown}
+              fallbackTitle={selected.result.title}
+              packageData={selected.result.publish_package}
+              refEl={markdownRef}
+              highlightText={highlightText}
+            />
           </div>
         </section>
       )}
+      <ReviewFloatingPanel
+        open={reviewPanelOpen}
+        title="内容审查"
+        subtitle={
+          selected?.status === "reviewing"
+            ? "正在内容审查..."
+            : selected?.result?.title || selected?.id || "当前任务"
+        }
+        onClose={() => {
+          setReviewPanelOpen(false);
+        }}
+      >
+        {!selected ? (
+          <div className="empty compact">未选择任务。</div>
+        ) : selected.status === "reviewing" && !selected.review ? (
+          <div className="empty compact">正在内容审查...</div>
+        ) : selected.review ? (
+          <div className="formGrid">
+            <div className="buttonRow">
+              <span className={selected.review.pass_overall ? "badge pass" : "badge low"}>
+                {selected.review.pass_overall ? "审查通过" : "需复核"}
+              </span>
+              <span className="badge">{reviewModeLabels[selected.review.mode || "hybrid"]}</span>
+              {selected.review.strict_mode ? <span className="badge high">严格</span> : <span className="badge unverified">非严格</span>}
+              <button
+                className="button"
+                disabled={reviewingId === selected.id || selected.status === "reviewing"}
+                type="button"
+                onClick={() => runContentReview(selected)}
+              >
+                <RefreshCw size={16} />
+                重新审查
+              </button>
+            </div>
+            <ReviewActionList
+              job={selected}
+              markdownRef={markdownRef}
+              onJobChange={updateJob}
+              onLocate={setHighlightText}
+              onMessage={setMessage}
+            />
+            <h3>建议</h3>
+            <ul className="issueList">
+              {(selected.review.suggestions.length ? selected.review.suggestions : ["无需额外建议。"]).map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+            </ul>
+            <div className="reviewMeta">
+              <span>审查模型：{selected.review.llm_used ? "已使用" : "未使用"}</span>
+              <span>依据文档：{selected.review.evidence_source_count} 份</span>
+            </div>
+          </div>
+        ) : (
+          <div className="empty compact">尚未内容审查。</div>
+        )}
+      </ReviewFloatingPanel>
     </>
   );
 }
