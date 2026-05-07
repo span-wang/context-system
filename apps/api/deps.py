@@ -9,8 +9,7 @@ from storage.local import LocalFSStorage
 
 @lru_cache
 def get_db() -> Database:
-    settings = get_settings()
-    return Database(settings.db.sqlite_path)
+    return Database()
 
 
 @lru_cache
@@ -27,4 +26,3 @@ def get_library_service() -> LibraryService:
 @lru_cache
 def get_ragflow_provider() -> RAGFlowProvider:
     return RAGFlowProvider(get_settings().ragflow)
-

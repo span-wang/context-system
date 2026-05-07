@@ -1,0 +1,7 @@
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: C:\Users\YOUR_USER\.cloudflared\YOUR_TUNNEL_UUID.json
+
+ingress:
+  - hostname: context.panspan.cloud
+    service: http://127.0.0.1:3000
+  - service: http_status:404

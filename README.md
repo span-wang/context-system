@@ -37,9 +37,41 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
+### MySQL 迁移
+
+推荐把迁移和启动拆开执行，先把数据库迁移到目标 revision，再决定是否带种子启动应用。
+
+```powershell
+# 使用当前 DB_URL 执行迁移
+powershell -ExecutionPolicy Bypass -File .\scripts\db-migrate.ps1
+
+# 启动项目自管 MySQL，迁移到 head，并写入种子数据
+powershell -ExecutionPolicy Bypass -File .\scripts\db-migrate.ps1 -UseLocalMySql -MySqlPort 3309 -MySqlDatabase exam_kit_local -SeedData
+
+# 只查看迁移状态，不重复执行 upgrade
+powershell -ExecutionPolicy Bypass -File .\scripts\db-migrate.ps1 -UseLocalMySql -SkipMigrate
+```
+
+迁移相关环境变量：
+
+- `DB_URL`
+- `DB_AUTO_MIGRATE`
+- `DB_SEED_ON_STARTUP`
+- `DB_MIGRATION_TARGET`
+
+说明：
+
+- `DB_AUTO_MIGRATE=true` 时，API 启动会自动执行迁移。
+- `DB_SEED_ON_STARTUP=true` 时，空库启动会自动写入演示数据。
+- `DB_MIGRATION_TARGET` 默认为 `head`，用于预留后续按 revision 灰度迁移的入口。
+- `/platform/api/system/status` 现在会返回 Alembic 当前 revision、head revision、迁移状态和数据库连通性，可直接用来判断迁移链路是否健康。
+
 说明：
 - 素材库现在支持上传 `PDF / 图片 / DOCX / Markdown / TXT`。
 - 普通 PDF 会优先提取可选中文本；扫描版 PDF 和图片会自动尝试 OCR。
+- 系统默认使用 `PaddleOCR` 做 PDF OCR，默认模型为 `PP-OCRv5_server_det` + `PP-OCRv5_server_rec`；`PyMuPDF` 仍用于可选中文本直提。
+- `PDF_OCR_ENGINE` 保留为兼容配置项，默认值为 `paddle`。
+- 如果机器性能不足，可在环境变量中把 `PDF_OCR_DETECTION_MODEL` / `PDF_OCR_RECOGNITION_MODEL` 改回 `PP-OCRv5_mobile_det` / `PP-OCRv5_mobile_rec`，或关闭 `PDF_OCR_USE_TEXTLINE_ORIENTATION`。
 - 如果扫描件预览仍为空，通常是图片清晰度过低，或 OCR 依赖没有安装成功。
 
 ### 前端

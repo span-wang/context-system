@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
@@ -296,12 +296,29 @@ export default function WorkflowPage() {
       applyTopic(updated);
       await loadEvents(topic.id);
       await loadTopics();
-      setMessage("内容审查完成。");
+      setMessage("内容审查已入队。");
+      pollTopicReview(topic.id);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "内容审查失败");
     } finally {
       setBusyId(null);
     }
+  }
+
+  async function pollTopicReview(topicId: string) {
+    for (let index = 0; index < 120; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const latest = await apiFetch<WorkflowTopic>(`/api/workflow/topics/${topicId}`).catch(() => null);
+      if (!latest) return;
+      applyTopic(latest);
+      if (latest.status !== "reviewing") {
+        await loadEvents(topicId);
+        await loadTopics();
+        setMessage(latest.review_status === "passed" ? "内容审查完成。" : "内容审查需要复核。");
+        return;
+      }
+    }
+    setMessage("内容审查仍在运行，请稍后刷新。");
   }
 
   async function confirmTopic(topic: WorkflowTopic) {
@@ -746,12 +763,12 @@ export default function WorkflowPage() {
                         <FileText size={16} />
                         素材引用
                       </strong>
-                      {selected.material_file_ids.map((fileId) => {
+                      {(selected.material_file_ids || []).map((fileId) => {
                         const file = files.find((item) => item.id === fileId);
                         return <span key={fileId}>{file?.source_title || file?.filename || fileId}</span>;
                       })}
-                      {!selected.material_file_ids.length && !selected.ragflow_dataset_ids.length && <span>未绑定素材</span>}
-                      {selected.ragflow_dataset_ids.map((datasetId) => (
+                      {!(selected.material_file_ids || []).length && !(selected.ragflow_dataset_ids || []).length && <span>未绑定素材</span>}
+                      {(selected.ragflow_dataset_ids || []).map((datasetId) => (
                         <span key={datasetId}>RAGFlow: {datasetId}</span>
                       ))}
                     </div>

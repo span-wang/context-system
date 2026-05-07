@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { ChangeEvent, RefObject, useMemo, useState } from "react";
 import { Check, LocateFixed, Replace, Save, X } from "lucide-react";

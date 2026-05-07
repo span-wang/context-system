@@ -3,7 +3,8 @@ from __future__ import annotations
 from fastapi import APIRouter, File, Form, Query, UploadFile
 
 from deps import get_library_service
-from schemas.library import LibraryFile, LibraryFilePatch
+from library.parse_options import DocumentParseOptions, ParsePreset
+from schemas.library import LibraryFile, LibraryFilePatch, LibraryFilePreview
 
 
 router = APIRouter(prefix="/api/library", tags=["library"])
@@ -45,6 +46,29 @@ async def delete_file(file_id: str) -> dict:
     return {"ok": True}
 
 
-@router.get("/files/{file_id}/preview")
-async def preview_file(file_id: str, max_chars: int = Query(4000, ge=1, le=500_000)) -> dict:
-    return await get_library_service().preview(file_id, max_chars=max_chars)
+@router.get("/files/{file_id}/preview", response_model=LibraryFilePreview)
+async def preview_file(
+    file_id: str,
+    max_chars: int = Query(4000, ge=1, le=500_000),
+    preset: ParsePreset = Query("auto"),
+    force_ocr: bool | None = Query(None),
+    render_dpi: int | None = Query(None, ge=96, le=300),
+    crop_header_ratio: float | None = Query(None, ge=0.0, le=0.2),
+    crop_footer_ratio: float | None = Query(None, ge=0.0, le=0.2),
+    trim_margins: bool | None = Query(None),
+    remove_repeated_lines: bool | None = Query(None),
+    watermark_detection: bool | None = Query(None),
+    enable_formula_recognition: bool | None = Query(None),
+) -> LibraryFilePreview:
+    options = DocumentParseOptions(
+        preset=preset,
+        force_ocr=force_ocr,
+        render_dpi=render_dpi,
+        crop_header_ratio=crop_header_ratio,
+        crop_footer_ratio=crop_footer_ratio,
+        trim_margins=trim_margins,
+        remove_repeated_lines=remove_repeated_lines,
+        watermark_detection=watermark_detection,
+        enable_formula_recognition=enable_formula_recognition,
+    )
+    return await get_library_service().preview(file_id, max_chars=max_chars, options=options)

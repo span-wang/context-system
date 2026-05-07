@@ -46,6 +46,20 @@ class LibraryFile(BaseModel):
     last_used_at: datetime | None = None
 
 
+class LibraryFilePreview(BaseModel):
+    file_id: str
+    filename: str
+    token_count: int
+    provider: str = "unknown"
+    text: str
+    markdown: str
+    table_count: int = 0
+    warning_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
+    truncated: bool
+    parse_options: dict[str, object] = Field(default_factory=dict)
+
+
 class LibraryFilePatch(BaseModel):
     filename: str | None = None
     subject: str | None = None
@@ -59,4 +73,3 @@ class LibraryFilePatch(BaseModel):
     source_version: str | None = None
     year: int | None = None
     tags: list[str] | None = None
-

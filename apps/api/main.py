@@ -1,8 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.router import api_router
+from app.db.bootstrap import initialize_database
+from app.middleware.audit import FailedRequestAuditMiddleware
+from background import start_background_worker, stop_background_worker
 from deps import get_db, get_storage
-from routers import generate_router, history_router, library_router, system_router, workflow_router
+from routers import generate_router, history_router, library_router, system_router, tasks_router, workflow_router
 from settings import get_settings
 
 
@@ -21,15 +25,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(FailedRequestAuditMiddleware)
 
 app.include_router(library_router)
 app.include_router(generate_router)
 app.include_router(history_router)
 app.include_router(workflow_router)
 app.include_router(system_router)
+app.include_router(tasks_router)
+
+# New professional platform APIs are mounted under a dedicated namespace
+# so the original product remains the default entry point.
+app.include_router(api_router, prefix="/platform")
 
 
 @app.on_event("startup")
 async def startup() -> None:
     get_db()
     get_storage()
+    initialize_database()
+    await start_background_worker()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await stop_background_worker()

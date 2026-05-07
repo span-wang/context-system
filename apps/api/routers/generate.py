@@ -11,6 +11,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from deps import get_db, get_library_service, get_ragflow_provider
+from background import enqueue_background_task, register_task_handler
 from exporters.markdown import export_markdown
 from exporters.xiaohongshu import build_publish_package_from_markdown
 from generators import get_generator
@@ -34,7 +35,7 @@ async def create_generation(request: GenerationRequest) -> dict:
     context = await _initial_context(request)
     _ensure_context_size(context)
     job = _create_job(context)
-    asyncio.create_task(_run_generation(job.id, request))
+    _enqueue_generation_job(job.id, request)
     return {"job_id": job.id}
 
 
@@ -66,7 +67,7 @@ async def create_generation_multipart(
     )
     _ensure_context_size(context)
     job = _create_job(context)
-    asyncio.create_task(_run_generation(job.id, None))
+    _enqueue_generation_job(job.id, None)
     return {"job_id": job.id}
 
 
@@ -127,7 +128,7 @@ async def retry_generation(job_id: str) -> dict:
     job.result = None
     job.review = None
     get_db().update_job(job)
-    asyncio.create_task(_run_generation(job.id, request))
+    _enqueue_generation_job(job.id, request)
     return {"job_id": job.id}
 
 
@@ -144,6 +145,16 @@ async def review_generation(job_id: str, request: ReviewRequest | None = None) -
     job.status = "reviewing"
     job.error = None
     get_db().update_job(job)
+    _enqueue_review_job(job.id, request)
+    return job
+
+
+async def run_review_job(job_id: str, request: ReviewRequest | None = None) -> GenerationJob:
+    job = get_db().get_job(job_id)
+    if not job:
+        raise RuntimeError("generation job not found")
+    if not job.result:
+        raise RuntimeError("generation result is not ready")
     try:
         settings = get_settings()
         endpoint = settings.llm.reviewer
@@ -165,7 +176,7 @@ async def review_generation(job_id: str, request: ReviewRequest | None = None) -
         job.status = "done"
         job.error = str(exc)
         get_db().update_job(job)
-        raise HTTPException(status_code=500, detail=f"content review failed: {exc}") from exc
+        raise RuntimeError(f"content review failed: {exc}") from exc
 
 
 @router.patch("/{job_id}/review/items/{item_id}", response_model=GenerationJob)
@@ -353,6 +364,7 @@ async def _run_generation(job_id: str, request: GenerationRequest | None) -> Non
         job.status = "failed"
         job.error = str(exc)
         db.update_job(job)
+        raise
 
 
 async def _generate_result(context: GenerationContext):
@@ -372,6 +384,38 @@ def _create_job(context: GenerationContext) -> GenerationJob:
     )
     get_db().create_job(job)
     return job
+
+
+def _enqueue_generation_job(job_id: str, request: GenerationRequest | None) -> None:
+    payload = {
+        "job_id": job_id,
+        "request": request.model_dump(mode="json") if request else None,
+    }
+    enqueue_background_task("generation", payload)
+
+
+def _enqueue_review_job(job_id: str, request: ReviewRequest | None = None) -> None:
+    payload = {
+        "job_id": job_id,
+        "request": request.model_dump(mode="json") if request else None,
+    }
+    enqueue_background_task("review", payload)
+
+
+async def _handle_generation_task(payload: dict) -> None:
+    request_data = payload.get("request")
+    request = GenerationRequest.model_validate(request_data) if request_data else None
+    await _run_generation(str(payload["job_id"]), request)
+
+
+async def _handle_review_task(payload: dict) -> None:
+    request_data = payload.get("request")
+    request = ReviewRequest.model_validate(request_data) if request_data else None
+    await run_review_job(str(payload["job_id"]), request)
+
+
+register_task_handler("generation", _handle_generation_task)
+register_task_handler("review", _handle_review_task)
 
 
 def _get_reviewable_job(job_id: str) -> GenerationJob:

@@ -2,12 +2,15 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { CalendarDays, History, Library, Settings, Wand2 } from "lucide-react";
+import { BookOpen, CalendarDays, ClipboardList, FileText, History, Library, Settings, Wand2 } from "lucide-react";
 
 const links = [
   { href: "/workflow", label: "工作流", icon: CalendarDays },
   { href: "/library", label: "素材库", icon: Library },
   { href: "/generate", label: "生成中心", icon: Wand2 },
+  { href: "/platform/analysis/papers", label: "试卷中心", icon: FileText },
+  { href: "/platform/subject-center", label: "学科中心", icon: BookOpen },
+  { href: "/platform/question-bank", label: "题库中心", icon: ClipboardList },
   { href: "/history", label: "历史审查", icon: History },
   { href: "/settings", label: "模型配置", icon: Settings },
 ];

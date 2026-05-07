@@ -25,6 +25,9 @@ storage:
   root: ./data
 db:
   url: sqlite:///./data/app.db
+  echo: false
+  pool_size: 10
+  max_overflow: 20
 ragflow:
   enabled: true
   base_url: ${RAGFLOW_BASE_URL}

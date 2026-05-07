@@ -1,8 +1,12 @@
 param(
   [int]$ApiPort = 8000,
   [int]$WebPort = 3000,
+  [switch]$UseLocalMySql,
+  [int]$MySqlPort = 3309,
+  [string]$MySqlDatabase = "exam_kit_local",
   [switch]$NoInstall,
-  [switch]$NoBrowser
+  [switch]$NoBrowser,
+  [switch]$NoTunnel
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,13 +14,20 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ApiDir = Join-Path $Root "apps\api"
 $WebDir = Join-Path $Root "apps\web"
 $DataDir = Join-Path $Root "data"
+$CacheDir = Join-Path $DataDir "cache"
 $LogDir = Join-Path $DataDir "logs"
 $RunDir = Join-Path $DataDir "run"
 $VenvDir = Join-Path $ApiDir ".venv"
 $PythonExe = Join-Path $VenvDir "Scripts\python.exe"
 $PipExe = Join-Path $VenvDir "Scripts\pip.exe"
+$PipCacheDir = Join-Path $CacheDir "pip"
+$TunnelScript = Join-Path $Root "deploy\cloudflare\start_named_tunnel.bat"
+$TunnelConfig = Join-Path $Root "deploy\cloudflare\config.yml"
+$LocalMySqlScript = Join-Path $Root "scripts\start-local-mysql.ps1"
+$LocalMySqlInfoPath = Join-Path $RunDir "mysql-local-$MySqlPort.json"
+$LocalMySqlDbUrl = $null
 
-New-Item -ItemType Directory -Force -Path $LogDir, $RunDir | Out-Null
+New-Item -ItemType Directory -Force -Path $CacheDir, $LogDir, $RunDir, $PipCacheDir | Out-Null
 
 function Write-Step([string]$Message) {
   Write-Host "==> $Message" -ForegroundColor Cyan
@@ -53,8 +64,54 @@ function Find-FreePort([int]$StartPort) {
   throw "No free port found from $StartPort to $($StartPort + 49)."
 }
 
+function Get-ProjectNextDevProcesses {
+  return @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+      $_.CommandLine -and
+      $_.CommandLine.Contains([string]$WebDir) -and
+      (
+        $_.CommandLine -match "next[\\/]+dist[\\/]+bin[\\/]+next" -or
+        $_.CommandLine -match "next[\\/]+dist[\\/]+server[\\/]+lib[\\/]+start-server\.js"
+      )
+    } | Sort-Object ProcessId | Select-Object -Unique ProcessId, Name, CommandLine
+  )
+}
+
+function Format-ProcessIds([object[]]$Processes) {
+  if (-not $Processes -or $Processes.Count -eq 0) {
+    return "none"
+  }
+  return (($Processes | ForEach-Object { [string]$_.ProcessId }) -join ", ")
+}
+
 function Save-Pid([string]$Name, [int]$ProcessId) {
   Set-Content -LiteralPath (Join-Path $RunDir "$Name.pid") -Value $ProcessId -Encoding ascii
+}
+
+function Start-TunnelIfReady {
+  if ($NoTunnel) {
+    Write-Host "Tunnel: disabled by switch." -ForegroundColor DarkYellow
+    return
+  }
+  if (-not (Test-Path -LiteralPath $TunnelScript -PathType Leaf)) {
+    Write-Host "Tunnel: skipped because start_named_tunnel.bat is missing." -ForegroundColor DarkYellow
+    return
+  }
+  if (-not (Test-Path -LiteralPath $TunnelConfig -PathType Leaf)) {
+    Write-Host "Tunnel: skipped because deploy\\cloudflare\\config.yml is missing." -ForegroundColor DarkYellow
+    return
+  }
+
+  Write-Step "Start Cloudflare named tunnel"
+  $tunnelOut = Join-Path $LogDir "tunnel.out.log"
+  $tunnelErr = Join-Path $LogDir "tunnel.err.log"
+  $tunnelProc = Start-Process -FilePath $TunnelScript `
+    -WorkingDirectory $Root `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput $tunnelOut `
+    -RedirectStandardError $tunnelErr `
+    -PassThru
+  Save-Pid "tunnel" $tunnelProc.Id
 }
 
 function Save-PortInfo([int]$Api, [int]$Web) {
@@ -63,6 +120,9 @@ function Save-PortInfo([int]$Api, [int]$Web) {
     web_port = $Web
     api_base = "http://127.0.0.1:$Api"
     web_url = "http://127.0.0.1:$Web"
+    use_local_mysql = [bool]$UseLocalMySql
+    mysql_port = if ($UseLocalMySql) { $MySqlPort } else { $null }
+    mysql_db_url = if ($UseLocalMySql) { $LocalMySqlDbUrl } else { $null }
     started_at = (Get-Date).ToString("s")
   } | ConvertTo-Json
   Set-Content -LiteralPath (Join-Path $RunDir "ports.json") -Value $json -Encoding utf8
@@ -83,8 +143,19 @@ function Install-ApiDeps {
   }
   if ($needsInstall) {
     Write-Step "Install API dependencies"
-    & $PipExe install --timeout 120 --retries 5 -r $requirements
-    if ($LASTEXITCODE -ne 0) { throw "API dependency installation failed." }
+    $oldPipCacheDir = $env:PIP_CACHE_DIR
+    $oldPipDisableVersionCheck = $env:PIP_DISABLE_PIP_VERSION_CHECK
+    $env:PIP_CACHE_DIR = $PipCacheDir
+    $env:PIP_DISABLE_PIP_VERSION_CHECK = "1"
+    try {
+      & $PythonExe -m pip install --cache-dir $PipCacheDir --timeout 120 --retries 5 -r $requirements
+      if ($LASTEXITCODE -ne 0) {
+        throw "API dependency installation failed. pip cache dir: $PipCacheDir"
+      }
+    } finally {
+      $env:PIP_CACHE_DIR = $oldPipCacheDir
+      $env:PIP_DISABLE_PIP_VERSION_CHECK = $oldPipDisableVersionCheck
+    }
     Set-Content -LiteralPath $stamp -Value (Get-Date).ToString("s") -Encoding ascii
   }
 }
@@ -110,6 +181,27 @@ function Install-WebDeps {
   }
 }
 
+function Start-LocalMySqlIfRequested {
+  if (-not $UseLocalMySql) { return }
+  if (-not (Test-Path -LiteralPath $LocalMySqlScript -PathType Leaf)) {
+    throw "Local MySQL script not found: $LocalMySqlScript"
+  }
+
+  Write-Step "Start local MySQL: 127.0.0.1:$MySqlPort / $MySqlDatabase"
+  & $LocalMySqlScript -Port $MySqlPort -Database $MySqlDatabase
+  if ($LASTEXITCODE -ne 0) {
+    throw "Local MySQL startup failed."
+  }
+  if (-not (Test-Path -LiteralPath $LocalMySqlInfoPath)) {
+    throw "Local MySQL info file not found: $LocalMySqlInfoPath"
+  }
+  $mysqlInfo = Get-Content -Raw -LiteralPath $LocalMySqlInfoPath | ConvertFrom-Json
+  $script:LocalMySqlDbUrl = [string]$mysqlInfo.db_url
+  if (-not $LocalMySqlDbUrl) {
+    throw "Local MySQL info file does not contain db_url."
+  }
+}
+
 Write-Step "Check dependencies"
 Get-Command node -ErrorAction Stop | Out-Null
 Get-Command npm.cmd -ErrorAction Stop | Out-Null
@@ -122,7 +214,7 @@ if (-not (Test-Path -LiteralPath $PythonExe)) {
 
 $ApiHealth = "http://127.0.0.1:$ApiPort/api/system/healthz"
 if (Get-ListenProcessId $ApiPort) {
-  if (Test-Http $ApiHealth) {
+  if ((-not $UseLocalMySql) -and (Test-Http $ApiHealth)) {
     Write-Step "API already running on port $ApiPort; reusing it"
   } else {
     $ApiPort = Find-FreePort ($ApiPort + 1)
@@ -131,26 +223,59 @@ if (Get-ListenProcessId $ApiPort) {
 }
 
 $ApiHealth = "http://127.0.0.1:$ApiPort/api/system/healthz"
+$WebUrl = "http://127.0.0.1:$WebPort/generate"
+$ReuseExistingWeb = $false
+$ProjectNextDevProcesses = Get-ProjectNextDevProcesses
+if ($UseLocalMySql -and $ProjectNextDevProcesses.Count -gt 0) {
+  $existingPids = Format-ProcessIds $ProjectNextDevProcesses
+  $webPortOccupied = [bool](Get-ListenProcessId $WebPort)
+  $webHealthy = Test-Http $WebUrl
+  if (($ApiPort -eq 8000) -and $webPortOccupied -and $webHealthy) {
+    Write-Host "UseLocalMySql: detected existing apps\\web next dev process(es): $existingPids" -ForegroundColor DarkYellow
+    Write-Host "UseLocalMySql: reusing the existing Web on port $WebPort because this repository should not run a second Next.js dev server." -ForegroundColor DarkYellow
+    Write-Host "UseLocalMySql: if you need a fresh Web bound to a new API chain, stop the existing Web first with scripts\\stop.ps1 -AlsoKnownPorts and rerun." -ForegroundColor DarkYellow
+    $ReuseExistingWeb = $true
+  } else {
+    $conflictReason = if ($ApiPort -ne 8000) {
+      "API port moved to $ApiPort, so the existing Web would not point at the new API chain."
+    } elseif (-not $webPortOccupied) {
+      "A project Next.js process exists, but the requested Web port $WebPort is not reusable."
+    } else {
+      "The existing Web on port $WebPort is not responding, so it cannot be safely reused."
+    }
+    throw "UseLocalMySql detected existing apps\\web next dev process(es): $existingPids. This repository should not run a second Next.js dev server. $conflictReason Stop the existing Web first with scripts\\stop.ps1 -AlsoKnownPorts, or reuse the current 3000/8000 chain before starting a new local-MySQL pair."
+  }
+}
+
+Start-LocalMySqlIfRequested
+
 if (-not (Test-Http $ApiHealth)) {
   Write-Step "Start API: $ApiHealth"
   $apiOut = Join-Path $LogDir "api.out.log"
   $apiErr = Join-Path $LogDir "api.err.log"
-  $apiProc = Start-Process -FilePath $PythonExe `
-    -ArgumentList @("-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "$ApiPort") `
-    -WorkingDirectory $ApiDir `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $apiOut `
-    -RedirectStandardError $apiErr `
-    -PassThru
-  Save-Pid "api" $apiProc.Id
-  if (-not (Wait-Http $ApiHealth 60)) {
-    throw "API startup timed out. Check log: $apiErr"
+  $oldDbUrl = $env:DB_URL
+  if ($UseLocalMySql) {
+    $env:DB_URL = $LocalMySqlDbUrl
+  }
+  try {
+    $apiProc = Start-Process -FilePath $PythonExe `
+      -ArgumentList @("-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "$ApiPort") `
+      -WorkingDirectory $ApiDir `
+      -WindowStyle Hidden `
+      -RedirectStandardOutput $apiOut `
+      -RedirectStandardError $apiErr `
+      -PassThru
+    Save-Pid "api" $apiProc.Id
+    if (-not (Wait-Http $ApiHealth 60)) {
+      throw "API startup timed out. Check log: $apiErr"
+    }
+  } finally {
+    $env:DB_URL = $oldDbUrl
   }
 }
 
-$WebUrl = "http://127.0.0.1:$WebPort/generate"
 if (Get-ListenProcessId $WebPort) {
-  if (Test-Http $WebUrl) {
+  if ($ReuseExistingWeb -or ((-not $UseLocalMySql) -and (Test-Http $WebUrl))) {
     Write-Step "Web already running on port $WebPort; reusing it"
   } else {
     $WebPort = Find-FreePort ($WebPort + 1)
@@ -159,11 +284,19 @@ if (Get-ListenProcessId $WebPort) {
 }
 
 $WebUrl = "http://127.0.0.1:$WebPort/generate"
-if (-not (Test-Http $WebUrl)) {
+if ((-not $ReuseExistingWeb) -and (-not (Test-Http $WebUrl))) {
   Write-Step "Start web: http://127.0.0.1:$WebPort"
   $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
-  $oldApiBase = $env:NEXT_PUBLIC_API_BASE
-  $env:NEXT_PUBLIC_API_BASE = "http://127.0.0.1:$ApiPort"
+  $oldApiProxyTarget = $env:API_PROXY_TARGET
+  $oldLayoutProxyTarget = $env:LAYOUT_PROXY_TARGET
+  $oldLayoutPublicUrl = $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL
+  $env:API_PROXY_TARGET = "http://127.0.0.1:$ApiPort"
+  if (-not $env:LAYOUT_PROXY_TARGET) {
+    $env:LAYOUT_PROXY_TARGET = "https://xhs.panspan.cloud"
+  }
+  if (-not $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL) {
+    $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL = "https://xhs.panspan.cloud"
+  }
   try {
     $webOut = Join-Path $LogDir "web.out.log"
     $webErr = Join-Path $LogDir "web.err.log"
@@ -176,7 +309,9 @@ if (-not (Test-Http $WebUrl)) {
       -PassThru
     Save-Pid "web" $webProc.Id
   } finally {
-    $env:NEXT_PUBLIC_API_BASE = $oldApiBase
+    $env:API_PROXY_TARGET = $oldApiProxyTarget
+    $env:LAYOUT_PROXY_TARGET = $oldLayoutProxyTarget
+    $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL = $oldLayoutPublicUrl
   }
   if (-not (Wait-Http $WebUrl 90)) {
     throw "Web startup timed out. Check log: $webErr"
@@ -184,11 +319,18 @@ if (-not (Test-Http $WebUrl)) {
 }
 
 Save-PortInfo $ApiPort $WebPort
+Start-TunnelIfReady
 
 Write-Host ""
 Write-Host "Exam Kit is ready." -ForegroundColor Green
 Write-Host "Web: http://127.0.0.1:$WebPort"
 Write-Host "API: http://127.0.0.1:$ApiPort"
+if ($UseLocalMySql) {
+  Write-Host "MySQL: $LocalMySqlDbUrl"
+}
+if ((-not $NoTunnel) -and (Test-Path -LiteralPath $TunnelConfig -PathType Leaf)) {
+  Write-Host "Tunnel: https://context.panspan.cloud"
+}
 Write-Host "Logs: $LogDir"
 
 if (-not $NoBrowser) {

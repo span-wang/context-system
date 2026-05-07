@@ -13,7 +13,10 @@ node_modules/
 .next/
 out/
 output/
+.codex_tmp/
 .playwright-cli/
+deploy/cloudflare/*.exe
+deploy/cloudflare/config.yml
 dist/
 build/
 *.log

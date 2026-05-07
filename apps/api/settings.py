@@ -129,8 +129,18 @@ class DBConfig(BaseModel):
     @property
     def sqlite_path(self) -> Path:
         if not self.url.startswith("sqlite:///"):
-            raise ValueError("Only sqlite:/// URLs are supported by the local MVP.")
+            raise ValueError("sqlite_path is only available for sqlite:/// database URLs.")
+        if self.url == "sqlite:///:memory:":
+            raise ValueError("sqlite_path is not available for in-memory sqlite databases.")
         return _resolve_path(self.url.replace("sqlite:///", "", 1))
+
+    @property
+    def resolved_url(self) -> str:
+        if self.url == "sqlite:///:memory:":
+            return self.url
+        if self.url.startswith("sqlite:///"):
+            return f"sqlite:///{self.sqlite_path.as_posix()}"
+        return self.url
 
 
 class RAGFlowConfig(BaseModel):
@@ -213,7 +223,12 @@ def get_settings() -> Settings:
     raw: dict[str, Any] = {}
     if config_path.exists():
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
+    if os.getenv("DB_URL"):
+        raw.setdefault("db", {})["url"] = os.getenv("DB_URL")
+    if os.getenv("STORAGE_ROOT"):
+        raw.setdefault("storage", {})["root"] = os.getenv("STORAGE_ROOT")
     settings = Settings.model_validate(_expand_env(raw))
     settings.storage.root_path.mkdir(parents=True, exist_ok=True)
-    settings.db.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    if settings.db.url.startswith("sqlite:///") and settings.db.url != "sqlite:///:memory:":
+        settings.db.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     return settings

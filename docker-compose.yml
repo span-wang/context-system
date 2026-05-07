@@ -1,11 +1,30 @@
 services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-exam_kit}
+      MYSQL_USER: ${MYSQL_USER:-examkit}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-examkit123}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123456}
+    ports:
+      - "3306:3306"
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+
   api:
     build: ./apps/api
     ports:
       - "8000:8000"
+    gpus: all
     env_file:
       - .evn
     environment:
+      - DB_URL=${DB_URL:-mysql+pymysql://examkit:examkit123@mysql:3306/exam_kit?charset=utf8mb4}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - DEEPSEEK_GENERATOR_API_KEY=${DEEPSEEK_GENERATOR_API_KEY}
       - DEEPSEEK_REVIEWER_API_KEY=${DEEPSEEK_REVIEWER_API_KEY}
@@ -14,11 +33,15 @@ services:
     volumes:
       - ./data:/app/data
       - ./config.yaml:/app/config.yaml
+    depends_on:
+      - mysql
   web:
     build: ./apps/web
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_BASE=http://localhost:8000
+      - API_PROXY_TARGET=http://api:8000
+      - NEXT_PUBLIC_LAYOUT_PUBLIC_URL=https://xhs.panspan.cloud
+      - LAYOUT_PROXY_TARGET=https://xhs.panspan.cloud
     depends_on:
       - api

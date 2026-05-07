@@ -1,6 +1,5 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-import asyncio
 from datetime import datetime
 from uuid import uuid4
 
@@ -8,8 +7,9 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
 from deps import get_db
+from background import enqueue_background_task, register_task_handler
 from exporters.xiaohongshu import build_publish_package_from_markdown, render_publish_package
-from routers.generate import _create_job, _ensure_context_size, _initial_context, _run_generation, review_generation
+from routers.generate import _create_job, _ensure_context_size, _initial_context, _run_generation, run_review_job
 from schemas.generation import GenerationRequest
 from schemas.review import ReviewRequest
 from schemas.workflow import (
@@ -51,7 +51,7 @@ def create_topic(request: WorkflowTopicCreate) -> WorkflowTopic:
         updated_at=now,
         **payload,
     )
-    return get_db().create_topic(topic, actor=topic.owner, note="选题入库")
+    return get_db().create_topic(topic, actor=topic.owner, note="閫夐鍏ュ簱")
 
 
 @router.get("/topics/{topic_id}", response_model=WorkflowTopic)
@@ -103,12 +103,12 @@ async def generate_topic(topic_id: str, request: WorkflowGenerateRequest) -> Wor
             status="drafting",
             review_status="not_started",
             generation_job_id=job.id,
-            note="从选题发起内容生成",
+            note="浠庨€夐鍙戣捣鍐呭鐢熸垚",
             actor=topic.owner,
         ),
         event_type="generation_started",
     )
-    asyncio.create_task(_run_topic_generation(topic_id, job.id, generation_request))
+    _enqueue_topic_generation(topic_id, job.id, generation_request)
     return WorkflowGenerateResponse(topic=updated, job_id=job.id)
 
 
@@ -117,23 +117,27 @@ async def review_topic(topic_id: str, request: ReviewRequest | None = None) -> W
     topic = _get_topic_or_404(topic_id)
     if not topic.generation_job_id:
         raise HTTPException(status_code=409, detail="topic has no generation job")
+    job = get_db().get_job(topic.generation_job_id)
+    if not job or not job.result:
+        raise HTTPException(status_code=409, detail="generation result is not ready")
+    if job.status == "reviewing":
+        raise HTTPException(status_code=409, detail="content review is already running")
     _update_topic_or_404(
         topic_id,
-        WorkflowTopicPatch(status="reviewing", review_status="reviewing", note="发起内容审查", actor=topic.owner),
+        WorkflowTopicPatch(status="reviewing", review_status="reviewing", note="鍙戣捣鍐呭瀹℃煡", actor=topic.owner),
         event_type="review_started",
     )
-    job = await review_generation(topic.generation_job_id, request)
-    review_passed = bool(job.review and job.review.pass_overall)
-    return _update_topic_or_404(
-        topic_id,
-        WorkflowTopicPatch(
-            status="awaiting_confirm" if review_passed else "needs_changes",
-            review_status="passed" if review_passed else "needs_changes",
-            note="内容审查完成",
-            actor=topic.owner,
-        ),
-        event_type="review_completed",
-    )
+    job = get_db().get_job(topic.generation_job_id)
+    if not job or not job.result:
+        raise HTTPException(status_code=409, detail="generation result is not ready")
+    if job.status == "reviewing":
+        raise HTTPException(status_code=409, detail="content review is already running")
+    job.status = "reviewing"
+    job.error = None
+    get_db().update_job(job)
+    _enqueue_topic_review(topic_id, topic.generation_job_id, request)
+    refreshed = _get_topic_or_404(topic_id)
+    return refreshed
 
 
 @router.post("/topics/{topic_id}/confirm", response_model=WorkflowTopic)
@@ -145,7 +149,7 @@ def confirm_topic(topic_id: str, request: WorkflowConfirmRequest) -> WorkflowTop
             status="approved",
             confirmed_by=request.confirmed_by or topic.owner,
             confirmed_at=datetime.utcnow(),
-            note=request.note or "人工确认通过",
+            note=request.note or "浜哄伐纭閫氳繃",
             actor=request.confirmed_by or topic.owner,
         ),
         event_type="confirmed",
@@ -174,7 +178,7 @@ def _export_topic(topic_id: str, request: WorkflowExportRequest) -> PlainTextRes
             topic_id,
             WorkflowTopicPatch(
                 status="exported",
-                note=request.note or "导出发布包",
+                note=request.note or "exported publish package",
                 actor=request.actor or topic.owner,
             ),
             event_type="exported",
@@ -194,7 +198,22 @@ def list_topic_events(topic_id: str) -> list[WorkflowEvent]:
 
 
 async def _run_topic_generation(topic_id: str, job_id: str, request: GenerationRequest) -> None:
-    await _run_generation(job_id, request)
+    try:
+        await _run_generation(job_id, request)
+    except Exception:
+        job = get_db().get_job(job_id)
+        topic = get_db().get_topic(topic_id)
+        if topic and topic.generation_job_id == job_id:
+            get_db().update_topic(
+                topic_id,
+                WorkflowTopicPatch(
+                    status="needs_changes",
+                    note=(job.error if job else None) or "generation failed",
+                    actor=topic.owner,
+                ),
+                event_type="generation_failed",
+            )
+        raise
     job = get_db().get_job(job_id)
     if not job:
         return
@@ -203,17 +222,87 @@ async def _run_topic_generation(topic_id: str, job_id: str, request: GenerationR
         return
     if job.status == "done" and job.result:
         status = "generated"
-        note = "生成完成，等待审查"
+        note = "generation completed; waiting for review"
         event_type = "generation_completed"
     else:
         status = "needs_changes"
-        note = job.error or "生成失败"
+        note = job.error or "鐢熸垚澶辫触"
         event_type = "generation_failed"
     get_db().update_topic(
         topic_id,
         WorkflowTopicPatch(status=status, note=note, actor=topic.owner),
         event_type=event_type,
     )
+
+
+async def _run_topic_review(topic_id: str, job_id: str, request: ReviewRequest | None = None) -> None:
+    topic = get_db().get_topic(topic_id)
+    try:
+        job = await run_review_job(job_id, request)
+        topic = get_db().get_topic(topic_id)
+        if not topic or topic.generation_job_id != job_id:
+            return
+        review_passed = bool(job.review and job.review.pass_overall)
+        get_db().update_topic(
+            topic_id,
+            WorkflowTopicPatch(
+                status="awaiting_confirm" if review_passed else "needs_changes",
+                review_status="passed" if review_passed else "needs_changes",
+                note="content review completed",
+                actor=topic.owner,
+            ),
+            event_type="review_completed",
+        )
+    except Exception as exc:
+        if topic and topic.generation_job_id == job_id:
+            get_db().update_topic(
+                topic_id,
+                WorkflowTopicPatch(
+                    status="needs_changes",
+                    review_status="needs_changes",
+                    note=str(exc),
+                    actor=topic.owner,
+                ),
+                event_type="review_failed",
+            )
+        raise
+
+
+def _enqueue_topic_generation(topic_id: str, job_id: str, request: GenerationRequest) -> None:
+    enqueue_background_task(
+        "topic_generation",
+        {
+            "topic_id": topic_id,
+            "job_id": job_id,
+            "request": request.model_dump(mode="json"),
+        },
+    )
+
+
+def _enqueue_topic_review(topic_id: str, job_id: str, request: ReviewRequest | None = None) -> None:
+    enqueue_background_task(
+        "topic_review",
+        {
+            "topic_id": topic_id,
+            "job_id": job_id,
+            "request": request.model_dump(mode="json") if request else None,
+        },
+    )
+
+
+async def _handle_topic_generation_task(payload: dict) -> None:
+    request = GenerationRequest.model_validate(payload["request"])
+    await _run_topic_generation(str(payload["topic_id"]), str(payload["job_id"]), request)
+
+
+async def _handle_topic_review_task(payload: dict) -> None:
+    request_data = payload.get("request")
+    request = ReviewRequest.model_validate(request_data) if request_data else None
+    await _run_topic_review(str(payload["topic_id"]), str(payload["job_id"]), request)
+
+
+register_task_handler("topic_generation", _handle_topic_generation_task)
+register_task_handler("topic_review", _handle_topic_review_task)
 
 
 def _get_topic_or_404(topic_id: str) -> WorkflowTopic:
@@ -254,17 +343,17 @@ def _validate_materials(file_ids: list[str]) -> None:
 
 def _compose_user_notes(topic: WorkflowTopic, extra_notes: str | None) -> str:
     parts = [
-        f"选题：{topic.title}",
-        f"发布渠道：{topic.publish_channel}",
+        f"Topic: {topic.title}",
+        f"Publish channel: {topic.publish_channel}",
     ]
     if topic.brief:
-        parts.append(f"选题说明：{topic.brief}")
+        parts.append(f"Brief: {topic.brief}")
     if topic.content_goal:
-        parts.append(f"内容目标：{topic.content_goal}")
+        parts.append(f"Content goal: {topic.content_goal}")
     if topic.audience:
-        parts.append(f"目标读者：{topic.audience}")
+        parts.append(f"Audience: {topic.audience}")
     if extra_notes:
-        parts.append(f"补充要求：{extra_notes}")
+        parts.append(f"Extra requirements: {extra_notes}")
     return "\n".join(parts)
 
 
@@ -280,51 +369,52 @@ def _build_publish_package(topic: WorkflowTopic, job, events: list[WorkflowEvent
     lines = [
         f"# {topic.title}",
         "",
-        "## 发布信息",
-        f"- 选题ID：{topic.id}",
-        f"- 责任人：{topic.owner or '未指定'}",
-        f"- 发布渠道：{topic.publish_channel}",
-        f"- 计划日期：{topic.scheduled_date or '未排期'}",
-        f"- 当前状态：{topic.status}",
-        f"- 审核状态：{topic.review_status}",
-        f"- 生成任务：{topic.generation_job_id or '未绑定'}",
+        "## Publish Info",
+        f"- Topic ID: {topic.id}",
+        f"- Owner: {topic.owner or 'unassigned'}",
+        f"- Publish channel: {topic.publish_channel}",
+        f"- Scheduled date: {topic.scheduled_date or 'unscheduled'}",
+        f"- Current status: {topic.status}",
+        f"- Review status: {topic.review_status}",
+        f"- Generation job: {topic.generation_job_id or 'unbound'}",
         "",
-        "## 素材引用",
+        "## Source Materials",
     ]
     if topic.material_file_ids:
         for index, file_id in enumerate(topic.material_file_ids, start=1):
             source = get_db().get_library_file(file_id)
             label = source.source_title or source.filename if source else file_id
-            lines.append(f"- [{index}] {label}（{file_id}）")
+            lines.append(f"- [{index}] {label} ({file_id})")
     elif topic.ragflow_dataset_ids:
-        lines.extend(f"- RAGFlow dataset：{dataset_id}" for dataset_id in topic.ragflow_dataset_ids)
+        lines.extend(f"- RAGFlow dataset: {dataset_id}" for dataset_id in topic.ragflow_dataset_ids)
     else:
-        lines.append("- 未绑定素材")
+        lines.append("- No source material bound")
 
     lines.extend(
         [
             "",
-            "## 审查结论",
-            f"- 结论：{('通过' if review.pass_overall else '需修改') if review else '未审查'}",
+            "## Review Result",
+            f"- Verdict: {('passed' if review.pass_overall else 'needs changes') if review else 'not reviewed'}",
         ]
     )
     if review:
-        lines.append(f"- 审查模式：{review.mode}")
-        lines.append(f"- 问题数：{len(review.issues)}")
+        lines.append(f"- Review mode: {review.mode}")
+        lines.append(f"- Issue count: {len(review.issues)}")
         if review.suggestions:
-            lines.append("- 建议：")
+            lines.append("- Suggestions:")
             lines.extend(f"  - {item}" for item in review.suggestions)
 
     lines.extend(
         [
             "",
-            "## 小红书发布包",
+            "## Xiaohongshu Publish Package",
             "",
             render_publish_package(publish_package, fallback_title=job.result.title).strip(),
             "",
-            "## 版本记录",
+            "## Version History",
         ]
     )
     for event in events:
         lines.append(f"- v{event.version} {event.created_at.isoformat()} {event.event_type} {event.actor or ''} {event.note or ''}".rstrip())
     return "\n".join(lines).strip() + "\n"
+

@@ -1,155 +1,56 @@
 from __future__ import annotations
 
 import json
-import sqlite3
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+from sqlalchemy import delete, func, or_, select, update
+
+from app.db.session import SessionLocal
+from app.models.legacy import (
+    LegacyBackgroundTask,
+    LegacyGenerationJob,
+    LegacyLibraryFile,
+    LegacyWorkflowEvent,
+    LegacyWorkflowTopic,
+)
 from schemas.generation import GenerationJob
 from schemas.library import LibraryFile, LibraryFilePatch
 from schemas.workflow import WorkflowEvent, WorkflowTopic, WorkflowTopicPatch
 
 
 class Database:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.init_schema()
+    """Compatibility repository for the original APIs.
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    The old implementation opened its own sqlite3 connections and created its
+    own schema. This class keeps the public method surface, but all data access
+    now goes through the shared SQLAlchemy SessionLocal/engine configured by
+    app.db.session.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path
 
     def init_schema(self) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS library_files (
-                    id TEXT PRIMARY KEY,
-                    sha256 TEXT NOT NULL UNIQUE,
-                    filename TEXT NOT NULL,
-                    size INTEGER NOT NULL,
-                    mime TEXT NOT NULL,
-                    storage_path TEXT NOT NULL,
-                    subject TEXT NOT NULL,
-                    category TEXT,
-                    chapter TEXT,
-                    source_type TEXT NOT NULL,
-                    source_authority TEXT NOT NULL,
-                    source_title TEXT NOT NULL,
-                    source_publisher TEXT,
-                    source_code TEXT,
-                    source_version TEXT,
-                    year INTEGER,
-                    tags TEXT NOT NULL,
-                    parsed_text TEXT,
-                    token_count INTEGER,
-                    created_at TEXT NOT NULL,
-                    last_used_at TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS generation_jobs (
-                    id TEXT PRIMARY KEY,
-                    context TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    result TEXT,
-                    review TEXT,
-                    created_at TEXT NOT NULL,
-                    error TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS workflow_topics (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    brief TEXT,
-                    subject TEXT NOT NULL,
-                    category TEXT,
-                    chapter TEXT,
-                    content_type TEXT NOT NULL,
-                    owner TEXT,
-                    status TEXT NOT NULL,
-                    review_status TEXT NOT NULL,
-                    priority TEXT NOT NULL,
-                    scheduled_date TEXT,
-                    due_date TEXT,
-                    publish_channel TEXT NOT NULL,
-                    content_goal TEXT,
-                    audience TEXT,
-                    material_file_ids TEXT NOT NULL,
-                    ragflow_dataset_ids TEXT NOT NULL,
-                    generation_job_id TEXT,
-                    confirmed_by TEXT,
-                    confirmed_at TEXT,
-                    published_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS workflow_events (
-                    id TEXT PRIMARY KEY,
-                    topic_id TEXT NOT NULL,
-                    version INTEGER NOT NULL,
-                    event_type TEXT NOT NULL,
-                    note TEXT,
-                    actor TEXT,
-                    snapshot TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_workflow_topics_status
-                ON workflow_topics(status)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_workflow_topics_schedule
-                ON workflow_topics(scheduled_date)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_workflow_events_topic
-                ON workflow_events(topic_id, version)
-                """
-            )
-            conn.commit()
+        return None
 
     def insert_library_file(self, file: LibraryFile) -> LibraryFile:
-        data = file.model_dump(mode="json")
-        data["tags"] = json.dumps(data["tags"], ensure_ascii=False)
-        columns = ", ".join(data.keys())
-        placeholders = ", ".join([f":{key}" for key in data])
-        with self.connect() as conn:
-            conn.execute(
-                f"INSERT INTO library_files ({columns}) VALUES ({placeholders})",
-                data,
-            )
-            conn.commit()
+        with SessionLocal() as session:
+            session.add(self._library_to_model(file))
+            session.commit()
         return file
 
     def get_library_by_sha(self, sha256: str) -> LibraryFile | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM library_files WHERE sha256 = ?", (sha256,)).fetchone()
-        return self._library_from_row(row) if row else None
+        with SessionLocal() as session:
+            row = session.scalar(select(LegacyLibraryFile).where(LegacyLibraryFile.sha256 == sha256))
+            return self._library_from_model(row) if row else None
 
     def get_library_file(self, file_id: str) -> LibraryFile | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM library_files WHERE id = ?", (file_id,)).fetchone()
-        return self._library_from_row(row) if row else None
+        with SessionLocal() as session:
+            row = session.get(LegacyLibraryFile, file_id)
+            return self._library_from_model(row) if row else None
 
     def list_library_files(
         self,
@@ -158,28 +59,26 @@ class Database:
         source_type: str | None = None,
         search: str | None = None,
     ) -> list[LibraryFile]:
-        clauses: list[str] = []
-        values: list[Any] = []
+        statement = select(LegacyLibraryFile)
         if subject:
-            clauses.append("subject = ?")
-            values.append(subject)
+            statement = statement.where(LegacyLibraryFile.subject == subject)
         if category:
-            clauses.append("category = ?")
-            values.append(category)
+            statement = statement.where(LegacyLibraryFile.category == category)
         if source_type:
-            clauses.append("source_type = ?")
-            values.append(source_type)
+            statement = statement.where(LegacyLibraryFile.source_type == source_type)
         if search:
-            clauses.append("(filename LIKE ? OR source_title LIKE ? OR tags LIKE ?)")
             pattern = f"%{search}%"
-            values.extend([pattern, pattern, pattern])
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM library_files {where} ORDER BY created_at DESC",
-                values,
-            ).fetchall()
-        return [self._library_from_row(row) for row in rows]
+            statement = statement.where(
+                or_(
+                    LegacyLibraryFile.filename.like(pattern),
+                    LegacyLibraryFile.source_title.like(pattern),
+                    LegacyLibraryFile.tags.like(pattern),
+                )
+            )
+        statement = statement.order_by(LegacyLibraryFile.created_at.desc())
+        with SessionLocal() as session:
+            rows = session.scalars(statement).all()
+            return [self._library_from_model(row) for row in rows]
 
     def update_library_file(self, file_id: str, patch: LibraryFilePatch) -> LibraryFile | None:
         current = self.get_library_file(file_id)
@@ -190,105 +89,230 @@ class Database:
         data.update(updates)
         if "tags" in updates:
             data["tags"] = updates["tags"] or []
-        data["tags"] = json.dumps(data["tags"], ensure_ascii=False)
-        columns = [
-            "filename",
-            "subject",
-            "category",
-            "chapter",
-            "source_type",
-            "source_authority",
-            "source_title",
-            "source_publisher",
-            "source_code",
-            "source_version",
-            "year",
-            "tags",
-        ]
-        assignments = ", ".join([f"{column} = :{column}" for column in columns])
-        data["id"] = file_id
-        with self.connect() as conn:
-            conn.execute(f"UPDATE library_files SET {assignments} WHERE id = :id", data)
-            conn.commit()
-        return self.get_library_file(file_id)
+
+        with SessionLocal() as session:
+            row = session.get(LegacyLibraryFile, file_id)
+            if not row:
+                return None
+            for column in (
+                "filename",
+                "subject",
+                "category",
+                "chapter",
+                "source_type",
+                "source_authority",
+                "source_title",
+                "source_publisher",
+                "source_code",
+                "source_version",
+                "year",
+            ):
+                setattr(row, column, data[column])
+            row.tags = json.dumps(data["tags"], ensure_ascii=False)
+            session.commit()
+            session.refresh(row)
+            return self._library_from_model(row)
 
     def rename_library_subject(self, old_subject: str, new_subject: str) -> None:
         if old_subject == new_subject:
             return
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE library_files SET subject = ? WHERE subject = ?",
-                (new_subject, old_subject),
-            )
-            conn.commit()
+        with SessionLocal() as session:
+            rows = session.scalars(select(LegacyLibraryFile).where(LegacyLibraryFile.subject == old_subject)).all()
+            for row in rows:
+                row.subject = new_subject
+            session.commit()
 
     def set_parsed_text(self, file_id: str, text: str, token_count: int) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE library_files SET parsed_text = ?, token_count = ? WHERE id = ?",
-                (text, token_count, file_id),
-            )
-            conn.commit()
+        with SessionLocal() as session:
+            row = session.get(LegacyLibraryFile, file_id)
+            if row:
+                row.parsed_text = text
+                row.token_count = token_count
+                session.commit()
 
     def mark_library_used(self, file_id: str) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE library_files SET last_used_at = ? WHERE id = ?",
-                (datetime.utcnow().isoformat(), file_id),
-            )
-            conn.commit()
+        with SessionLocal() as session:
+            row = session.get(LegacyLibraryFile, file_id)
+            if row:
+                row.last_used_at = datetime.utcnow()
+                session.commit()
 
     def delete_library_file(self, file_id: str) -> LibraryFile | None:
         current = self.get_library_file(file_id)
         if not current:
             return None
-        with self.connect() as conn:
-            conn.execute("DELETE FROM library_files WHERE id = ?", (file_id,))
-            conn.commit()
+        with SessionLocal() as session:
+            row = session.get(LegacyLibraryFile, file_id)
+            if row:
+                session.delete(row)
+                session.commit()
         return current
 
     def create_job(self, job: GenerationJob) -> GenerationJob:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO generation_jobs
-                    (id, context, status, result, review, created_at, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                self._job_values(job),
-            )
-            conn.commit()
+        with SessionLocal() as session:
+            session.add(self._job_to_model(job))
+            session.commit()
         return job
 
     def update_job(self, job: GenerationJob) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE generation_jobs
-                SET context = ?, status = ?, result = ?, review = ?, created_at = ?, error = ?
-                WHERE id = ?
-                """,
-                (*self._job_values(job)[1:], job.id),
-            )
-            conn.commit()
+        values = self._job_values(job)
+        with SessionLocal() as session:
+            row = session.get(LegacyGenerationJob, job.id)
+            if not row:
+                return
+            row.context = values["context"]
+            row.status = values["status"]
+            row.result = values["result"]
+            row.review = values["review"]
+            row.created_at = values["created_at"]
+            row.error = values["error"]
+            session.commit()
 
     def get_job(self, job_id: str) -> GenerationJob | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM generation_jobs WHERE id = ?", (job_id,)).fetchone()
-        return self._job_from_row(row) if row else None
+        with SessionLocal() as session:
+            row = session.get(LegacyGenerationJob, job_id)
+            return self._job_from_model(row) if row else None
 
     def list_jobs(self) -> list[GenerationJob]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM generation_jobs ORDER BY created_at DESC"
-            ).fetchall()
-        return [self._job_from_row(row) for row in rows]
+        statement = select(LegacyGenerationJob).order_by(LegacyGenerationJob.created_at.desc())
+        with SessionLocal() as session:
+            rows = session.scalars(statement).all()
+            return [self._job_from_model(row) for row in rows]
 
     def delete_job(self, job_id: str) -> bool:
-        with self.connect() as conn:
-            cur = conn.execute("DELETE FROM generation_jobs WHERE id = ?", (job_id,))
-            conn.commit()
-        return cur.rowcount > 0
+        with SessionLocal() as session:
+            result = session.execute(delete(LegacyGenerationJob).where(LegacyGenerationJob.id == job_id))
+            session.commit()
+            return result.rowcount > 0
+
+    def enqueue_task(
+        self,
+        task_type: str,
+        payload: dict[str, Any],
+        *,
+        max_attempts: int = 3,
+        task_id: str | None = None,
+    ) -> str:
+        now = datetime.utcnow()
+        task_id = task_id or str(uuid4())
+        with SessionLocal() as session:
+            session.add(
+                LegacyBackgroundTask(
+                    id=task_id,
+                    task_type=task_type,
+                    payload=json.dumps(payload, ensure_ascii=False),
+                    status="queued",
+                    attempts=0,
+                    max_attempts=max_attempts,
+                    last_error=None,
+                    worker_id=None,
+                    created_at=now,
+                    updated_at=now,
+                    next_run_at=now,
+                    locked_at=None,
+                    finished_at=None,
+                )
+            )
+            session.commit()
+        return task_id
+
+    def recover_active_tasks(self) -> int:
+        now = datetime.utcnow()
+        with SessionLocal() as session:
+            rows = session.scalars(
+                select(LegacyBackgroundTask).where(LegacyBackgroundTask.status.in_(("queued", "running")))
+            ).all()
+            for row in rows:
+                row.status = "queued"
+                row.worker_id = None
+                row.locked_at = None
+                row.next_run_at = now
+                row.updated_at = now
+            session.commit()
+            return len(rows)
+
+    def list_background_tasks(self, limit: int = 50) -> list[dict[str, Any]]:
+        statement = select(LegacyBackgroundTask).order_by(LegacyBackgroundTask.created_at.desc()).limit(limit)
+        with SessionLocal() as session:
+            rows = session.scalars(statement).all()
+            return [self._background_task_from_model(row) for row in rows]
+
+    def get_background_task(self, task_id: str) -> dict[str, Any] | None:
+        with SessionLocal() as session:
+            row = session.get(LegacyBackgroundTask, task_id)
+            return self._background_task_from_model(row) if row else None
+
+    def claim_next_task(self, worker_id: str) -> dict[str, Any] | None:
+        now = datetime.utcnow()
+        with SessionLocal() as session:
+            row = session.scalar(
+                select(LegacyBackgroundTask)
+                .where(
+                    LegacyBackgroundTask.status == "queued",
+                    LegacyBackgroundTask.next_run_at <= now,
+                )
+                .order_by(LegacyBackgroundTask.created_at.asc())
+                .limit(1)
+            )
+            if not row:
+                return None
+            result = session.execute(
+                update(LegacyBackgroundTask)
+                .where(
+                    LegacyBackgroundTask.id == row.id,
+                    LegacyBackgroundTask.status == "queued",
+                    LegacyBackgroundTask.next_run_at <= now,
+                )
+                .values(
+                    status="running",
+                    attempts=LegacyBackgroundTask.attempts + 1,
+                    worker_id=worker_id,
+                    locked_at=now,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                return None
+            session.commit()
+            claimed = session.get(LegacyBackgroundTask, row.id)
+            return self._background_task_from_model(claimed) if claimed else None
+
+    def complete_task(self, task_id: str) -> None:
+        now = datetime.utcnow()
+        with SessionLocal() as session:
+            row = session.get(LegacyBackgroundTask, task_id)
+            if not row:
+                return
+            row.status = "succeeded"
+            row.last_error = None
+            row.worker_id = None
+            row.updated_at = now
+            row.finished_at = now
+            session.commit()
+
+    def fail_task(self, task_id: str, error: str, *, retry_delay_seconds: int = 30) -> None:
+        now = datetime.utcnow()
+        with SessionLocal() as session:
+            row = session.get(LegacyBackgroundTask, task_id)
+            if not row:
+                return
+            row.last_error = error
+            row.worker_id = None
+            row.locked_at = None
+            row.updated_at = now
+            if row.attempts < row.max_attempts:
+                row.status = "queued"
+                row.next_run_at = now + timedelta(seconds=retry_delay_seconds)
+            else:
+                row.status = "failed"
+                row.finished_at = now
+            session.commit()
+
+    def _background_task_from_model(self, row: LegacyBackgroundTask) -> dict[str, Any]:
+        data = self._model_to_dict(row)
+        data["payload"] = json.loads(data["payload"] or "{}")
+        return data
 
     def create_topic(
         self,
@@ -296,22 +320,16 @@ class Database:
         actor: str | None = None,
         note: str | None = None,
     ) -> WorkflowTopic:
-        data = self._topic_to_record(topic)
-        columns = ", ".join(data.keys())
-        placeholders = ", ".join([f":{key}" for key in data])
-        with self.connect() as conn:
-            conn.execute(
-                f"INSERT INTO workflow_topics ({columns}) VALUES ({placeholders})",
-                data,
-            )
-            self._insert_topic_event(conn, topic, "created", actor, note)
-            conn.commit()
+        with SessionLocal() as session:
+            session.add(self._topic_to_model(topic))
+            self._insert_topic_event(session, topic, "created", actor, note)
+            session.commit()
         return topic
 
     def get_topic(self, topic_id: str) -> WorkflowTopic | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM workflow_topics WHERE id = ?", (topic_id,)).fetchone()
-        return self._topic_from_row(row) if row else None
+        with SessionLocal() as session:
+            row = session.get(LegacyWorkflowTopic, topic_id)
+            return self._topic_from_model(row) if row else None
 
     def list_topics(
         self,
@@ -321,38 +339,35 @@ class Database:
         date_to: str | None = None,
         search: str | None = None,
     ) -> list[WorkflowTopic]:
-        clauses: list[str] = []
-        values: list[Any] = []
+        statement = select(LegacyWorkflowTopic)
         if status:
-            clauses.append("status = ?")
-            values.append(status)
+            statement = statement.where(LegacyWorkflowTopic.status == status)
         if owner:
-            clauses.append("owner = ?")
-            values.append(owner)
-        if date_from:
-            clauses.append("scheduled_date >= ?")
-            values.append(date_from)
-        if date_to:
-            clauses.append("scheduled_date <= ?")
-            values.append(date_to)
+            statement = statement.where(LegacyWorkflowTopic.owner == owner)
+        parsed_date_from = self._parse_date_filter(date_from)
+        parsed_date_to = self._parse_date_filter(date_to)
+        if parsed_date_from:
+            statement = statement.where(LegacyWorkflowTopic.scheduled_date >= parsed_date_from)
+        if parsed_date_to:
+            statement = statement.where(LegacyWorkflowTopic.scheduled_date <= parsed_date_to)
         if search:
-            clauses.append("(title LIKE ? OR brief LIKE ? OR chapter LIKE ? OR content_goal LIKE ?)")
             pattern = f"%{search}%"
-            values.extend([pattern, pattern, pattern, pattern])
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT * FROM workflow_topics
-                {where}
-                ORDER BY
-                    CASE WHEN scheduled_date IS NULL THEN 1 ELSE 0 END,
-                    scheduled_date ASC,
-                    updated_at DESC
-                """,
-                values,
-            ).fetchall()
-        return [self._topic_from_row(row) for row in rows]
+            statement = statement.where(
+                or_(
+                    LegacyWorkflowTopic.title.like(pattern),
+                    LegacyWorkflowTopic.brief.like(pattern),
+                    LegacyWorkflowTopic.chapter.like(pattern),
+                    LegacyWorkflowTopic.content_goal.like(pattern),
+                )
+            )
+        statement = statement.order_by(
+            LegacyWorkflowTopic.scheduled_date.is_(None),
+            LegacyWorkflowTopic.scheduled_date.asc(),
+            LegacyWorkflowTopic.updated_at.desc(),
+        )
+        with SessionLocal() as session:
+            rows = session.scalars(statement).all()
+            return [self._topic_from_model(row) for row in rows]
 
     def update_topic(
         self,
@@ -372,138 +387,141 @@ class Database:
 
         data = current.model_dump(mode="json")
         data.update(updates)
-        data["updated_at"] = datetime.utcnow().isoformat()
-        record = self._topic_to_record(WorkflowTopic.model_validate(data))
-        columns = [
-            "title",
-            "brief",
-            "subject",
-            "category",
-            "chapter",
-            "content_type",
-            "owner",
-            "status",
-            "review_status",
-            "priority",
-            "scheduled_date",
-            "due_date",
-            "publish_channel",
-            "content_goal",
-            "audience",
-            "material_file_ids",
-            "ragflow_dataset_ids",
-            "generation_job_id",
-            "confirmed_by",
-            "confirmed_at",
-            "published_at",
-            "updated_at",
-        ]
-        assignments = ", ".join([f"{column} = :{column}" for column in columns])
-        with self.connect() as conn:
-            conn.execute(f"UPDATE workflow_topics SET {assignments} WHERE id = :id", record)
-            updated = self._topic_from_row(
-                conn.execute("SELECT * FROM workflow_topics WHERE id = ?", (topic_id,)).fetchone()
-            )
-            self._insert_topic_event(conn, updated, event_type, actor, note)
-            conn.commit()
-        return updated
+        data["updated_at"] = datetime.utcnow()
+        updated_topic = WorkflowTopic.model_validate(data)
+
+        with SessionLocal() as session:
+            row = session.get(LegacyWorkflowTopic, topic_id)
+            if not row:
+                return None
+            self._apply_topic(row, updated_topic)
+            self._insert_topic_event(session, updated_topic, event_type, actor, note)
+            session.commit()
+            session.refresh(row)
+            return self._topic_from_model(row)
 
     def delete_topic(self, topic_id: str) -> bool:
-        with self.connect() as conn:
-            cur = conn.execute("DELETE FROM workflow_topics WHERE id = ?", (topic_id,))
-            conn.execute("DELETE FROM workflow_events WHERE topic_id = ?", (topic_id,))
-            conn.commit()
-        return cur.rowcount > 0
+        with SessionLocal() as session:
+            result = session.execute(delete(LegacyWorkflowTopic).where(LegacyWorkflowTopic.id == topic_id))
+            session.execute(delete(LegacyWorkflowEvent).where(LegacyWorkflowEvent.topic_id == topic_id))
+            session.commit()
+            return result.rowcount > 0
 
     def list_topic_events(self, topic_id: str) -> list[WorkflowEvent]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM workflow_events WHERE topic_id = ? ORDER BY version DESC",
-                (topic_id,),
-            ).fetchall()
-        return [self._event_from_row(row) for row in rows]
+        statement = (
+            select(LegacyWorkflowEvent)
+            .where(LegacyWorkflowEvent.topic_id == topic_id)
+            .order_by(LegacyWorkflowEvent.version.desc())
+        )
+        with SessionLocal() as session:
+            rows = session.scalars(statement).all()
+            return [self._event_from_model(row) for row in rows]
 
-    def _library_from_row(self, row: sqlite3.Row) -> LibraryFile:
-        data = dict(row)
+    def _library_to_model(self, file: LibraryFile) -> LegacyLibraryFile:
+        data = file.model_dump()
+        data["tags"] = json.dumps(data["tags"], ensure_ascii=False)
+        return LegacyLibraryFile(**data)
+
+    def _library_from_model(self, row: LegacyLibraryFile) -> LibraryFile:
+        data = self._model_to_dict(row)
         data["tags"] = json.loads(data["tags"] or "[]")
         source_title = (data.get("source_title") or "").strip()
-        if source_title in {"批量上传资料", "uploaded source"}:
-            data["source_title"] = Path(data.get("filename") or "未命名资料").stem
+        if source_title in {"鎵归噺涓婁紶璧勬枡", "uploaded source"}:
+            data["source_title"] = Path(data.get("filename") or "untitled").stem
         return LibraryFile.model_validate(data)
 
-    def _job_values(self, job: GenerationJob) -> tuple[Any, ...]:
+    def _job_values(self, job: GenerationJob) -> dict[str, Any]:
         data = job.model_dump(mode="json")
-        return (
-            data["id"],
-            json.dumps(data["context"], ensure_ascii=False),
-            data["status"],
-            json.dumps(data["result"], ensure_ascii=False) if data.get("result") else None,
-            json.dumps(data["review"], ensure_ascii=False) if data.get("review") else None,
-            data["created_at"],
-            data.get("error"),
-        )
+        return {
+            "id": data["id"],
+            "context": json.dumps(data["context"], ensure_ascii=False),
+            "status": data["status"],
+            "result": json.dumps(data["result"], ensure_ascii=False) if data.get("result") else None,
+            "review": json.dumps(data["review"], ensure_ascii=False) if data.get("review") else None,
+            "created_at": job.created_at,
+            "error": data.get("error"),
+        }
 
-    def _job_from_row(self, row: sqlite3.Row) -> GenerationJob:
-        data = dict(row)
+    def _job_to_model(self, job: GenerationJob) -> LegacyGenerationJob:
+        return LegacyGenerationJob(**self._job_values(job))
+
+    def _job_from_model(self, row: LegacyGenerationJob) -> GenerationJob:
+        data = self._model_to_dict(row)
         data["context"] = json.loads(data["context"])
         data["result"] = json.loads(data["result"]) if data["result"] else None
         data["review"] = json.loads(data["review"]) if data["review"] else None
         return GenerationJob.model_validate(data)
 
+    def _topic_to_model(self, topic: WorkflowTopic) -> LegacyWorkflowTopic:
+        data = self._topic_to_record(topic)
+        return LegacyWorkflowTopic(**data)
+
     def _topic_to_record(self, topic: WorkflowTopic) -> dict[str, Any]:
-        data = topic.model_dump(mode="json")
+        data = topic.model_dump()
         data["material_file_ids"] = json.dumps(data["material_file_ids"], ensure_ascii=False)
         data["ragflow_dataset_ids"] = json.dumps(data["ragflow_dataset_ids"], ensure_ascii=False)
         return data
 
-    def _topic_from_row(self, row: sqlite3.Row) -> WorkflowTopic:
-        data = dict(row)
+    def _apply_topic(self, row: LegacyWorkflowTopic, topic: WorkflowTopic) -> None:
+        data = self._topic_to_record(topic)
+        for key, value in data.items():
+            setattr(row, key, value)
+
+    def _topic_from_model(self, row: LegacyWorkflowTopic) -> WorkflowTopic:
+        data = self._model_to_dict(row)
         data["material_file_ids"] = json.loads(data["material_file_ids"] or "[]")
         data["ragflow_dataset_ids"] = json.loads(data["ragflow_dataset_ids"] or "[]")
         return WorkflowTopic.model_validate(data)
 
     def _insert_topic_event(
         self,
-        conn: sqlite3.Connection,
+        session,
         topic: WorkflowTopic,
         event_type: str,
         actor: str | None,
         note: str | None,
     ) -> WorkflowEvent:
-        row = conn.execute(
-            "SELECT COALESCE(MAX(version), 0) + 1 AS version FROM workflow_events WHERE topic_id = ?",
-            (topic.id,),
-        ).fetchone()
+        version = (
+            session.scalar(
+                select(func.coalesce(func.max(LegacyWorkflowEvent.version), 0) + 1).where(
+                    LegacyWorkflowEvent.topic_id == topic.id
+                )
+            )
+            or 1
+        )
         event = WorkflowEvent(
-            id=f"{topic.id}:{row['version']}",
+            id=f"{topic.id}:{version}",
             topic_id=topic.id,
-            version=row["version"],
+            version=version,
             event_type=event_type,
             note=note,
             actor=actor,
             snapshot=topic.model_dump(mode="json"),
             created_at=datetime.utcnow(),
         )
-        conn.execute(
-            """
-            INSERT INTO workflow_events
-                (id, topic_id, version, event_type, note, actor, snapshot, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event.id,
-                event.topic_id,
-                event.version,
-                event.event_type,
-                event.note,
-                event.actor,
-                json.dumps(event.snapshot, ensure_ascii=False),
-                event.created_at.isoformat(),
-            ),
+        session.add(
+            LegacyWorkflowEvent(
+                id=event.id,
+                topic_id=event.topic_id,
+                version=event.version,
+                event_type=event.event_type,
+                note=event.note,
+                actor=event.actor,
+                snapshot=json.dumps(event.snapshot, ensure_ascii=False),
+                created_at=event.created_at,
+            )
         )
         return event
 
-    def _event_from_row(self, row: sqlite3.Row) -> WorkflowEvent:
-        data = dict(row)
+    def _event_from_model(self, row: LegacyWorkflowEvent) -> WorkflowEvent:
+        data = self._model_to_dict(row)
         data["snapshot"] = json.loads(data["snapshot"] or "{}")
         return WorkflowEvent.model_validate(data)
+
+    def _model_to_dict(self, row) -> dict[str, Any]:
+        return {column.name: getattr(row, column.name) for column in row.__table__.columns}
+
+    def _parse_date_filter(self, value: str | None) -> date | None:
+        if not value:
+            return None
+        return date.fromisoformat(value)

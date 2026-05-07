@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { FileText, RefreshCw, Trash2, UploadCloud } from "lucide-react";
-import { apiFetch, LibraryFile, LibraryFilePreview, SubjectConfig, SystemConfig } from "../../lib/api";
+import { apiFetch, LibraryFile, LibraryFilePreview, ParsePreset, SubjectConfig, SystemConfig } from "../../lib/api";
 
 const libraryPreviewChars = 200_000;
 
@@ -15,13 +15,26 @@ const sourceTypes = [
   ["other", "其他"],
 ];
 
+const parsePresetOptions: Array<{ value: ParsePreset; label: string }> = [
+  { value: "auto", label: "自动" },
+  { value: "fast", label: "高速" },
+  { value: "balanced", label: "均衡" },
+  { value: "accurate", label: "高精度" },
+  { value: "formula", label: "公式增强" },
+];
+
 export default function LibraryPage() {
   const [files, setFiles] = useState<LibraryFile[]>([]);
   const [uploadFiles, setUploadFiles] = useState<FileList | null>(null);
   const [message, setMessage] = useState("");
+  const [previewError, setPreviewError] = useState("");
   const [loading, setLoading] = useState(false);
   const [preview, setPreview] = useState<LibraryFilePreview | null>(null);
   const [subjects, setSubjects] = useState<SubjectConfig[]>([]);
+  const [parsePreset, setParsePreset] = useState<ParsePreset>("auto");
+  const [forceOcr, setForceOcr] = useState(false);
+  const [headerRatio, setHeaderRatio] = useState("0.00");
+  const [footerRatio, setFooterRatio] = useState("0.00");
   const [meta, setMeta] = useState({
     subject: "",
     category: "",
@@ -102,11 +115,23 @@ export default function LibraryPage() {
   }
 
   async function showPreview(file: LibraryFile) {
-    const data = await apiFetch<LibraryFilePreview>(
-      `/api/library/files/${file.id}/preview?max_chars=${libraryPreviewChars}`
-    );
-    setPreview(data);
-    await loadFiles();
+    setPreviewError("");
+    const params = new URLSearchParams({
+      max_chars: String(libraryPreviewChars),
+      preset: parsePreset,
+    });
+    if (forceOcr) params.set("force_ocr", "true");
+    if (Number(headerRatio) > 0) params.set("crop_header_ratio", String(Number(headerRatio)));
+    if (Number(footerRatio) > 0) params.set("crop_footer_ratio", String(Number(footerRatio)));
+    try {
+      const data = await apiFetch<LibraryFilePreview>(
+        `/api/library/files/${file.id}/preview?${params.toString()}`
+      );
+      setPreview(data);
+      await loadFiles();
+    } catch (error) {
+      setPreviewError(error instanceof Error ? error.message : "预览失败");
+    }
   }
 
   return (
@@ -243,6 +268,35 @@ export default function LibraryPage() {
           <div className="panelBody formGrid">
             <div className="row">
               <div className="field">
+                <label>解析预设</label>
+                <select value={parsePreset} onChange={(e) => setParsePreset(e.target.value as ParsePreset)}>
+                  {parsePresetOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field">
+                <label>强制 OCR</label>
+                <select value={forceOcr ? "true" : "false"} onChange={(e) => setForceOcr(e.target.value === "true")}>
+                  <option value="false">否</option>
+                  <option value="true">是</option>
+                </select>
+              </div>
+            </div>
+            <div className="row">
+              <div className="field">
+                <label>页眉裁切</label>
+                <input value={headerRatio} onChange={(e) => setHeaderRatio(e.target.value)} placeholder="0.04" />
+              </div>
+              <div className="field">
+                <label>页脚裁切</label>
+                <input value={footerRatio} onChange={(e) => setFooterRatio(e.target.value)} placeholder="0.05" />
+              </div>
+            </div>
+            <div className="row">
+              <div className="field">
                 <label>学科筛选</label>
                 <select value={filters.subject} onChange={(e) => setFilters({ ...filters, subject: e.target.value })}>
                   <option value="">全部学科</option>
@@ -262,6 +316,7 @@ export default function LibraryPage() {
               <RefreshCw size={17} />
               应用筛选
             </button>
+            {previewError && <p className="errorText">{previewError}</p>}
             <div className="tableWrap">
               <table>
                 <thead>
@@ -313,10 +368,16 @@ export default function LibraryPage() {
         <section className="panel" style={{ marginTop: 18 }}>
           <div className="panelHeader">
             <h2>{preview.filename}</h2>
-            <p>估算 Token：{preview.token_count.toLocaleString()}</p>
+            <p>
+              估算 Token：{preview.token_count.toLocaleString()} · 解析器：{preview.provider} · 表格：{preview.table_count}
+            </p>
           </div>
           <div className="panelBody">
-            <pre className="markdown">{preview.text}</pre>
+            {!!Object.keys(preview.parse_options || {}).length && (
+              <p className="muted">解析参数：{JSON.stringify(preview.parse_options)}</p>
+            )}
+            {!!preview.warnings.length && <p className="muted">{preview.warnings.join(" | ")}</p>}
+            <pre className="markdown">{preview.markdown || preview.text}</pre>
           </div>
         </section>
       )}

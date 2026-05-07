@@ -22,6 +22,7 @@ import ReviewFloatingPanel from "../../components/ReviewFloatingPanel";
 import {
   API_BASE,
   LAYOUT_API_BASE,
+  LAYOUT_PUBLIC_URL,
   apiFetch,
   contentTypeLabels,
   ContentType,
@@ -54,7 +55,7 @@ const activeGenerationStatuses = new Set<GenerationJob["status"]>([
   "generating",
   "reviewing",
 ]);
-const placeholderSourceTitles = new Set(["批量上传资料", "uploaded source"]);
+const placeholderSourceTitles = new Set(["批量上传资料", "鎵归噺涓婁紶璧勬枡", "uploaded source"]);
 
 type GenerationMode = "direct" | "ragflow";
 type GenerationForm = {
@@ -200,7 +201,7 @@ export default function GeneratePage() {
     try {
       const data = await apiFetch<RAGFlowDatasetList>("/api/system/ragflow/datasets");
       setRagflowDatasets(data.datasets);
-      setRagflowMessage(data.datasets.length ? `已拉取 ${data.datasets.length} 个 dataset。` : "RAGFlow 暂无可用 dataset。");
+      setRagflowMessage(data.datasets.length ? `Loaded ${data.datasets.length} datasets.` : "No RAGFlow datasets available.");
     } catch (error) {
       const text = error instanceof Error ? error.message : "拉取 RAGFlow dataset 清单失败";
       setRagflowMessage(text);
@@ -245,7 +246,7 @@ export default function GeneratePage() {
       events.addEventListener("done", (event) => {
         const payload = JSON.parse((event as MessageEvent).data) as GenerationJob;
         applyJob(payload);
-        setMessage(payload.status === "done" ? "生成完成。" : payload.error || "任务失败");
+        setMessage(payload.status === "done" ? "Generation completed." : payload.error || "Task failed.");
         closeStream();
       });
 
@@ -337,7 +338,7 @@ export default function GeneratePage() {
         .then((latest) => {
           if (cancelled) return;
           applyJob(latest);
-          setMessage(isActiveGeneration(latest) ? `已恢复上次任务：${latest.status}` : "已恢复上次生成任务。");
+          setMessage(isActiveGeneration(latest) ? `Restored last job: ${latest.status}` : "Restored last generation job.");
           if (isActiveGeneration(latest)) watchJob(latest.id);
         })
         .catch(() => {
@@ -379,10 +380,10 @@ export default function GeneratePage() {
     [selectedFiles, selectedMissingFileIds]
   );
   const selectedFileSummary = selected.length
-    ? `${selected.length} 个素材：${selectedFileNames.slice(0, 2).join("、")}${selected.length > 2 ? " 等" : ""}`
+    ? `${selected.length} sources: ${selectedFileNames.slice(0, 2).join(", ")}${selected.length > 2 ? " etc." : ""}`
     : files.length
-      ? "选择素材库资料"
-      : "暂无素材库资料";
+      ? "Select library sources"
+      : "No library sources";
   const selectedTokens = useMemo(
     () => selectedFiles.reduce((sum, file) => sum + (file.token_count || 0), 0),
     [selectedFiles]
@@ -415,8 +416,8 @@ export default function GeneratePage() {
     [selectedRagflowDatasets, selectedRagflowDatasetMissingIds]
   );
   const ragflowDatasetSummary = selectedRagflowDatasetIds.length
-    ? `${selectedRagflowDatasetIds.length} 个 dataset：${selectedRagflowDatasetNames.slice(0, 2).join("、")}${
-        selectedRagflowDatasetIds.length > 2 ? " 等" : ""
+    ? `${selectedRagflowDatasetIds.length} datasets: ${selectedRagflowDatasetNames.slice(0, 2).join(", ")}${
+        selectedRagflowDatasetIds.length > 2 ? " etc." : ""
       }`
     : ragflowLoading
       ? "正在拉取 RAGFlow dataset 清单..."
@@ -483,56 +484,73 @@ export default function GeneratePage() {
 
   async function collectPromptSourceContent() {
     const blocks: string[] = [];
-    blocks.push(`【任务信息】`);
-    blocks.push(`学科：${form.subject || "未填写"}`);
-    blocks.push(`类目：${form.category || "未填写"}`);
-    blocks.push(`章节：${form.chapter || "未填写"}`);
-    blocks.push(`内容类型：${contentTypeLabels[form.content_type]}`);
-    blocks.push(`目标页数：${form.pages || "未填写"}`);
+    blocks.push("[Task Info]");
+    blocks.push(`Subject: ${form.subject || "not set"}`);
+    blocks.push(`Category: ${form.category || "not set"}`);
+    blocks.push(`Chapter: ${form.chapter || "not set"}`);
+    blocks.push(`Content type: ${contentTypeLabels[form.content_type]}`);
+    blocks.push(`Target pages: ${form.pages || "not set"}`);
     blocks.push("");
 
     if (form.user_notes.trim()) {
-      blocks.push("【补充说明】");
+      blocks.push("[User Notes]");
       blocks.push(form.user_notes.trim());
       blocks.push("");
     }
 
     if (mode === "direct" && selected.length) {
-      const previews = await Promise.all(
+      const previews = await Promise.allSettled(
         selected.map((fileId) =>
           apiFetch<LibraryFilePreview>(`/api/library/files/${fileId}/preview?max_chars=${promptSourcePreviewChars}`)
         )
       );
-      blocks.push("【素材库资料】");
-      previews.forEach((preview, index) => {
-        blocks.push(`--- 素材 ${index + 1}：${preview.filename}${preview.truncated ? "（已截断预览）" : ""} ---`);
-        blocks.push(preview.text.trim() || "（无可用文本）");
+      blocks.push("[Library Sources]");
+      previews.forEach((result, index) => {
+        const fileId = selected[index];
+        if (result.status === "rejected") {
+          blocks.push(`--- Source ${index + 1}: ${fileId} (preview unavailable) ---`);
+          blocks.push(result.reason instanceof Error ? result.reason.message : "This source preview failed to load.");
+          return;
+        }
+        const preview = result.value;
+        blocks.push(`--- Source ${index + 1}: ${preview.filename}${preview.truncated ? " (preview truncated)" : ""} ---`);
+        blocks.push(preview.text.trim() || "(no available text)");
       });
       blocks.push("");
     }
 
     if (mode === "ragflow") {
-      blocks.push("【RAGFlow 检索要求】");
-      blocks.push(`Dataset IDs：${selectedRagflowDatasetIds.join(", ") || "未填写"}`);
-      blocks.push("生成时请结合后端检索到的资料正文；本预览仅包含检索条件。");
+      blocks.push("[RAGFlow Retrieval]");
+      blocks.push(`Dataset IDs: ${selectedRagflowDatasetIds.join(", ") || "not set"}`);
+      blocks.push("Use backend retrieval results during generation; this preview only includes retrieval parameters.");
       blocks.push("");
     }
 
     if (mode === "direct" && uploadFiles?.length) {
-      blocks.push("【本次新上传】");
-      const uploadBlocks = await Promise.all(
+      blocks.push("[New Uploads]");
+      const uploadBlocks = await Promise.allSettled(
         Array.from(uploadFiles).map(async (file, index) => {
           const text = await readUploadPreview(file);
-          return [`--- 上传 ${index + 1}：${file.name} ---`, text || "（无法在浏览器中预览该文件，提交生成后由后端解析。）"].join("\n");
+          return [`--- Upload ${index + 1}: ${file.name} ---`, text || "(this file cannot be previewed in the browser; the backend will parse it after submission)"].join("\n");
         })
       );
-      blocks.push(uploadBlocks.join("\n\n"));
+      blocks.push(
+        uploadBlocks
+          .map((result, index) => {
+            const file = Array.from(uploadFiles)[index];
+            if (result.status === "rejected") {
+              return [`--- Upload ${index + 1}: ${file.name} ---`, "This upload preview failed to load."].join("\n");
+            }
+            return result.value;
+          })
+          .join("\n\n"),
+      );
       blocks.push("");
     }
 
     if (blocks.length <= 8) {
-      blocks.push("【原始资料】");
-      blocks.push("本次未选择素材，请仅生成可复核的结构初稿，并保留未核验提示。");
+      blocks.push("[Source Content]");
+      blocks.push("No source material selected. Generate a verifiable draft and keep the unverified warning.");
     }
 
     return blocks.join("\n").trim();
@@ -572,8 +590,8 @@ export default function GeneratePage() {
           },
         }),
       });
-      setLayoutMessage(`已发送到排版工具：${created.title}`);
-      window.open(`${LAYOUT_API_BASE}/`, "_blank", "noopener,noreferrer");
+      setLayoutMessage(`Sent to layout tool: ${created.title}`);
+      window.open(`${LAYOUT_PUBLIC_URL}/`, "_blank", "noopener,noreferrer");
     } catch (error) {
       setLayoutMessage(error instanceof Error ? error.message : "发送到排版工具失败");
     } finally {
@@ -586,7 +604,7 @@ export default function GeneratePage() {
     setSubmitting(true);
     setMessage("");
     setJob(null);
-    closeStream();
+      closeStream();
     try {
       if (!form.subject) {
         setMessage("请先在设置页添加学科。");
@@ -675,7 +693,8 @@ export default function GeneratePage() {
         body: JSON.stringify({ mode: reviewMode }),
       });
       applyJob(updated);
-      setMessage("内容审查完成。");
+      if (isActiveGeneration(updated)) watchJob(updated.id);
+      setMessage(isActiveGeneration(updated) ? "内容审查已排队。" : "内容审查完成。");
       setReviewPanelOpen(true);
     } catch (error) {
       const fallback = await apiFetch<GenerationJob>(`/api/generate/${job.id}`).catch(() => null);
@@ -832,7 +851,7 @@ export default function GeneratePage() {
                   )}
                 </div>
                 <div className="selectMetaLine">
-                  <span>{selectedRagflowDatasetIds.length ? `已选 ${selectedRagflowDatasetIds.length} 个 dataset` : "未选择 dataset"}</span>
+                  <span>{selectedRagflowDatasetIds.length ? `Selected ${selectedRagflowDatasetIds.length} datasets` : "No dataset selected"}</span>
                   {selectedRagflowDatasets.reduce((sum, dataset) => sum + (dataset.document_count || 0), 0) > 0 && (
                     <span>{selectedRagflowDatasets.reduce((sum, dataset) => sum + (dataset.document_count || 0), 0)} docs</span>
                   )}
@@ -858,7 +877,7 @@ export default function GeneratePage() {
                     </span>
                     <span>
                       <strong>{selectedFileSummary}</strong>
-                      <small>{selected.length ? `${selectedTokens.toLocaleString()} token` : "可与本次新上传资料混合使用"}</small>
+                      <small>{selected.length ? `${selectedTokens.toLocaleString()} token` : "Can be mixed with new uploads"}</small>
                     </span>
                     <ChevronDown size={16} />
                   </button>
@@ -895,13 +914,13 @@ export default function GeneratePage() {
                         </label>
                       ))}
                       {!files.length && !selectedMissingFileIds.length && (
-                        <div className="multiSelectEmpty">先去素材库上传资料，或直接无资料生成。</div>
+                        <div className="multiSelectEmpty">Upload sources in the library first, or generate without sources.</div>
                       )}
                     </div>
                   )}
                 </div>
                 <div className="selectMetaLine">
-                  <span>已选 {selected.length} 个素材</span>
+                  <span>Selected {selected.length} sources</span>
                   <span>{selectedTokens.toLocaleString()} token</span>
                   <span>未解析文件会在提交时解析并拦截超限</span>
                 </div>
@@ -939,7 +958,7 @@ export default function GeneratePage() {
               <textarea
                 value={form.user_notes}
                 onChange={(e) => setForm({ ...form, user_notes: e.target.value })}
-                placeholder="例如：偏小红书口吻，重点讲收入确认易错点，适合考前冲刺。"
+                placeholder="Example: use a concise Xiaohongshu tone and focus on common mistakes before the exam."
               />
             </div>
 
@@ -971,7 +990,7 @@ export default function GeneratePage() {
                   {!layoutModes.length && <option value={form.layout_mode_id}>请先启动 Layout_For_Xhs</option>}
                   {layoutModes.map((layoutMode) => (
                     <option key={layoutMode.id} value={layoutMode.id}>
-                      {layoutMode.name} · {layoutMode.title}
+                      {layoutMode.name} - {layoutMode.title}
                     </option>
                   ))}
                 </select>
@@ -1005,7 +1024,7 @@ export default function GeneratePage() {
                   <Clipboard size={16} />
                   复制提示词
                 </button>
-                <a className="button" href={LAYOUT_API_BASE} rel="noreferrer" target="_blank">
+                <a className="button" href={LAYOUT_PUBLIC_URL} rel="noreferrer" target="_blank">
                   <ExternalLink size={16} />
                   打开排版
                 </a>
@@ -1205,10 +1224,10 @@ function parseDatasetIds(value: string) {
 }
 
 function composeLayoutPrompt(template: string, sourceContent: string) {
-  const content = sourceContent.trim() || "本次未提供原始资料，请生成可复核的结构初稿。";
+  const content = sourceContent.trim() || "No source content was provided. Generate a verifiable draft.";
   return template.includes("{{sourceContent}}")
     ? template.replaceAll("{{sourceContent}}", content)
-    : `${template.trim()}\n\n原始资料：\n\n${content}`;
+    : `${template.trim()}\n\nSource content:\n\n${content}`;
 }
 
 async function readUploadPreview(file: File) {
@@ -1237,3 +1256,4 @@ function buildGenerationOptions(pages: string, layoutPrompt: string, layoutMode:
     layout_template_version: layoutMode?.templateVersion || null,
   };
 }
+

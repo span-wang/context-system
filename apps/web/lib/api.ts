@@ -1,5 +1,8 @@
-export const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
-export const LAYOUT_API_BASE = process.env.NEXT_PUBLIC_LAYOUT_API_BASE || "http://127.0.0.1:3210";
+import { resolvePublicBase } from "./public-base";
+
+export const API_BASE = resolvePublicBase(process.env.NEXT_PUBLIC_API_BASE, "");
+export const LAYOUT_API_BASE = resolvePublicBase(process.env.NEXT_PUBLIC_LAYOUT_API_BASE, "/layout");
+export const LAYOUT_PUBLIC_URL = process.env.NEXT_PUBLIC_LAYOUT_PUBLIC_URL || "https://xhs.panspan.cloud";
 
 export type ContentType =
   | "mnemonic"
@@ -11,6 +14,7 @@ export type ContentType =
 
 export type ReviewMode = "llm_only" | "document_only" | "hybrid";
 export type ReviewItemStatus = "pending" | "confirmed" | "replaced" | "skipped";
+export type ParsePreset = "auto" | "fast" | "balanced" | "accurate" | "formula";
 export type WorkflowTopicStatus =
   | "idea"
   | "planned"
@@ -53,8 +57,14 @@ export type LibraryFilePreview = {
   file_id: string;
   filename: string;
   token_count: number;
+  provider: string;
   text: string;
+  markdown: string;
+  table_count: number;
+  warning_count: number;
+  warnings: string[];
   truncated: boolean;
+  parse_options: Record<string, unknown>;
 };
 
 export type LayoutMode = {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import datetime
@@ -8,7 +9,14 @@ from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile
 
-from library.parser import parse_bytes
+from library.parse_options import DocumentParseOptions
+from library.parser import (
+    ParsedDocument,
+    deserialize_parsed_document,
+    parse_document,
+    parse_preview_document,
+    serialize_parsed_document,
+)
 from library.token_counter import estimate_tokens
 from schemas.context import ContextSource
 from schemas.library import FileMetadata, LibraryFile, LibraryFilePatch
@@ -89,7 +97,8 @@ class LibraryService:
     ) -> list[LibraryFile]:
         if subject:
             subject = self._normalize_subject_or_422(subject)
-        return [self._with_display_title(file) for file in self.db.list_library_files(subject, category, source_type, search)]
+        files = self.db.list_library_files(subject, category, source_type, search)
+        return [self._with_display_title(file) for file in files]
 
     def get_file(self, file_id: str) -> LibraryFile:
         file = self.db.get_library_file(file_id)
@@ -115,32 +124,65 @@ class LibraryService:
         if not file:
             raise HTTPException(status_code=404, detail="library file not found")
         await self.storage.delete(file.storage_path)
-        cache_path = self.cache_root / f"{file.sha256}.txt"
-        if cache_path.exists():
-            cache_path.unlink()
+        for pattern in (f"{file.sha256}.txt", f"{file.sha256}.json", f"{file.sha256}__*.txt", f"{file.sha256}__*.json"):
+            for cache_path in self.cache_root.glob(pattern):
+                if cache_path.exists():
+                    cache_path.unlink()
 
-    async def parse_and_cache(self, file: LibraryFile) -> str:
-        if file.parsed_text:
-            return file.parsed_text
-        cache_path = self.cache_root / f"{file.sha256}.txt"
-        if cache_path.exists():
-            text = cache_path.read_text(encoding="utf-8")
-        else:
-            raw = await self.storage.get(file.storage_path)
-            text = parse_bytes(raw, file.filename, file.mime)
-            cache_path.write_text(text, encoding="utf-8")
-        self.db.set_parsed_text(file.id, text, estimate_tokens(text))
-        return text
+    async def parse_and_cache(
+        self,
+        file: LibraryFile,
+        options: DocumentParseOptions | None = None,
+        *,
+        preview: bool = False,
+    ) -> ParsedDocument:
+        options = options or DocumentParseOptions()
+        cache_key = options.cache_key()
+        cache_prefix = file.sha256 if cache_key == "default" else f"{file.sha256}__{cache_key}"
+        if preview:
+            cache_prefix = f"{file.sha256}__preview" if cache_key == "default" else f"{file.sha256}__preview__{cache_key}"
+        text_cache_path = self.cache_root / f"{cache_prefix}.txt"
+        structured_cache_path = self.cache_root / f"{cache_prefix}.json"
 
-    async def to_context_source(self, file_id: str) -> ContextSource:
+        if structured_cache_path.exists():
+            parsed = deserialize_parsed_document(structured_cache_path.read_text(encoding="utf-8"))
+            if parsed is not None:
+                if _is_stale_parse_cache(parsed):
+                    structured_cache_path.unlink(missing_ok=True)
+                    text_cache_path.unlink(missing_ok=True)
+                else:
+                    if not text_cache_path.exists():
+                        text_cache_path.write_text(parsed.text, encoding="utf-8")
+                    self._remember_parse_result(file.id, parsed, preview=preview)
+                    return parsed
+
+        if text_cache_path.exists():
+            text = text_cache_path.read_text(encoding="utf-8")
+            parsed = ParsedDocument(text=text, markdown=text, provider="legacy_cache")
+            structured_cache_path.write_text(serialize_parsed_document(parsed), encoding="utf-8")
+            self._remember_parse_result(file.id, parsed, preview=preview)
+            return parsed
+
+        raw = await self.storage.get(file.storage_path)
+        parser = parse_preview_document if preview else parse_document
+        try:
+            parsed = await asyncio.to_thread(parser, raw, file.filename, file.mime, options)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"文件解析失败：{exc}") from exc
+        text_cache_path.write_text(parsed.text, encoding="utf-8")
+        structured_cache_path.write_text(serialize_parsed_document(parsed), encoding="utf-8")
+        self._remember_parse_result(file.id, parsed, preview=preview)
+        return parsed
+
+    async def to_context_source(self, file_id: str, options: DocumentParseOptions | None = None) -> ContextSource:
         file = self.get_file(file_id)
-        text = await self.parse_and_cache(file)
+        parsed = await self.parse_and_cache(file, options=options)
         self.db.mark_library_used(file_id)
         source_label = f"素材库:{file.source_title or file.filename}"
         if file.chapter:
             source_label += f"::{file.chapter}"
         return ContextSource(
-            text=text,
+            text=parsed.markdown or parsed.text,
             source_label=source_label,
             source_type=file.source_type,
             authority=file.source_authority,
@@ -152,44 +194,74 @@ class LibraryService:
         upload: UploadFile,
         metadata: FileMetadata,
         save: bool,
+        options: DocumentParseOptions | None = None,
     ) -> ContextSource:
         if save:
             file = await self.ingest_upload(upload, metadata)
-            return await self.to_context_source(file.id)
+            return await self.to_context_source(file.id, options=options)
 
         data = await upload.read()
         filename = upload.filename or "upload"
-        text = parse_bytes(data, filename, upload.content_type or "application/octet-stream")
+        try:
+            parsed = await asyncio.to_thread(
+                parse_document,
+                data,
+                filename,
+                upload.content_type or "application/octet-stream",
+                options,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"文件解析失败：{exc}") from exc
         source_title = self._display_source_title(metadata.source_title, filename)
         label = f"本次上传:{source_title}"
         if metadata.chapter:
             label += f"::{metadata.chapter}"
         return ContextSource(
-            text=text,
+            text=parsed.markdown or parsed.text,
             source_label=label,
             source_type=metadata.source_type,
             authority=metadata.source_authority,
             file_id=None,
         )
 
-    async def preview(self, file_id: str, max_chars: int = DEFAULT_PREVIEW_CHARS) -> dict:
+    async def preview(
+        self,
+        file_id: str,
+        max_chars: int = DEFAULT_PREVIEW_CHARS,
+        options: DocumentParseOptions | None = None,
+    ) -> dict:
         file = self.get_file(file_id)
-        text = await self.parse_and_cache(file)
-        preview_text = text
-        if not text.strip():
-            preview_text = (
+        options = options or DocumentParseOptions()
+        parsed = await self.parse_and_cache(file, options=options, preview=True)
+        preview_markdown = parsed.markdown or parsed.text
+        preview_text = parsed.text or preview_markdown
+        if not preview_markdown.strip():
+            placeholder = (
                 "[No text extracted. This file may be a low-quality scan, an image-only page, "
-                "or OCR may not be installed correctly. The parser first extracts selectable "
-                "PDF text and then falls back to OCR when needed.]"
+                "or PP-StructureV3 may not be installed correctly.]"
             )
+            preview_markdown = placeholder
+            preview_text = placeholder
         max_chars = max(1, min(max_chars, MAX_PREVIEW_CHARS))
         return {
             "file_id": file.id,
             "filename": file.filename,
-            "token_count": estimate_tokens(text),
+            "token_count": estimate_tokens(parsed.text),
+            "provider": parsed.provider,
             "text": preview_text[:max_chars],
-            "truncated": len(preview_text) > max_chars,
+            "markdown": preview_markdown[:max_chars],
+            "table_count": len(parsed.tables),
+            "warning_count": len(parsed.warnings),
+            "warnings": parsed.warnings[:5],
+            "truncated": len(preview_markdown) > max_chars,
+            "parse_options": options.normalized_dump(),
         }
+
+    def _remember_parse_result(self, file_id: str, parsed: ParsedDocument, *, preview: bool) -> None:
+        if preview:
+            return
+        self.db.set_parsed_text(file_id, parsed.text, estimate_tokens(parsed.text))
+
     def _metadata_from_json(self, raw: str | None) -> FileMetadata:
         if not raw:
             raise HTTPException(status_code=422, detail="batch_meta is required")
@@ -225,3 +297,8 @@ class LibraryService:
         if source_title == file.source_title:
             return file
         return file.model_copy(update={"source_title": source_title})
+
+
+def _is_stale_parse_cache(parsed: ParsedDocument) -> bool:
+    provider = parsed.provider.lower()
+    return provider.startswith("pdf_ocr_pipeline/rapid") or provider == "rapidocr_onnxruntime"

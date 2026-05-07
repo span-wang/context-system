@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useRef, useState } from "react";
 import { Clipboard, Download, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
@@ -75,9 +75,14 @@ export default function HistoryPage() {
         body: JSON.stringify({ mode: reviewMode }),
       });
       updateJob(updated);
-      setMessage("内容审查完成。");
       setSelected(updated);
       setReviewPanelOpen(true);
+      if (updated.status === "reviewing") {
+        setMessage("内容审查已入队。");
+        pollReviewJob(updated.id);
+      } else {
+        setMessage("内容审查完成。");
+      }
     } catch (error) {
       const fallback = await apiFetch<GenerationJob>(`/api/generate/${job.id}`).catch(() => null);
       if (fallback) updateJob(fallback);
@@ -85,6 +90,20 @@ export default function HistoryPage() {
     } finally {
       setReviewingId(null);
     }
+  }
+
+  async function pollReviewJob(jobId: string) {
+    for (let index = 0; index < 120; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const latest = await apiFetch<GenerationJob>(`/api/generate/${jobId}`).catch(() => null);
+      if (!latest) return;
+      updateJob(latest);
+      if (latest.status !== "reviewing") {
+        setMessage(latest.error ? latest.error : "内容审查完成。");
+        return;
+      }
+    }
+    setMessage("内容审查仍在运行，请稍后刷新。");
   }
 
   function openReviewPanel() {
