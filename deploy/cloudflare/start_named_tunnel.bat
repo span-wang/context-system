@@ -5,6 +5,9 @@ set "SCRIPT_DIR=%~dp0"
 set "CLOUDFLARED_EXE=%SCRIPT_DIR%cloudflared.exe"
 if exist "%SCRIPT_DIR%cloudflared_run.exe" set "CLOUDFLARED_EXE=%SCRIPT_DIR%cloudflared_run.exe"
 set "CONFIG_FILE=%SCRIPT_DIR%config.yml"
+if not "%~1"=="" set "CONFIG_FILE=%~1"
+set "CONFIG_NAME=config.yml"
+if not "%~1"=="" set "CONFIG_NAME=%~nx1"
 
 if not exist "%CLOUDFLARED_EXE%" (
   echo [ERROR] Missing cloudflared executable in %SCRIPT_DIR%
@@ -18,7 +21,10 @@ if not exist "%CONFIG_FILE%" (
 )
 
 echo Starting named Cloudflare Tunnel using %CONFIG_FILE%
-echo Recommended routing:
-echo   - https://context.panspan.cloud  new platform entrance
+echo Public hostname:
+echo   - use the hostname configured in %CONFIG_FILE%
 echo Keep the original local product ports unchanged and let cloudflared connect to 127.0.0.1:3000.
-"%CLOUDFLARED_EXE%" tunnel --config "%CONFIG_FILE%" --protocol http2 run
+pushd "%SCRIPT_DIR%"
+"%CLOUDFLARED_EXE%" tunnel --config "%CONFIG_NAME%" --protocol http2 run
+if errorlevel 1 exit /b %errorlevel%
+popd

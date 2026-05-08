@@ -1,7 +1,7 @@
 ﻿"use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { CheckCircle2, Edit2, KeyRound, Plus, PlugZap, RefreshCw, Save, Server, SlidersHorizontal, Trash2, X } from "lucide-react";
+import { CheckCircle2, KeyRound, PlugZap, RefreshCw, Save, Server, SlidersHorizontal, Trash2 } from "lucide-react";
 import { apiFetch, LLMEndpointConfig, LLMPresetConfig, SystemConfig } from "../../lib/api";
 
 type ProviderId = LLMEndpointConfig["provider"];
@@ -92,11 +92,6 @@ export default function SettingsPage() {
   const [presetSaving, setPresetSaving] = useState<EndpointTarget | null>(null);
   const [presetApplying, setPresetApplying] = useState<string | null>(null);
   const [presetDeleting, setPresetDeleting] = useState<string | null>(null);
-  const [subjectName, setSubjectName] = useState("");
-  const [subjectCategories, setSubjectCategories] = useState("");
-  const [editingSubjectId, setEditingSubjectId] = useState<string | null>(null);
-  const [subjectSaving, setSubjectSaving] = useState(false);
-  const [subjectMessage, setSubjectMessage] = useState("");
 
   async function loadConfig() {
     setLoading(true);
@@ -266,47 +261,6 @@ export default function SettingsPage() {
     } finally {
       setPresetDeleting(null);
     }
-  }
-
-  async function saveSubject(event: FormEvent) {
-    event.preventDefault();
-    const name = subjectName.trim();
-    if (!name) {
-      setSubjectMessage("先填写学科名称。");
-      return;
-    }
-    setSubjectSaving(true);
-    setSubjectMessage("");
-    try {
-      const data = await apiFetch<SystemConfig>("/api/system/subjects", {
-        method: "POST",
-        body: JSON.stringify({
-          id: editingSubjectId,
-          name,
-          categories: subjectCategories.split(/[,，\s]+/).filter(Boolean),
-        }),
-      });
-      setConfig(data);
-      resetSubjectForm();
-      setSubjectMessage(editingSubjectId ? `已更新学科：${name}` : `已保存学科：${name}`);
-    } catch (error) {
-      setSubjectMessage(error instanceof Error ? error.message : "保存学科失败");
-    } finally {
-      setSubjectSaving(false);
-    }
-  }
-
-  function editSubject(subject: SystemConfig["subjects"][number]) {
-    setEditingSubjectId(subject.id);
-    setSubjectName(subject.name);
-    setSubjectCategories(subject.categories.join("，"));
-    setSubjectMessage("");
-  }
-
-  function resetSubjectForm() {
-    setEditingSubjectId(null);
-    setSubjectName("");
-    setSubjectCategories("");
   }
 
   function renderEndpoint(target: EndpointTarget) {
@@ -484,67 +438,6 @@ export default function SettingsPage() {
             </div>
           </div>
           </form>
-
-          <form className="panel" onSubmit={saveSubject}>
-            <div className="panelHeader">
-              <h2>
-                <Plus size={18} />
-                学科管理
-              </h2>
-              <p>这里是唯一的学科新增入口，生成和素材库都会使用这份列表。</p>
-            </div>
-            <div className="panelBody formGrid">
-              <div className="row">
-                <div className="field">
-                  <label>学科名称</label>
-                  <input
-                    placeholder="例如：初级会计"
-                    value={subjectName}
-                    onChange={(event) => setSubjectName(event.target.value)}
-                  />
-                </div>
-                <div className="field">
-                  <label>类目</label>
-                  <input
-                    placeholder="用逗号或空格分隔"
-                    value={subjectCategories}
-                    onChange={(event) => setSubjectCategories(event.target.value)}
-                  />
-                </div>
-              </div>
-              <div className="buttonRow">
-                <button className="button primary" disabled={subjectSaving} type="submit">
-                  <Plus size={17} />
-                  {subjectSaving ? "保存中" : editingSubjectId ? "保存修改" : "添加学科"}
-                </button>
-                {editingSubjectId && (
-                  <button className="button" type="button" onClick={resetSubjectForm}>
-                    <X size={17} />
-                    取消编辑
-                  </button>
-                )}
-              </div>
-              {subjectMessage && <p className="muted">{subjectMessage}</p>}
-              <div className="subjectList">
-                {config?.subjects.length ? (
-                  config.subjects.map((subject) => (
-                    <div className="subjectRow" key={subject.id}>
-                      <div>
-                        <strong>{subject.name}</strong>
-                        <span>{subject.categories.length ? subject.categories.join(" / ") : "未设置类目"}</span>
-                      </div>
-                      <button className="button" type="button" onClick={() => editSubject(subject)}>
-                        <Edit2 size={16} />
-                        编辑
-                      </button>
-                    </div>
-                  ))
-                ) : (
-                  <div className="empty">还没有学科。</div>
-                )}
-              </div>
-            </div>
-          </form>
         </div>
 
         <aside className="panel">
@@ -579,6 +472,10 @@ export default function SettingsPage() {
               <strong>{config?.ragflow.enabled ? "enabled" : "disabled"}</strong>
               <span>Storage</span>
               <strong>{config?.storage.type || "-"}</strong>
+            </div>
+            <div className="calloutBox">
+              <strong>学科管理已迁移</strong>
+              <p className="muted">学科、类目、章节和知识点请统一在学科中心维护，生成中心、素材库和工作流会自动使用同一份数据。</p>
             </div>
             <div className="presetList">
               <div className="presetHeader">

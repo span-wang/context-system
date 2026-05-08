@@ -501,7 +501,9 @@ export default function GeneratePage() {
     if (mode === "direct" && selected.length) {
       const previews = await Promise.allSettled(
         selected.map((fileId) =>
-          apiFetch<LibraryFilePreview>(`/api/library/files/${fileId}/preview?max_chars=${promptSourcePreviewChars}`)
+          apiFetch<LibraryFilePreview>(
+            `/api/library/files/${fileId}/preview?max_chars=${promptSourcePreviewChars}&output_format=markdown`
+          )
         )
       );
       blocks.push("[Library Sources]");
@@ -514,7 +516,7 @@ export default function GeneratePage() {
         }
         const preview = result.value;
         blocks.push(`--- Source ${index + 1}: ${preview.filename}${preview.truncated ? " (preview truncated)" : ""} ---`);
-        blocks.push(preview.text.trim() || "(no available text)");
+        blocks.push(preview.content.trim() || preview.markdown.trim() || preview.text.trim() || "(no available text)");
       });
       blocks.push("");
     }
@@ -607,7 +609,7 @@ export default function GeneratePage() {
       closeStream();
     try {
       if (!form.subject) {
-        setMessage("请先在设置页添加学科。");
+        setMessage("请先在学科中心添加学科。");
         return;
       }
       if (mode === "ragflow" && !selectedRagflowDatasetIds.length) {
@@ -741,7 +743,7 @@ export default function GeneratePage() {
                   value={form.subject}
                   onChange={(e) => setForm(selectSubject(form, subjects, e.target.value))}
                 >
-                  {!subjects.length && <option value="">请先添加学科</option>}
+                  {!subjects.length && <option value="">请先在学科中心添加学科</option>}
                   {subjects.map((subject) => (
                     <option key={subject.id} value={subject.name}>
                       {subject.name}

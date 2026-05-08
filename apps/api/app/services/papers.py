@@ -22,6 +22,8 @@ from app.schemas.papers import (
     PaperSummary,
     PaperUploadResponse,
 )
+from app.services.paper_dataset import export_paper_parser_sample, should_auto_export_paper_dataset
+from app.services.question_enrichment import normalize_question_fields
 from app.services.tagging import apply_rule_tags
 from library.parse_options import DocumentParseOptions
 from library.parser import parse_document
@@ -30,21 +32,30 @@ PaperParseProgressCallback = Callable[[str, int, dict[str, object] | None], None
 
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".md", ".txt"}
 ALLOWED_UPLOAD_MIME_PREFIXES = ("application/", "image/", "text/")
-QUESTION_SPLIT_PATTERN = re.compile(r"(?m)^\s*(?:第\s*)?([0-9]{1,3}|[一二三四五六七八九十百]{1,6})\s*[\.、．)]\s*")
+QUESTION_SPLIT_PATTERN = re.compile(r"(?m)^\s*(?:#+\s*)?(?:第\s*)?([0-9]{1,3}|[一二三四五六七八九十百]{1,6})\s*[\.、．)]\s*")
 OPTION_PATTERN = re.compile(r"(?m)^\s*([A-H])[\.\、．)]\s*(.+?)(?=(?:\n\s*[A-H][\.\、．)]\s*)|\Z)", re.S)
-ANSWER_PATTERN = re.compile(r"(?:答案|参考答案|正确答案)\s*[:：]\s*(.+?)(?=(?:\n\s*(?:解析|答案解析|【解析】)\s*[:：])|\Z)", re.S)
-ANALYSIS_PATTERN = re.compile(r"(?:解析|答案解析|【解析】)\s*[:：]\s*(.+)$", re.S)
+ANSWER_PATTERN = re.compile(
+    r"(?ms)^\s*(?:#+\s*)?(?:答案|参考答案|正确答案)\s*[:：]\s*(.+?)(?=^\s*(?:#+\s*)?(?:解析|答案解析|【解析】)\s*(?:[:：]|\n)|\Z)"
+)
+ANALYSIS_PATTERN = re.compile(r"(?ms)^\s*(?:#+\s*)?(?:解析|答案解析|【解析】)\s*(?:[:：]\s*|\n+)(.+)$")
+ANSWER_ANALYSIS_HEADER_PATTERN = re.compile(r"(?m)^\s*(?:#+\s*)?答案与解析\s*$")
 SECTION_HEADER_PATTERN = re.compile(
-    r"(?m)^\s*(?:(?:第\s*[一二三四五六七八九十百0-9]+\s*部分)|(?:[一二三四五六七八九十百0-9]+\s*[、.．]))?\s*"
-    r"(?P<title>(?:单项选择题|多项选择题|判断题|填空题|简答题|计算题|案例分析题|综合题|材料分析题))"
-    r"(?:\s*[（(][^)\n）]+[)）])?\s*$"
+    r"(?m)^\s*(?:#+\s*)?(?:(?:第\s*[一二三四五六七八九十百0-9]+\s*部分)|(?:[一二三四五六七八九十百0-9]+\s*[、.．]))?\s*"
+    r"(?P<title>(?:单项选择题|多项选择题|不定项选择题|判断题|填空题|简答题|计算题|案例分析题|综合题|材料分析题))"
+    r"[^\n]*$"
 )
 SUBQUESTION_PATTERN = re.compile(r"(?m)^\s*[(（]([1-9][0-9]{0,2}|[一二三四五六七八九十]+)[)）]\s*")
+MATERIAL_ITEM_PATTERN = re.compile(r"(?m)^\s*(?:[(（][1-9][0-9]{0,2}[)）]|资料[一二三四五六七八九十0-9]+(?:\s*[:：]|$))")
+CASE_GROUP_PATTERN = re.compile(r"(?m)^\s*(?:#+\s*)?[（(]([一二三四五六七八九十0-9]+)[)）]\s*$")
+SHARED_STEM_CUE_PATTERN = re.compile(
+    r"(?:要求\s*[:：]?|根据上述资料|根据下列资料|阅读下列材料|分析回答下列|回答下列|下列小题|不考虑其他因素)"
+)
 MULTI_ANSWER_PATTERN = re.compile(r"^[A-H](?:[\s,，/、]+[A-H])+$")
 JUDGE_ANSWER_PATTERN = re.compile(r"^(?:正确|错误|对|错|√|×)$")
 SECTION_TYPE_MAP = {
     "单项选择题": "single_choice",
     "多项选择题": "multiple_choice",
+    "不定项选择题": "multiple_choice",
     "判断题": "judge",
     "填空题": "fill_blank",
     "简答题": "short_answer",
@@ -56,11 +67,18 @@ SECTION_TYPE_MAP = {
 
 
 @dataclass(slots=True)
+class SplitQuestionBlock:
+    raw_text: str
+    question_no_override: str | None = None
+    stem_prefix: str | None = None
+
+
+@dataclass(slots=True)
 class ParsedSection:
     title: str
     section_type: str
     sort_order: int
-    blocks: list[str]
+    blocks: list[SplitQuestionBlock]
 
 
 @dataclass(slots=True)
@@ -105,6 +123,7 @@ class PaperService:
         subject = self.repository.get_subject(paper.subject_id)
         category = self.repository.get_subject_category(paper.category_id)
         asset = self.repository.get_asset(paper.asset_id)
+        active_job = self.repository.find_active_parse_job(paper.id)
         sections = [PaperSectionResponse.model_validate(item) for item in self.repository.list_sections(paper.id)]
         return PaperDetailResponse.model_validate(
             {
@@ -113,6 +132,10 @@ class PaperService:
                 "category": category.name if category else _category_from_asset_tags(asset.tags_json if asset else None),
                 "asset_filename": asset.filename if asset else None,
                 "asset_parse_status": asset.parse_status if asset else None,
+                "active_parse_job_id": active_job.id if active_job else None,
+                "active_parse_job_status": active_job.status if active_job else None,
+                "active_parse_stage": (active_job.scope_config_json or {}).get("stage") if active_job else None,
+                "active_parse_progress": active_job.progress if active_job else None,
                 "sections": sections,
             }
         )
@@ -124,6 +147,21 @@ class PaperService:
         paper_name = paper.paper_name
         removed_question_count = len(self.repository.list_questions(paper.id))
         removed_source_link_count = self.repository.count_source_links(paper.id)
+        parse_jobs = self.repository.list_jobs(paper.id)
+        finished_at = datetime.utcnow()
+        for job in parse_jobs:
+            if job.status in {"completed", "failed"}:
+                continue
+            scope = dict(job.scope_config_json or {})
+            scope["stage"] = "failed"
+            detail = dict(scope.get("detail") or {})
+            detail.update({"paper_id": paper.id, "termination_reason": "paper_deleted"})
+            scope["detail"] = detail
+            job.scope_config_json = scope
+            job.status = "failed"
+            job.progress = 100
+            job.error_message = "试卷已删除，解析任务已终止"
+            job.finished_at = finished_at
         self.repository.delete_paper(paper.id)
         self.session.commit()
         return PaperDeleteResponse(
@@ -156,7 +194,9 @@ class PaperService:
         if not storage_path.exists():
             raise HTTPException(status_code=404, detail=f"素材文件不存在：{asset.storage_path}")
 
+        self._sync_parse_runtime_status(paper, asset, "prepare")
         _emit_parse_progress(progress_callback, "read_file", 10, {"filename": asset.filename})
+        self._sync_parse_runtime_status(paper, asset, "read_file")
         data = storage_path.read_bytes()
         parsed_document = parse_document(
             data,
@@ -165,8 +205,9 @@ class PaperService:
             options=options,
             progress_callback=progress_callback,
         )
-        parsed_text = parsed_document.markdown or parsed_document.text
-        if not parsed_text.strip():
+        parsed_output = options.select_output(text=parsed_document.text, markdown=parsed_document.markdown).strip()
+        split_source_text = (parsed_document.text or parsed_output).strip()
+        if not parsed_output:
             asset.parse_status = "empty"
             asset.ocr_status = "empty"
             paper.status = "parse_failed"
@@ -179,9 +220,16 @@ class PaperService:
         operator = self.repository.get_default_user(tenant.id)
         operator_id = operator.id if operator else None
 
-        _emit_parse_progress(progress_callback, "split_questions", 76, {"text_length": len(parsed_text)})
+        _emit_parse_progress(progress_callback, "split_questions", 76, {"text_length": len(split_source_text)})
+        self._sync_parse_runtime_status(paper, asset, "split_questions")
+        parsed_sections = _split_paper_sections(split_source_text)
+        _emit_parse_progress(
+            progress_callback,
+            "build_sections",
+            80,
+            {"section_count": len(parsed_sections)},
+        )
         self.repository.delete_parse_outputs(paper.id)
-        parsed_sections = _split_paper_sections(parsed_text)
         questions: list[ExamQuestion] = []
         created_sections: list[PaperSection] = []
         quality_warnings: list[str] = []
@@ -194,6 +242,8 @@ class PaperService:
                 subject_id = first_subject[0].subject_id
         if subject_id is None:
             raise HTTPException(status_code=422, detail="试卷或素材必须绑定学科后才能切题")
+        subject = self.repository.get_subject(subject_id)
+        category = self.repository.get_subject_category(paper.category_id)
 
         running_start_no: int | None = 1
         for section_index, parsed_section in enumerate(parsed_sections, start=1):
@@ -212,53 +262,53 @@ class PaperService:
                 )
             )
             created_sections.append(section)
-            _emit_parse_progress(
-                progress_callback,
-                "build_sections",
-                min(84, 76 + int((section_index / max(1, len(parsed_sections))) * 8)),
-                {
-                    "section_index": section_index,
-                    "section_count": len(parsed_sections),
-                    "section_name": parsed_section.title,
-                },
-            )
+            self._sync_parse_runtime_status(paper, asset, "build_sections")
 
             section_questions: list[ExamQuestion] = []
-            for block in parsed_section.blocks:
+            for question_index, block in enumerate(parsed_section.blocks, start=1):
                 parsed = _parse_question_block(block, parsed_section)
-                if parsed.quality_issues:
-                    quality_warnings.append(
-                        f"{parsed_section.title} 第{parsed.question_no}题：{'；'.join(parsed.quality_issues)}"
-                    )
-                uid_seed = f"{paper.id}:{section.id}:{parsed.question_no}:{parsed.stem_text[:80]}"
-                question_uid = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()[:24]
-                section_questions.append(
-                    ExamQuestion(
-                        tenant_id=paper.tenant_id,
-                        paper_id=paper.id,
-                        subject_id=subject_id,
-                        section_id=section.id,
-                        question_no=parsed.question_no,
-                        question_uid=f"P{paper.id}-{question_uid}",
-                        question_type=parsed.question_type,
-                        stem_text=parsed.stem_text,
-                        options_json=parsed.options_json,
-                        answer_text=parsed.answer_text,
-                        analysis_text=parsed.analysis_text,
-                        source_page_from=None,
-                        source_page_to=None,
-                        score=None,
-                        difficulty_level=parsed.difficulty_level,
-                        quality_score=parsed.quality_score,
-                        is_duplicate=False,
-                        duplicate_group_id=None,
-                        parse_status="needs_review" if parsed.quality_issues else "parsed",
-                        review_status="needs_review" if parsed.quality_issues else "pending",
-                        review_note="；".join(parsed.quality_issues) if parsed.quality_issues else None,
-                        created_by=operator_id,
-                        updated_by=operator_id,
-                    )
+                question = ExamQuestion(
+                    tenant_id=paper.tenant_id,
+                    paper_id=paper.id,
+                    subject_id=subject_id,
+                    section_id=section.id,
+                    question_no=parsed.question_no,
+                    question_uid=_make_question_uid(paper.id, section.id, question_index, parsed),
+                    question_type=parsed.question_type,
+                    stem_text=parsed.stem_text,
+                    options_json=parsed.options_json,
+                    answer_text=parsed.answer_text,
+                    analysis_text=parsed.analysis_text,
+                    source_page_from=None,
+                    source_page_to=None,
+                    score=None,
+                    difficulty_level=parsed.difficulty_level,
+                    quality_score=parsed.quality_score,
+                    is_duplicate=False,
+                    duplicate_group_id=None,
+                    parse_status="parsed",
+                    review_status="pending",
+                    review_note=None,
+                    created_by=operator_id,
+                    updated_by=operator_id,
                 )
+                normalize_question_fields(question)
+                quality_issues = _collect_quality_issues(
+                    question_type=question.question_type,
+                    stem=question.stem_text,
+                    options=question.options_json or [],
+                    answer_text=question.answer_text,
+                    analysis_text=question.analysis_text,
+                    quality_score=float(question.quality_score or parsed.quality_score),
+                )
+                if quality_issues:
+                    question.parse_status = "needs_review"
+                    question.review_status = "needs_revision"
+                    question.review_note = "；".join(quality_issues)
+                    quality_warnings.append(
+                        f"{parsed_section.title} 第{question.question_no}题：{'；'.join(quality_issues)}"
+                    )
+                section_questions.append(question)
 
             if section_questions:
                 section.start_no = running_start_no
@@ -269,28 +319,55 @@ class PaperService:
 
         quality_warnings.extend(_collect_numbering_warnings(questions))
         self.repository.create_questions(questions)
-        _emit_parse_progress(progress_callback, "tagging", 88, {"question_count": len(questions)})
+        self._sync_parse_runtime_status(paper, asset, "tagging")
         points = self.repository.list_knowledge_points(subject_id)
         tagged_count = 0
-        for question_index, question in enumerate(questions, start=1):
-            tagged_count += len(apply_rule_tags(self.session, question, points, paper.tenant_id, operator_id))
-            if question_index == len(questions) or question_index % 10 == 0:
-                _emit_parse_progress(
-                    progress_callback,
-                    "tagging",
-                    min(96, 88 + int((question_index / max(1, len(questions))) * 8)),
-                    {"tagged_questions": question_index, "question_count": len(questions)},
-                )
+        for question in questions:
+            rule_created = apply_rule_tags(self.session, question, points, paper.tenant_id, operator_id)
+            tagged_count += len(rule_created)
 
-        asset.parsed_text = parsed_text
-        asset.token_count = max(1, len(parsed_text) // 2)
+        asset.parsed_text = parsed_output
+        asset.token_count = max(1, len(parsed_output) // 2)
         asset.parse_status = "parsed"
         asset.ocr_status = "completed"
         paper.status = "parsed"
         paper.total_question_count = len(questions)
         paper.review_status = "pending"
-        _emit_parse_progress(progress_callback, "saving", 98, {"question_count": len(questions)})
         self.session.commit()
+        dataset_sample_path: str | None = None
+        dataset_warnings: list[str] = []
+        if should_auto_export_paper_dataset():
+            try:
+                sample_dir = export_paper_parser_sample(
+                    paper_id=paper.id,
+                    paper_name=paper.paper_name,
+                    source_text=split_source_text,
+                    paper_status=paper.status,
+                    paper_review_status=paper.review_status,
+                    exam_year=paper.exam_year,
+                    exam_month=paper.exam_month,
+                    exam_region=paper.exam_region,
+                    paper_type=paper.paper_type,
+                    subject_name=subject.name if subject else None,
+                    subject_code=subject.code if subject else None,
+                    category_name=category.name if category else _category_from_asset_tags(asset.tags_json if asset else None),
+                    asset_id=asset.id,
+                    asset_filename=asset.filename,
+                    asset_mime_type=asset.mime_type,
+                    asset_storage_path=asset.storage_path,
+                    asset_parse_status=asset.parse_status,
+                    asset_ocr_status=asset.ocr_status,
+                    provider=parsed_document.provider,
+                    parse_options=options.normalized_dump(),
+                    stored_section_count=len([section for section in created_sections if section.start_no is not None]),
+                    stored_question_count=len(questions),
+                    stored_needs_review_count=sum(
+                        1 for question in questions if question.parse_status == "needs_review"
+                    ),
+                )
+                dataset_sample_path = str(sample_dir)
+            except Exception as exc:
+                dataset_warnings.append(f"样本自动导入失败：{exc}")
         _emit_parse_progress(progress_callback, "completed", 100, {"question_count": len(questions)})
         return PaperParseResponse(
             paper_id=paper.id,
@@ -300,10 +377,17 @@ class PaperService:
             question_count=len(questions),
             section_count=len([section for section in created_sections if section.start_no is not None]),
             tagged_count=tagged_count,
-            preview=parsed_text[:300],
+            preview=parsed_output[:300],
             provider=parsed_document.provider,
-            warnings=[*parsed_document.warnings, *quality_warnings][:10],
+            output_format=options.output_format,
+            warnings=[
+                *parsed_document.warnings,
+                *quality_warnings,
+                *dataset_warnings,
+            ][:10],
             parse_options=options.normalized_dump(),
+            dataset_sample_path=dataset_sample_path,
+            dataset_auto_exported=bool(dataset_sample_path),
         )
 
     async def upload_paper(
@@ -479,21 +563,64 @@ class PaperService:
             }
         )
 
+    def _sync_parse_runtime_status(self, paper: ExamPaper, asset: Asset, stage: str) -> None:
+        paper.status = _paper_runtime_status(stage)
+        asset.parse_status = _asset_runtime_status(stage)
+        if stage in {"ocr", "layout_analysis", "ocr_fallback"}:
+            asset.ocr_status = "running"
 
-def _split_question_blocks(text: str) -> list[str]:
+
+def _paper_runtime_status(stage: str) -> str:
+    mapping = {
+        "prepare": "preparing",
+        "read_file": "reading_file",
+        "ocr": "ocr_running",
+        "layout_analysis": "layout_analyzing",
+        "ocr_fallback": "ocr_fallback_running",
+        "split_questions": "splitting_questions",
+        "build_sections": "building_sections",
+        "tagging": "tagging",
+        "saving": "saving",
+        "completed": "parsed",
+        "failed": "parse_failed",
+    }
+    return mapping.get(stage, "parsing")
+
+
+def _asset_runtime_status(stage: str) -> str:
+    mapping = {
+        "prepare": "preparing",
+        "read_file": "reading_file",
+        "ocr": "ocr_running",
+        "layout_analysis": "layout_analyzing",
+        "ocr_fallback": "ocr_fallback_running",
+        "split_questions": "splitting_questions",
+        "build_sections": "building_sections",
+        "tagging": "tagging",
+        "saving": "saving",
+        "completed": "parsed",
+        "failed": "failed",
+    }
+    return mapping.get(stage, "parsing")
+
+
+def _split_question_blocks(text: str) -> list[SplitQuestionBlock]:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     matches = list(QUESTION_SPLIT_PATTERN.finditer(normalized))
-    blocks: list[str] = []
+    raw_blocks: list[str] = []
     if not matches:
         chunks = [chunk.strip() for chunk in re.split(r"\n{2,}", normalized) if chunk.strip()]
-        return chunks[:80] if chunks else [normalized.strip()]
+        fallback_blocks = chunks[:80] if chunks else [normalized.strip()]
+        return [SplitQuestionBlock(raw_text=block) for block in fallback_blocks if block]
 
+    leading_text = normalized[:matches[0].start()].strip()
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
         block = normalized[match.start():end].strip()
         if block:
-            blocks.append(block)
-    return blocks[:200]
+            raw_blocks.append(block)
+    raw_blocks = _collapse_out_of_sequence_blocks(raw_blocks[:200])
+    return _expand_shared_stem_blocks(raw_blocks[:200], leading_text=leading_text)
 
 
 def _split_paper_sections(text: str) -> list[ParsedSection]:
@@ -510,7 +637,7 @@ def _split_paper_sections(text: str) -> list[ParsedSection]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
         body = normalized[start:end].strip()
         title = match.group("title").strip()
-        blocks = _split_question_blocks(body) if body else []
+        blocks = _split_section_blocks(title, body) if body else []
         if not blocks:
             continue
         sections.append(
@@ -529,11 +656,19 @@ def _split_paper_sections(text: str) -> list[ParsedSection]:
     return [ParsedSection(title="自动切题", section_type="mixed", sort_order=1, blocks=blocks)]
 
 
-def _parse_question_block(block: str, section: ParsedSection) -> ParsedQuestionBlock:
-    block = block.strip()
-    number_match = QUESTION_SPLIT_PATTERN.match(block)
-    question_no = number_match.group(1) if number_match else str(section.sort_order)
-    content = block[number_match.end():].strip() if number_match else block
+def _split_section_blocks(title: str, body: str) -> list[SplitQuestionBlock]:
+    grouped_blocks = _split_case_group_blocks(body)
+    if grouped_blocks:
+        return grouped_blocks
+    return _split_question_blocks(body)
+
+
+def _parse_question_block(block: SplitQuestionBlock, section: ParsedSection) -> ParsedQuestionBlock:
+    raw_text = block.raw_text.strip()
+    number_match = QUESTION_SPLIT_PATTERN.match(raw_text)
+    question_no = block.question_no_override or (number_match.group(1) if number_match else str(section.sort_order))
+    content = raw_text[number_match.end():].strip() if number_match else raw_text
+    content = ANSWER_ANALYSIS_HEADER_PATTERN.sub("", content).strip()
 
     answer_text = _extract_pattern(ANSWER_PATTERN, content)
     analysis_text = _extract_pattern(ANALYSIS_PATTERN, content)
@@ -543,9 +678,27 @@ def _parse_question_block(block: str, section: ParsedSection) -> ParsedQuestionB
     options = [f"{match.group(1)}. {match.group(2).strip()}" for match in OPTION_PATTERN.finditer(content_without_answer)]
     stem = OPTION_PATTERN.sub("", content_without_answer).strip()
     stem = re.sub(r"\n{3,}", "\n\n", stem)
+    if block.stem_prefix:
+        stem = f"{block.stem_prefix}\n\n{stem}".strip()
     subquestion_count = len(SUBQUESTION_PATTERN.findall(content_without_answer))
-    question_type = _detect_question_type(section.section_type, options, answer_text, content_without_answer, subquestion_count)
-    quality_score = _estimate_quality_score(stem, options, answer_text, analysis_text, subquestion_count, section.section_type)
+    contextual_subquestion_count = subquestion_count
+    if block.stem_prefix:
+        contextual_subquestion_count = max(contextual_subquestion_count, len(SUBQUESTION_PATTERN.findall(block.stem_prefix)))
+    question_type = _detect_question_type(
+        section.section_type,
+        options,
+        answer_text,
+        content_without_answer,
+        contextual_subquestion_count,
+    )
+    quality_score = _estimate_quality_score(
+        stem,
+        options,
+        answer_text,
+        analysis_text,
+        contextual_subquestion_count,
+        section.section_type,
+    )
     quality_issues = _collect_quality_issues(
         question_type=question_type,
         stem=stem,
@@ -554,20 +707,247 @@ def _parse_question_block(block: str, section: ParsedSection) -> ParsedQuestionB
         analysis_text=analysis_text,
         quality_score=quality_score,
     )
-    difficulty = _estimate_difficulty(question_type, subquestion_count)
+    difficulty = _estimate_difficulty(question_type, contextual_subquestion_count)
     return ParsedQuestionBlock(
         question_no=str(question_no),
         question_type=question_type,
-        stem_text=stem or content[:500] or f"第 {question_no} 题",
+        stem_text=stem or block.stem_prefix or content[:500] or f"第 {question_no} 题",
         options_json=options,
         answer_text=answer_text,
         analysis_text=analysis_text,
         difficulty_level=difficulty,
         quality_score=quality_score,
-        subquestion_count=subquestion_count,
+        subquestion_count=contextual_subquestion_count,
         source_section_name=section.title,
         quality_issues=quality_issues,
     )
+
+
+def _make_question_uid(
+    paper_id: int,
+    section_id: int | None,
+    question_index: int,
+    parsed: ParsedQuestionBlock,
+) -> str:
+    uid_seed = f"{paper_id}:{section_id or 0}:{question_index}:{parsed.question_no}:{parsed.stem_text[:80]}"
+    question_uid = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()[:24]
+    return f"P{paper_id}-{question_uid}"
+
+
+def _split_case_group_blocks(text: str) -> list[SplitQuestionBlock]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    matches = list(CASE_GROUP_PATTERN.finditer(normalized))
+    if not matches:
+        return []
+    if SHARED_STEM_CUE_PATTERN.search(normalized) is None:
+        return []
+
+    blocks: list[SplitQuestionBlock] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        group_body = normalized[start:end].strip()
+        if not group_body:
+            continue
+        label = match.group(1).strip()
+        group_blocks = _split_question_blocks(group_body)
+        if not group_blocks:
+            continue
+        for block in group_blocks:
+            question_no = _extract_question_no(block.raw_text)
+            if question_no:
+                block.question_no_override = f"{label}-{question_no}"
+        blocks.extend(group_blocks)
+    return blocks
+
+
+def _expand_shared_stem_blocks(raw_blocks: list[str], leading_text: str | None = None) -> list[SplitQuestionBlock]:
+    leading_blocks = _expand_leading_shared_stem_blocks(raw_blocks, leading_text=leading_text)
+    if leading_blocks is not None:
+        return leading_blocks
+
+    expanded_blocks: list[SplitQuestionBlock] = []
+    index = 0
+    while index < len(raw_blocks):
+        block = raw_blocks[index].strip()
+        if not block:
+            index += 1
+            continue
+
+        parent_match = QUESTION_SPLIT_PATTERN.match(block)
+        if parent_match is None or not _looks_like_shared_stem_block(block):
+            expanded_blocks.append(SplitQuestionBlock(raw_text=block))
+            index += 1
+            continue
+
+        parent_no = parent_match.group(1).strip()
+        shared_stem_parts = [block[parent_match.end():].strip()]
+        child_entries: list[tuple[str, str]] = []
+        cursor = index + 1
+        expected_child_no = 1
+
+        while cursor < len(raw_blocks):
+            candidate = raw_blocks[cursor].strip()
+            child_match = QUESTION_SPLIT_PATTERN.match(candidate)
+            child_number = _question_no_to_int(child_match.group(1).strip()) if child_match else None
+            if child_match and child_number == expected_child_no:
+                child_entries.append((child_match.group(1).strip(), candidate))
+                expected_child_no += 1
+                cursor += 1
+                continue
+
+            if _has_following_expected_child(raw_blocks, cursor + 1, expected_child_no):
+                if child_entries:
+                    child_no, child_text = child_entries[-1]
+                    child_entries[-1] = (child_no, f"{child_text}\n{candidate}".strip())
+                else:
+                    shared_stem_parts.append(candidate)
+                cursor += 1
+                continue
+            break
+
+        if not child_entries:
+            expanded_blocks.append(SplitQuestionBlock(raw_text=block))
+            index += 1
+            continue
+
+        shared_stem = "\n".join(part for part in shared_stem_parts if part.strip()).strip()
+        expanded_blocks.extend(
+            SplitQuestionBlock(
+                raw_text=child_text,
+                question_no_override=f"{parent_no}-{child_no}",
+                stem_prefix=shared_stem,
+            )
+            for child_no, child_text in child_entries
+        )
+        index = cursor
+
+    return expanded_blocks
+
+
+def _collapse_out_of_sequence_blocks(raw_blocks: list[str]) -> list[str]:
+    collapsed: list[str] = []
+    expected_no: int | None = None
+
+    for index, block in enumerate(raw_blocks):
+        question_no = _question_no_to_int(_extract_question_no(block) or "")
+        if not collapsed:
+            collapsed.append(block)
+            expected_no = question_no + 1 if question_no is not None else None
+            continue
+
+        if expected_no is not None and question_no == expected_no:
+            collapsed.append(block)
+            expected_no += 1
+            continue
+
+        if expected_no is not None and _has_following_expected_child(raw_blocks, index + 1, expected_no):
+            collapsed[-1] = f"{collapsed[-1]}\n{block}".strip()
+            continue
+
+        collapsed.append(block)
+        expected_no = question_no + 1 if question_no is not None else None
+
+    return collapsed
+
+
+def _expand_leading_shared_stem_blocks(
+    raw_blocks: list[str],
+    *,
+    leading_text: str | None,
+) -> list[SplitQuestionBlock] | None:
+    shared_stem = (leading_text or "").strip()
+    if not shared_stem:
+        return None
+    if not _looks_like_leading_shared_stem(shared_stem, raw_blocks):
+        if not raw_blocks:
+            return None
+        merged_first = f"{shared_stem}\n{raw_blocks[0]}".strip()
+        return [SplitQuestionBlock(raw_text=merged_first), *[SplitQuestionBlock(raw_text=block) for block in raw_blocks[1:]]]
+    return [
+        SplitQuestionBlock(
+            raw_text=block,
+            stem_prefix=shared_stem,
+        )
+        for block in raw_blocks
+    ]
+
+
+def _looks_like_shared_stem_block(block: str) -> bool:
+    number_match = QUESTION_SPLIT_PATTERN.match(block.strip())
+    if number_match is None:
+        return False
+    content = block[number_match.end():].strip()
+    if not content:
+        return False
+    if len(OPTION_PATTERN.findall(content)) >= 2:
+        return False
+    material_item_count = len(MATERIAL_ITEM_PATTERN.findall(content))
+    subquestion_count = len(SUBQUESTION_PATTERN.findall(content))
+    if max(material_item_count, subquestion_count) < 2:
+        return False
+    return SHARED_STEM_CUE_PATTERN.search(content) is not None
+
+
+def _looks_like_leading_shared_stem(shared_stem: str, raw_blocks: list[str]) -> bool:
+    if not raw_blocks:
+        return False
+    first_question_no = _question_no_to_int(_extract_question_no(raw_blocks[0]) or "")
+    if first_question_no != 1:
+        return False
+    material_item_count = len(MATERIAL_ITEM_PATTERN.findall(shared_stem))
+    subquestion_count = len(SUBQUESTION_PATTERN.findall(shared_stem))
+    if max(material_item_count, subquestion_count) >= 2:
+        return True
+    return SHARED_STEM_CUE_PATTERN.search(shared_stem) is not None
+
+
+def _has_following_expected_child(raw_blocks: list[str], start_index: int, expected_child_no: int, max_lookahead: int = 2) -> bool:
+    for offset in range(max_lookahead):
+        position = start_index + offset
+        if position >= len(raw_blocks):
+            return False
+        candidate = raw_blocks[position].strip()
+        match = QUESTION_SPLIT_PATTERN.match(candidate)
+        if match is None:
+            continue
+        number = _question_no_to_int(match.group(1).strip())
+        if number == expected_child_no:
+            return True
+    return False
+
+
+def _question_no_to_int(value: str) -> int | None:
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized.isdigit():
+        return int(normalized)
+    return _chinese_numeral_to_int(normalized)
+
+
+def _extract_question_no(block: str) -> str | None:
+    match = QUESTION_SPLIT_PATTERN.match(block.strip())
+    if match is None:
+        return None
+    return match.group(1).strip() or None
+
+
+def _chinese_numeral_to_int(value: str) -> int | None:
+    numerals = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    units = {"十": 10, "百": 100}
+    total = 0
+    current = 0
+    for char in value:
+        if char in numerals:
+            current = numerals[char]
+            continue
+        if char in units:
+            total += (current or 1) * units[char]
+            current = 0
+            continue
+        return None
+    return total + current
 
 
 def _detect_question_type(

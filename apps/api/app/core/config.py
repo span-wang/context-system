@@ -85,6 +85,10 @@ def _parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _parse_csv_list(value: str) -> list[str]:
+    return [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
+
+
 def _set_nested(raw: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
     cursor = raw
     for key in path[:-1]:
@@ -99,6 +103,7 @@ def _set_nested(raw: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
 def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
     overrides: tuple[tuple[str, tuple[str, ...], Any], ...] = (
         ("APP_ENVIRONMENT", ("app", "environment"), str),
+        ("APP_CORS_ORIGINS", ("app", "cors_origins"), _parse_csv_list),
         ("DB_URL", ("db", "url"), str),
         ("DB_ECHO", ("db", "echo"), _parse_bool),
         ("DB_POOL_SIZE", ("db", "pool_size"), int),
@@ -221,6 +226,14 @@ def get_settings() -> Settings:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
 
     settings = Settings.model_validate(_expand_env(_apply_env_overrides(raw)))
+    for env_name in ("PUBLIC_WEB_URL", "PUBLIC_WEB_ORIGIN"):
+        raw_origin = os.getenv(env_name)
+        if not raw_origin:
+            continue
+        for item in _parse_csv_list(raw_origin):
+            origin = item if "://" in item else f"https://{item}"
+            if origin not in settings.app.cors_origins:
+                settings.app.cors_origins.append(origin)
     settings.storage.root_path.mkdir(parents=True, exist_ok=True)
     if settings.db.url.startswith("sqlite:///") and settings.db.url != "sqlite:///:memory:":
         settings.db.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

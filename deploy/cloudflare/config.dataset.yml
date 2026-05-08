@@ -1,0 +1,7 @@
+tunnel: 8febdcf3-e642-43f0-ad68-06c334b469f9
+credentials-file: C:\Users\panshimao\.cloudflared\8febdcf3-e642-43f0-ad68-06c334b469f9.json
+
+ingress:
+  - hostname: testmodel.panspan.cloud
+    service: http://127.0.0.1:3000
+  - service: http_status:404

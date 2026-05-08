@@ -255,6 +255,7 @@ def seed_demo_data(session) -> None:
     chapter_foundation = Chapter(
         tenant_id=tenant.id,
         subject_id=primary_subject.id,
+        category_id=primary_category_models[0].id if primary_category_models else None,
         parent_id=None,
         name="会计基础",
         level=1,
@@ -266,6 +267,7 @@ def seed_demo_data(session) -> None:
     chapter_income = Chapter(
         tenant_id=tenant.id,
         subject_id=primary_subject.id,
+        category_id=primary_category_models[1].id if len(primary_category_models) > 1 else (primary_category_models[0].id if primary_category_models else None),
         parent_id=None,
         name="收入与合同",
         level=1,
@@ -280,7 +282,7 @@ def seed_demo_data(session) -> None:
     kp_revenue = KnowledgePoint(
         tenant_id=tenant.id,
         subject_id=primary_subject.id,
-        category_id=None,
+        category_id=chapter_income.category_id,
         chapter_id=chapter_income.id,
         parent_id=None,
         name="收入确认五步法",
@@ -296,7 +298,7 @@ def seed_demo_data(session) -> None:
     kp_control = KnowledgePoint(
         tenant_id=tenant.id,
         subject_id=primary_subject.id,
-        category_id=None,
+        category_id=chapter_income.category_id,
         chapter_id=chapter_income.id,
         parent_id=None,
         name="控制权转移判断",
@@ -312,7 +314,7 @@ def seed_demo_data(session) -> None:
     kp_inventory = KnowledgePoint(
         tenant_id=tenant.id,
         subject_id=primary_subject.id,
-        category_id=None,
+        category_id=chapter_foundation.category_id,
         chapter_id=chapter_foundation.id,
         parent_id=None,
         name="存货初始计量",

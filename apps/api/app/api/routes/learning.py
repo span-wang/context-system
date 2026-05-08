@@ -8,6 +8,7 @@ from app.schemas.auth import CurrentUserResponse
 from app.schemas.learning import (
     LearningHomeResponse,
     MasteryResponse,
+    PracticeSessionDetailResponse,
     PracticeSessionResponse,
     StartPracticeRequest,
     SubmitPracticeRequest,
@@ -36,9 +37,9 @@ def sessions(session: Session = Depends(get_session)) -> list[PracticeSessionRes
     return PracticeSessionService(session).list_sessions()
 
 
-@router.get("/sessions/{session_id}", response_model=PracticeSessionResponse)
-def session_detail(session_id: int, session: Session = Depends(get_session)) -> PracticeSessionResponse:
-    return PracticeSessionService(session).get_session(session_id)
+@router.get("/sessions/{session_id}", response_model=PracticeSessionDetailResponse)
+def session_detail(session_id: int, session: Session = Depends(get_session)) -> PracticeSessionDetailResponse:
+    return PracticeSessionService(session).get_session_detail(session_id)
 
 
 @router.post("/sessions", response_model=PracticeSessionResponse)

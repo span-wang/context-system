@@ -11,10 +11,10 @@ from fastapi import HTTPException, UploadFile
 
 from library.parse_options import DocumentParseOptions
 from library.parser import (
+    ParseProgressCallback,
     ParsedDocument,
     deserialize_parsed_document,
     parse_document,
-    parse_preview_document,
     serialize_parsed_document,
 )
 from library.token_counter import estimate_tokens
@@ -135,16 +135,13 @@ class LibraryService:
         options: DocumentParseOptions | None = None,
         *,
         preview: bool = False,
+        force_reparse: bool = False,
+        progress_callback: ParseProgressCallback | None = None,
     ) -> ParsedDocument:
         options = options or DocumentParseOptions()
-        cache_key = options.cache_key()
-        cache_prefix = file.sha256 if cache_key == "default" else f"{file.sha256}__{cache_key}"
-        if preview:
-            cache_prefix = f"{file.sha256}__preview" if cache_key == "default" else f"{file.sha256}__preview__{cache_key}"
-        text_cache_path = self.cache_root / f"{cache_prefix}.txt"
-        structured_cache_path = self.cache_root / f"{cache_prefix}.json"
+        text_cache_path, structured_cache_path = self._parse_cache_paths(file, options, preview=preview)
 
-        if structured_cache_path.exists():
+        if not force_reparse and structured_cache_path.exists():
             parsed = deserialize_parsed_document(structured_cache_path.read_text(encoding="utf-8"))
             if parsed is not None:
                 if _is_stale_parse_cache(parsed):
@@ -153,36 +150,49 @@ class LibraryService:
                 else:
                     if not text_cache_path.exists():
                         text_cache_path.write_text(parsed.text, encoding="utf-8")
-                    self._remember_parse_result(file.id, parsed, preview=preview)
+                    self._remember_parse_result(file.id, parsed, options=options, preview=preview)
+                    if progress_callback is not None:
+                        progress_callback("cache", 70, {"file_id": file.id, "cache_hit": True})
                     return parsed
 
-        if text_cache_path.exists():
+        if not force_reparse and text_cache_path.exists():
             text = text_cache_path.read_text(encoding="utf-8")
             parsed = ParsedDocument(text=text, markdown=text, provider="legacy_cache")
             structured_cache_path.write_text(serialize_parsed_document(parsed), encoding="utf-8")
-            self._remember_parse_result(file.id, parsed, preview=preview)
+            self._remember_parse_result(file.id, parsed, options=options, preview=preview)
+            if progress_callback is not None:
+                progress_callback("cache", 70, {"file_id": file.id, "cache_hit": True})
             return parsed
 
+        if progress_callback is not None:
+            progress_callback("read_file", 10, {"file_id": file.id, "filename": file.filename})
         raw = await self.storage.get(file.storage_path)
-        parser = parse_preview_document if preview else parse_document
         try:
-            parsed = await asyncio.to_thread(parser, raw, file.filename, file.mime, options)
+            parsed = await asyncio.to_thread(
+                parse_document,
+                raw,
+                file.filename,
+                file.mime,
+                options,
+                progress_callback,
+            )
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"文件解析失败：{exc}") from exc
         text_cache_path.write_text(parsed.text, encoding="utf-8")
         structured_cache_path.write_text(serialize_parsed_document(parsed), encoding="utf-8")
-        self._remember_parse_result(file.id, parsed, preview=preview)
+        self._remember_parse_result(file.id, parsed, options=options, preview=preview)
         return parsed
 
     async def to_context_source(self, file_id: str, options: DocumentParseOptions | None = None) -> ContextSource:
         file = self.get_file(file_id)
+        options = options or DocumentParseOptions()
         parsed = await self.parse_and_cache(file, options=options)
         self.db.mark_library_used(file_id)
         source_label = f"素材库:{file.source_title or file.filename}"
         if file.chapter:
             source_label += f"::{file.chapter}"
         return ContextSource(
-            text=parsed.markdown or parsed.text,
+            text=_selected_output(parsed, options),
             source_label=source_label,
             source_type=file.source_type,
             authority=file.source_authority,
@@ -216,8 +226,9 @@ class LibraryService:
         label = f"本次上传:{source_title}"
         if metadata.chapter:
             label += f"::{metadata.chapter}"
+        options = options or DocumentParseOptions()
         return ContextSource(
-            text=parsed.markdown or parsed.text,
+            text=_selected_output(parsed, options),
             source_label=label,
             source_type=metadata.source_type,
             authority=metadata.source_authority,
@@ -229,38 +240,137 @@ class LibraryService:
         file_id: str,
         max_chars: int = DEFAULT_PREVIEW_CHARS,
         options: DocumentParseOptions | None = None,
+        progress_callback: ParseProgressCallback | None = None,
     ) -> dict:
         file = self.get_file(file_id)
         options = options or DocumentParseOptions()
-        parsed = await self.parse_and_cache(file, options=options, preview=True)
-        preview_markdown = parsed.markdown or parsed.text
-        preview_text = parsed.text or preview_markdown
-        if not preview_markdown.strip():
-            placeholder = (
-                "[No text extracted. This file may be a low-quality scan, an image-only page, "
-                "or PP-StructureV3 may not be installed correctly.]"
-            )
-            preview_markdown = placeholder
-            preview_text = placeholder
+        stored_result = self.db.get_latest_library_parse_result(file.id)
+        if stored_result is not None:
+            preview_markdown = str(stored_result.get("markdown") or stored_result.get("parsed_text") or "")
+            preview_text = str(stored_result.get("parsed_text") or preview_markdown)
+            preview_content = options.select_output(text=preview_text, markdown=preview_markdown)
+            token_count = int(stored_result.get("token_count") or estimate_tokens(preview_markdown or preview_text))
+            warnings = [str(item) for item in (stored_result.get("warnings") or []) if str(item).strip()]
+            max_chars = max(1, min(max_chars, MAX_PREVIEW_CHARS))
+            if progress_callback is not None:
+                progress_callback("cache", 70, {"file_id": file.id, "cache_hit": True, "stored_result": True})
+            return {
+                "file_id": file.id,
+                "filename": file.filename,
+                "token_count": token_count,
+                "provider": str(stored_result.get("provider") or "stored_parse"),
+                "text": preview_text[:max_chars],
+                "markdown": preview_markdown[:max_chars],
+                "content": preview_content[:max_chars],
+                "output_format": options.output_format,
+                "table_count": 0,
+                "warning_count": len(warnings),
+                "warnings": warnings[:5],
+                "truncated": len(preview_content) > max_chars,
+                "parse_options": stored_result.get("parse_options") or {},
+            }
+
+        parsed = await self.parse_and_cache(
+            file,
+            options=options,
+            preview=False,
+            progress_callback=progress_callback,
+        )
+        selected_output = _selected_output(parsed, options)
+        preview_text, preview_markdown, preview_content = _preview_payload(parsed, options)
+        persisted_markdown = parsed.markdown or parsed.text
+        token_count = estimate_tokens(persisted_markdown)
         max_chars = max(1, min(max_chars, MAX_PREVIEW_CHARS))
         return {
             "file_id": file.id,
             "filename": file.filename,
-            "token_count": estimate_tokens(parsed.text),
+            "token_count": token_count,
             "provider": parsed.provider,
             "text": preview_text[:max_chars],
             "markdown": preview_markdown[:max_chars],
+            "content": preview_content[:max_chars],
+            "output_format": options.output_format,
             "table_count": len(parsed.tables),
             "warning_count": len(parsed.warnings),
             "warnings": parsed.warnings[:5],
-            "truncated": len(preview_markdown) > max_chars,
+            "truncated": len(selected_output) > max_chars,
             "parse_options": options.normalized_dump(),
         }
 
-    def _remember_parse_result(self, file_id: str, parsed: ParsedDocument, *, preview: bool) -> None:
+    async def reparse(
+        self,
+        file_id: str,
+        max_chars: int = DEFAULT_PREVIEW_CHARS,
+        options: DocumentParseOptions | None = None,
+        progress_callback: ParseProgressCallback | None = None,
+    ) -> dict:
+        file = self.get_file(file_id)
+        options = options or DocumentParseOptions()
+        parsed = await self.parse_and_cache(
+            file,
+            options=options,
+            preview=False,
+            force_reparse=True,
+            progress_callback=progress_callback,
+        )
+        selected_output = _selected_output(parsed, options)
+        preview_text, preview_markdown, preview_content = _preview_payload(parsed, options)
+        persisted_markdown = parsed.markdown or parsed.text
+        token_count = estimate_tokens(persisted_markdown)
+        result_id, sequence_number, kept = self.db.store_library_parse_result(
+            file.id,
+            provider=parsed.provider,
+            parsed_text=selected_output,
+            markdown=parsed.markdown or None,
+            parse_options=options.normalized_dump(),
+            warnings=parsed.warnings,
+            token_count=token_count,
+        )
+        max_chars = max(1, min(max_chars, MAX_PREVIEW_CHARS))
+        return {
+            "file_id": file.id,
+            "filename": file.filename,
+            "token_count": token_count,
+            "provider": parsed.provider,
+            "text": preview_text[:max_chars],
+            "markdown": preview_markdown[:max_chars],
+            "content": preview_content[:max_chars],
+            "output_format": options.output_format,
+            "table_count": len(parsed.tables),
+            "warning_count": len(parsed.warnings),
+            "warnings": parsed.warnings[:5],
+            "truncated": len(selected_output) > max_chars,
+            "parse_options": options.normalized_dump(),
+            "stored_result_id": result_id,
+            "stored_sequence_number": sequence_number,
+            "kept_results": [item.model_dump(mode="json") for item in kept],
+        }
+
+    def _remember_parse_result(
+        self,
+        file_id: str,
+        parsed: ParsedDocument,
+        *,
+        options: DocumentParseOptions,
+        preview: bool,
+    ) -> None:
         if preview:
             return
-        self.db.set_parsed_text(file_id, parsed.text, estimate_tokens(parsed.text))
+        persisted_markdown = parsed.markdown or parsed.text
+        self.db.set_parsed_text(file_id, persisted_markdown, estimate_tokens(persisted_markdown))
+
+    def _parse_cache_paths(
+        self,
+        file: LibraryFile,
+        options: DocumentParseOptions,
+        *,
+        preview: bool,
+    ) -> tuple[Path, Path]:
+        cache_key = options.cache_key()
+        cache_prefix = file.sha256 if cache_key == "default" else f"{file.sha256}__{cache_key}"
+        if preview:
+            cache_prefix = f"{file.sha256}__preview" if cache_key == "default" else f"{file.sha256}__preview__{cache_key}"
+        return self.cache_root / f"{cache_prefix}.txt", self.cache_root / f"{cache_prefix}.json"
 
     def _metadata_from_json(self, raw: str | None) -> FileMetadata:
         if not raw:
@@ -297,6 +407,24 @@ class LibraryService:
         if source_title == file.source_title:
             return file
         return file.model_copy(update={"source_title": source_title})
+
+
+def _preview_payload(parsed: ParsedDocument, options: DocumentParseOptions) -> tuple[str, str, str]:
+    preview_markdown = parsed.markdown or parsed.text
+    preview_text = parsed.text or preview_markdown
+    if not preview_markdown.strip():
+        placeholder = (
+            "[No text extracted. This file may be a low-quality scan, an image-only page, "
+            "or PP-StructureV3 may not be installed correctly.]"
+        )
+        preview_markdown = placeholder
+        preview_text = placeholder
+    preview_content = options.select_output(text=preview_text, markdown=preview_markdown)
+    return preview_text, preview_markdown, preview_content
+
+
+def _selected_output(parsed: ParsedDocument, options: DocumentParseOptions) -> str:
+    return options.select_output(text=parsed.text, markdown=parsed.markdown)
 
 
 def _is_stale_parse_cache(parsed: ParsedDocument) -> bool:

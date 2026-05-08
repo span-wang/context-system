@@ -6,6 +6,14 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_session, require_roles
 from app.schemas.auth import CurrentUserResponse
 from app.schemas.questions import (
+    QuestionAiCompleteRequest,
+    QuestionAiCompleteResponse,
+    QuestionAiKnowledgeReviewRequest,
+    QuestionAiKnowledgeReviewResponse,
+    QuestionAiProcessRequest,
+    QuestionAiProcessResponse,
+    QuestionAiReviewRequest,
+    QuestionAiReviewResponse,
     QuestionBatchReviewRequest,
     QuestionBatchReviewResponse,
     QuestionDetailResponse,
@@ -27,9 +35,19 @@ def list_questions(
     paper_id: int | None = Query(default=None),
     review_status: str | None = Query(default=None),
     question_type: str | None = Query(default=None),
+    subject_id: int | None = Query(default=None),
+    category_id: int | None = Query(default=None),
+    year: int | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> list[QuestionSummary]:
-    return QuestionExtractionService(session).list_questions(paper_id, review_status=review_status, question_type=question_type)
+    return QuestionExtractionService(session).list_questions(
+        paper_id,
+        review_status=review_status,
+        question_type=question_type,
+        subject_id=subject_id,
+        category_id=category_id,
+        year=year,
+    )
 
 
 @router.post("/batch-review", response_model=QuestionBatchReviewResponse)
@@ -46,6 +64,85 @@ def batch_review_questions(
         target_type="question",
         target_id=",".join(str(item) for item in result.question_ids),
         payload={"review_status": result.review_status, "updated_count": result.updated_count, "review_note": payload.review_note},
+    )
+    return result
+
+
+@router.post("/ai-complete", response_model=QuestionAiCompleteResponse)
+def ai_complete_questions(
+    payload: QuestionAiCompleteRequest,
+    session: Session = Depends(get_session),
+    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "reviewer")),
+) -> QuestionAiCompleteResponse:
+    result = QuestionExtractionService(session).ai_complete_questions(payload, reviewer_id=current_user.id)
+    AuditService(session).log(
+        current_user,
+        module="questions",
+        action="ai_complete",
+        target_type="question",
+        target_id=",".join(str(item) for item in result.question_ids),
+        payload={
+            "requested_count": result.requested_count,
+            "updated_count": result.updated_count,
+            "unchanged_count": result.unchanged_count,
+            "failed_count": result.failed_count,
+            "failed_question_ids": result.failed_question_ids,
+        },
+    )
+    return result
+
+
+@router.post("/ai-review", response_model=QuestionAiReviewResponse)
+def ai_review_questions(
+    payload: QuestionAiReviewRequest,
+    session: Session = Depends(get_session),
+    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "reviewer")),
+) -> QuestionAiReviewResponse:
+    result = QuestionExtractionService(session).ai_review_questions(payload, reviewer_id=current_user.id)
+    AuditService(session).log(
+        current_user,
+        module="questions",
+        action="ai_review",
+        target_type="question",
+        target_id=",".join(str(item) for item in result.question_ids),
+        payload={
+            "requested_count": result.requested_count,
+            "updated_count": result.updated_count,
+            "approved_count": result.approved_count,
+            "needs_revision_count": result.needs_revision_count,
+            "rejected_count": result.rejected_count,
+            "failed_count": result.failed_count,
+            "failed_question_ids": result.failed_question_ids,
+        },
+    )
+    return result
+
+
+@router.post("/ai-process", response_model=QuestionAiProcessResponse)
+def ai_process_questions(
+    payload: QuestionAiProcessRequest,
+    session: Session = Depends(get_session),
+    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "reviewer")),
+) -> QuestionAiProcessResponse:
+    result = QuestionExtractionService(session).ai_process_questions(payload, reviewer_id=current_user.id)
+    AuditService(session).log(
+        current_user,
+        module="questions",
+        action="ai_process",
+        target_type="question",
+        target_id=",".join(str(item) for item in result.question_ids),
+        payload={
+            "requested_count": result.requested_count,
+            "updated_count": result.updated_count,
+            "completed_count": result.completed_count,
+            "approved_count": result.approved_count,
+            "needs_revision_count": result.needs_revision_count,
+            "rejected_count": result.rejected_count,
+            "tagged_question_count": result.tagged_question_count,
+            "created_link_count": result.created_link_count,
+            "failed_count": result.failed_count,
+            "failed_question_ids": result.failed_question_ids,
+        },
     )
     return result
 
@@ -93,6 +190,31 @@ def review_question_knowledge_links(
             "review_status": result.review_status,
             "primary_link_id": result.primary_link_id,
             "updated_count": result.updated_count,
+        },
+    )
+    return result
+
+
+@router.post("/{question_id}/knowledge-links/ai-review", response_model=QuestionAiKnowledgeReviewResponse)
+def ai_review_question_knowledge_links(
+    question_id: int,
+    payload: QuestionAiKnowledgeReviewRequest,
+    session: Session = Depends(get_session),
+    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "reviewer")),
+) -> QuestionAiKnowledgeReviewResponse:
+    result = QuestionExtractionService(session).ai_review_knowledge_links(question_id, payload, reviewer_id=current_user.id)
+    AuditService(session).log(
+        current_user,
+        module="questions",
+        action="ai_review_knowledge_links",
+        target_type="question",
+        target_id=question_id,
+        payload={
+            "link_ids": result.link_ids,
+            "updated_count": result.updated_count,
+            "approved_count": result.approved_count,
+            "rejected_count": result.rejected_count,
+            "primary_link_id": result.primary_link_id,
         },
     )
     return result

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Callable
 
 from fastapi import Request, Response
@@ -12,29 +13,35 @@ from app.db.session import SessionLocal
 from app.models import AuditLog
 
 
+logger = logging.getLogger(__name__)
+
+
 class FailedRequestAuditMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         response = await call_next(request)
         if not _should_log(request, response):
             return response
 
-        with SessionLocal() as session:
-            session.add(
-                AuditLog(
-                    tenant_id=1,
-                    user_id=_resolve_user_id(request),
-                    module="http",
-                    action="failed_request",
-                    target_type=request.method,
-                    target_id=request.url.path,
-                    request_id=request.headers.get("x-request-id"),
-                    payload_json={
-                        "status_code": response.status_code,
-                        "query": str(request.url.query)[:500],
-                    },
+        try:
+            with SessionLocal() as session:
+                session.add(
+                    AuditLog(
+                        tenant_id=1,
+                        user_id=_resolve_user_id(request),
+                        module="http",
+                        action="failed_request",
+                        target_type=request.method,
+                        target_id=request.url.path,
+                        request_id=request.headers.get("x-request-id"),
+                        payload_json={
+                            "status_code": response.status_code,
+                            "query": str(request.url.query)[:500],
+                        },
+                    )
                 )
-            )
-            session.commit()
+                session.commit()
+        except Exception:
+            logger.exception("Failed to audit failed request: %s %s", request.method, request.url.path)
         return response
 
 

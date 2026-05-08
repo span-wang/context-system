@@ -12,6 +12,7 @@ LEGACY_TABLE_NAMES = {
     "background_tasks",
     "generation_jobs",
     "library_files",
+    "library_parse_results",
     "workflow_events",
     "workflow_topics",
 }
@@ -41,6 +42,21 @@ class LegacyLibraryFile(Base):
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class LegacyLibraryParseResult(Base):
+    __tablename__ = "library_parse_results"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    file_id: Mapped[str] = mapped_column(String(64), index=True)
+    sequence_number: Mapped[int] = mapped_column(Integer, index=True)
+    provider: Mapped[str] = mapped_column(String(128))
+    token_count: Mapped[int] = mapped_column(Integer)
+    parsed_text: Mapped[str] = mapped_column(Text)
+    markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parse_options: Mapped[str] = mapped_column(Text)
+    warnings: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class LegacyGenerationJob(Base):

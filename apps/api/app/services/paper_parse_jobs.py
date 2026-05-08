@@ -4,14 +4,20 @@ import threading
 from datetime import datetime
 
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.models import AnalysisJob
+from app.services.analysis_jobs import update_job_record
 from app.services.papers import PaperService
 from app.services.system import SystemService
 from library.parse_options import DocumentParseOptions
+
+
+class ParseJobAbortedError(RuntimeError):
+    pass
 
 
 def start_paper_parse_job(session: Session, paper_id: int, options: DocumentParseOptions) -> AnalysisJob:
@@ -19,6 +25,9 @@ def start_paper_parse_job(session: Session, paper_id: int, options: DocumentPars
     paper = PaperService(session).repository.get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="试卷不存在")
+    active_job = _find_active_paper_parse_job(session, paper_id)
+    if active_job is not None:
+        return active_job
 
     job = AnalysisJob(
         tenant_id=tenant_id,
@@ -54,8 +63,9 @@ def start_paper_parse_job(session: Session, paper_id: int, options: DocumentPars
 def _run_paper_parse_job(job_id: int, paper_id: int, options_dump: dict[str, object]) -> None:
     with SessionLocal() as session:
         options = DocumentParseOptions(**options_dump)
-        _update_job(
-            session,
+        if _job_should_stop(job_id, paper_id):
+            return
+        update_job_record(
             job_id,
             status="running",
             progress=3,
@@ -65,8 +75,7 @@ def _run_paper_parse_job(job_id: int, paper_id: int, options_dump: dict[str, obj
         )
         try:
             capability = SystemService().get_ocr_capability()
-            _update_job(
-                session,
+            update_job_record(
                 job_id,
                 status="running",
                 progress=5,
@@ -81,15 +90,25 @@ def _run_paper_parse_job(job_id: int, paper_id: int, options_dump: dict[str, obj
             )
 
             def progress_callback(stage: str, progress: int, detail: dict[str, object] | None) -> None:
-                _update_job(session, job_id, status="running", progress=progress, stage=stage, detail=detail)
+                if _job_should_stop(job_id, paper_id):
+                    raise ParseJobAbortedError("试卷已删除，解析任务已终止")
+                update_job_record(
+                    job_id,
+                    status="running",
+                    progress=progress,
+                    stage=stage,
+                    detail=detail,
+                    best_effort=True,
+                )
 
             result = PaperService(session).parse_paper(
                 paper_id,
                 options=options,
                 progress_callback=progress_callback,
             )
-            _update_job(
-                session,
+            if _job_should_stop(job_id, paper_id):
+                raise ParseJobAbortedError("试卷已删除，解析任务已终止")
+            update_job_record(
                 job_id,
                 status="completed",
                 progress=100,
@@ -105,10 +124,13 @@ def _run_paper_parse_job(job_id: int, paper_id: int, options_dump: dict[str, obj
                 result_summary=result.model_dump(mode="json"),
                 finished_at=datetime.utcnow(),
             )
+        except ParseJobAbortedError:
+            session.rollback()
         except Exception as exc:
             session.rollback()
-            _update_job(
-                session,
+            if _job_should_stop(job_id, paper_id):
+                return
+            update_job_record(
                 job_id,
                 status="failed",
                 progress=100,
@@ -118,44 +140,24 @@ def _run_paper_parse_job(job_id: int, paper_id: int, options_dump: dict[str, obj
                 finished_at=datetime.utcnow(),
             )
 
-
-def _update_job(
-    session: Session,
-    job_id: int,
-    *,
-    status: str,
-    progress: int,
-    stage: str,
-    detail: dict[str, object] | None = None,
-    result_summary: dict[str, object] | None = None,
-    error_message: str | None = None,
-    started_at: datetime | None = None,
-    finished_at: datetime | None = None,
-) -> None:
-    job = session.get(AnalysisJob, job_id)
-    if job is None:
-        return
-    scope = dict(job.scope_config_json or {})
-    scope["stage"] = stage
-    if detail:
-        scope["detail"] = detail
-    job.scope_config_json = scope
-    job.status = status
-    job.progress = max(0, min(100, progress))
-    if result_summary is not None:
-        job.result_summary_json = result_summary
-    if error_message is not None:
-        job.error_message = error_message[:255]
-    if started_at is not None:
-        job.started_at = started_at
-    if finished_at is not None:
-        job.finished_at = finished_at
-    session.commit()
-
-
 def _default_tenant_id(session: Session) -> int:
     settings = get_settings()
     tenant = PaperService(session).repository.get_default_tenant(settings.app.default_tenant_code)
     if tenant is None:
         raise HTTPException(status_code=500, detail="默认租户尚未初始化")
     return tenant.id
+
+
+def _find_active_paper_parse_job(session: Session, paper_id: int) -> AnalysisJob | None:
+    return PaperService(session).repository.find_active_job(paper_id, "paper_parse")
+
+
+def _job_should_stop(job_id: int, paper_id: int) -> bool:
+    with SessionLocal() as session:
+        job = session.get(AnalysisJob, job_id)
+        if job is None:
+            return True
+        if job.status not in {"pending", "running"}:
+            return True
+        paper = PaperService(session).repository.get_paper(paper_id)
+        return paper is None

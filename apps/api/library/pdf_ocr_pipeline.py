@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import io
+import hashlib
 import json
 import math
 import os
@@ -13,6 +14,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from settings import PROJECT_ROOT
+
 
 NOISE_TEXT_PATTERN = re.compile(r"\S+")
 WATERMARK_ALPHA_THRESHOLD = 245
@@ -22,15 +25,20 @@ DEFAULT_PADDLE_OCR_DETECTION_MODEL = "PP-OCRv5_server_det"
 DEFAULT_PADDLE_OCR_RECOGNITION_MODEL = "PP-OCRv5_server_rec"
 PADDLE_OCR_LOCK = RLock()
 DEFAULT_OCR_ENGINE = "paddle"
+DEFAULT_PDF_PARSE_PAGE_BATCH_SIZE = 4
 OCR_ENGINE_ENV = "PDF_OCR_ENGINE"
+PDF_PARSE_PAGE_BATCH_SIZE_ENV = "PDF_PARSE_PAGE_CHUNK_SIZE"
+PDF_OCR_CHECKPOINT_DIR_ENV = "PDF_OCR_CHECKPOINT_DIR"
 PADDLE_OCR_VERSION_ENV = "PDF_OCR_VERSION"
 PADDLE_OCR_DETECTION_MODEL_ENV = "PDF_OCR_DETECTION_MODEL"
 PADDLE_OCR_RECOGNITION_MODEL_ENV = "PDF_OCR_RECOGNITION_MODEL"
+PADDLE_OCR_DETECTION_MODEL_DIR_ENV = "PDF_OCR_DETECTION_MODEL_DIR"
+PADDLE_OCR_RECOGNITION_MODEL_DIR_ENV = "PDF_OCR_RECOGNITION_MODEL_DIR"
 PADDLE_OCR_TEXTLINE_ORIENTATION_ENV = "PDF_OCR_USE_TEXTLINE_ORIENTATION"
 PADDLE_OCR_DOC_ORIENTATION_ENV = "PDF_OCR_USE_DOC_ORIENTATION"
 PADDLE_OCR_DOC_UNWARPING_ENV = "PDF_OCR_USE_DOC_UNWARPING"
 PADDLE_OCR_DEVICE_ENV = "PDF_OCR_DEVICE"
-OCRProgressCallback = Callable[[int, int], None]
+OCRProgressCallback = Callable[[int, int, dict[str, object] | None], None]
 
 
 @dataclass
@@ -47,6 +55,7 @@ class OCRPipelineOptions:
     watermark_brightness_threshold: int = WATERMARK_ALPHA_THRESHOLD
     enable_formula_recognition: bool = False
     formula_confidence_threshold: float = 0.5
+    page_chunk_size: int | None = None
 
 
 @dataclass
@@ -123,7 +132,7 @@ def _run_pdf_ocr_pipeline(
             return direct
 
     try:
-        pages, total_page_count = _render_pdf_pages(pdf_bytes, options.render_dpi, options.max_pages)
+        total_page_count = _get_pdf_page_count(pdf_bytes)
     except Exception as exc:
         return OCRDocumentResult(
             filename=filename,
@@ -135,7 +144,8 @@ def _run_pdf_ocr_pipeline(
             metadata={"filename": filename},
         )
 
-    if not pages:
+    target_page_count = min(total_page_count, options.max_pages) if options.max_pages is not None else total_page_count
+    if target_page_count <= 0:
         return OCRDocumentResult(
             filename=filename,
             provider="pdf_ocr_pipeline",
@@ -144,6 +154,71 @@ def _run_pdf_ocr_pipeline(
             markdown="",
             warnings=["PDF contains no renderable pages."],
             metadata={"filename": filename},
+        )
+
+    document_warnings: list[str] = []
+    page_batch_size = _get_pdf_page_batch_size(options)
+    checkpoint_dir = _get_pdf_ocr_checkpoint_dir(
+        pdf_bytes,
+        options,
+        _get_pdf_ocr_checkpoint_root(),
+    )
+    cached_pages_by_number = {
+        page_number: cached_page
+        for page_number in range(1, target_page_count + 1)
+        if (cached_page := _load_pdf_ocr_checkpoint_page(checkpoint_dir, page_number)) is not None
+    }
+    total_chunks = _count_pdf_chunks(target_page_count, page_batch_size)
+    resumed_pages = len(cached_pages_by_number)
+    resumed_chunks = _count_completed_chunks(cached_pages_by_number.keys(), page_batch_size)
+    resume_start_page = _first_missing_page(cached_pages_by_number, target_page_count)
+    if options.max_pages is not None and total_page_count > target_page_count:
+        document_warnings.append(f"OCR limited to first {target_page_count} of {total_page_count} pages.")
+
+    if len(cached_pages_by_number) == target_page_count:
+        page_results = [cached_pages_by_number[page_number] for page_number in range(1, target_page_count + 1)]
+        document_warnings.append(f"OCR resumed from {len(cached_pages_by_number)} cached pages.")
+        if progress_callback is not None:
+            progress_callback(
+                target_page_count,
+                target_page_count,
+                {
+                    "done_pages": target_page_count,
+                    "total_pages": target_page_count,
+                    "page_batch_size": page_batch_size,
+                    "chunk_count": total_chunks,
+                    "completed_chunk_count": total_chunks,
+                    "resumed_pages": resumed_pages,
+                    "resumed_chunk_count": resumed_chunks,
+                    "resume_start_page": resume_start_page,
+                },
+            )
+        if options.remove_repeated_lines:
+            _remove_repeated_noise(page_results, options.repeated_line_min_pages)
+        full_text = "\n\n".join(page.text for page in page_results if page.text.strip())
+        full_markdown = "\n\n".join(page.markdown for page in page_results if page.markdown.strip())
+        return OCRDocumentResult(
+            filename=filename,
+            provider="pdf_ocr_pipeline/checkpoint",
+            used_ocr=True,
+            text=full_text,
+            markdown=full_markdown or full_text,
+            pages=page_results,
+            warnings=document_warnings,
+            metadata={
+                "filename": filename,
+                "page_count": len(page_results),
+                "total_page_count": total_page_count,
+                "target_page_count": target_page_count,
+                "page_batch_size": page_batch_size,
+                "checkpoint_dir": str(checkpoint_dir),
+                "chunk_count": total_chunks,
+                "completed_chunk_count": total_chunks,
+                "resumed_pages": resumed_pages,
+                "resumed_chunk_count": resumed_chunks,
+                "resume_start_page": resume_start_page,
+                "options": asdict(options),
+            },
         )
 
     ocr_engine, ocr_engine_name, engine_warning = _get_ocr_engine()
@@ -161,26 +236,105 @@ def _run_pdf_ocr_pipeline(
     formula_engine, formula_warning = _get_formula_engine(options.enable_formula_recognition)
 
     page_results: list[OCRPageResult] = []
-    document_warnings: list[str] = []
-    if options.max_pages is not None and total_page_count > len(pages):
-        document_warnings.append(f"OCR limited to first {len(pages)} of {total_page_count} pages.")
+    if cached_pages_by_number:
+        document_warnings.append(f"OCR resumed from {len(cached_pages_by_number)} cached pages.")
     if engine_warning:
         document_warnings.append(engine_warning)
     if formula_warning:
         document_warnings.append(formula_warning)
 
-    for page_number, page in enumerate(pages, start=1):
-        page_result = _ocr_single_page(
-            page=page,
-            page_number=page_number,
+    pending_start_page: int | None = None
+    for page_number in range(1, target_page_count + 1):
+        cached_page = cached_pages_by_number.get(page_number)
+        if cached_page is not None:
+            if pending_start_page is not None:
+                _process_pdf_ocr_page_range(
+                    pdf_bytes,
+                    options,
+                    ocr_engine=ocr_engine,
+                    ocr_engine_name=ocr_engine_name,
+                    formula_engine=formula_engine,
+                    page_results=page_results,
+                    document_warnings=document_warnings,
+                    progress_callback=progress_callback,
+                    target_page_count=target_page_count,
+                    page_batch_size=page_batch_size,
+                    checkpoint_dir=checkpoint_dir,
+                    total_chunks=total_chunks,
+                    resumed_pages=resumed_pages,
+                    resumed_chunks=resumed_chunks,
+                    resume_start_page=resume_start_page,
+                    start_page=pending_start_page,
+                    end_page=page_number - 1,
+                )
+                pending_start_page = None
+            page_results.append(cached_page)
+            if progress_callback is not None:
+                progress_callback(
+                    page_number,
+                    target_page_count,
+                    {
+                        "done_pages": len(page_results),
+                        "total_pages": target_page_count,
+                        "page_batch_size": page_batch_size,
+                        "chunk_count": total_chunks,
+                        "completed_chunk_count": _count_fully_completed_chunks(
+                            len(page_results),
+                            target_page_count,
+                            page_batch_size,
+                        ),
+                        "resumed_pages": resumed_pages,
+                        "resumed_chunk_count": resumed_chunks,
+                        "resume_start_page": resume_start_page,
+                    },
+                )
+            continue
+
+        if pending_start_page is None:
+            pending_start_page = page_number
+
+    if pending_start_page is not None:
+        _process_pdf_ocr_page_range(
+            pdf_bytes,
+            options,
             ocr_engine=ocr_engine,
             ocr_engine_name=ocr_engine_name,
             formula_engine=formula_engine,
-            options=options,
+            page_results=page_results,
+            document_warnings=document_warnings,
+            progress_callback=progress_callback,
+            target_page_count=target_page_count,
+            page_batch_size=page_batch_size,
+            checkpoint_dir=checkpoint_dir,
+            total_chunks=total_chunks,
+            resumed_pages=resumed_pages,
+            resumed_chunks=resumed_chunks,
+            resume_start_page=resume_start_page,
+            start_page=pending_start_page,
+            end_page=target_page_count,
         )
-        page_results.append(page_result)
-        if progress_callback is not None:
-            progress_callback(page_number, len(pages))
+
+    page_results.sort(key=lambda page: page.page_number)
+
+    if not page_results:
+        return OCRDocumentResult(
+            filename=filename,
+            provider="pdf_ocr_pipeline",
+            used_ocr=True,
+            text="",
+            markdown="",
+            warnings=document_warnings or ["PDF OCR produced no page results."],
+            metadata={
+                "filename": filename,
+                "page_count": 0,
+                "total_page_count": total_page_count,
+                "target_page_count": target_page_count,
+                "page_batch_size": page_batch_size,
+                "chunk_count": total_chunks,
+                "completed_chunk_count": 0,
+                "options": asdict(options),
+            },
+        )
 
     if options.remove_repeated_lines:
         _remove_repeated_noise(page_results, options.repeated_line_min_pages)
@@ -199,6 +353,14 @@ def _run_pdf_ocr_pipeline(
             "filename": filename,
             "page_count": len(page_results),
             "total_page_count": total_page_count,
+            "target_page_count": target_page_count,
+            "page_batch_size": page_batch_size,
+            "checkpoint_dir": str(checkpoint_dir),
+            "chunk_count": total_chunks,
+            "completed_chunk_count": total_chunks,
+            "resumed_pages": resumed_pages,
+            "resumed_chunk_count": resumed_chunks,
+            "resume_start_page": resume_start_page,
             "options": asdict(options),
             "ocr_settings": _get_paddle_ocr_settings() if ocr_engine_name == "paddleocr" else {},
         },
@@ -260,18 +422,21 @@ def _extract_pdf_text(pdf_bytes: bytes, filename: str) -> OCRDocumentResult | No
 
     pages: list[OCRPageResult] = []
     parts: list[str] = []
-    for page_number, page in enumerate(document, start=1):
-        text = page.get_text("text").strip()
-        parts.append(text)
-        pages.append(
-            OCRPageResult(
-                page_number=page_number,
-                width=float(page.rect.width),
-                height=float(page.rect.height),
-                text=text,
-                markdown=text,
+    try:
+        for page_number, page in enumerate(document, start=1):
+            text = page.get_text("text").strip()
+            parts.append(text)
+            pages.append(
+                OCRPageResult(
+                    page_number=page_number,
+                    width=float(page.rect.width),
+                    height=float(page.rect.height),
+                    text=text,
+                    markdown=text,
+                )
             )
-        )
+    finally:
+        document.close()
 
     merged = "\n\n".join(part for part in parts if part)
     return OCRDocumentResult(
@@ -289,7 +454,32 @@ def _has_meaningful_text(text: str) -> bool:
     return len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", text or "")) >= 24
 
 
+def _get_pdf_page_count(pdf_bytes: bytes) -> int:
+    try:
+        import pymupdf
+    except Exception:
+        import fitz as pymupdf
+
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        return int(doc.page_count)
+    finally:
+        doc.close()
+
+
 def _render_pdf_pages(pdf_bytes: bytes, dpi: int, max_pages: int | None = None) -> tuple[list[dict[str, Any]], int]:
+    total_page_count = _get_pdf_page_count(pdf_bytes)
+    target_page_count = min(total_page_count, max_pages) if max_pages is not None else total_page_count
+    pages = _render_pdf_page_range(pdf_bytes, dpi, 0, target_page_count)
+    return pages, total_page_count
+
+
+def _render_pdf_page_range(
+    pdf_bytes: bytes,
+    dpi: int,
+    start_page_index: int,
+    end_page_index: int,
+) -> list[dict[str, Any]]:
     try:
         import pymupdf
     except Exception:
@@ -297,22 +487,281 @@ def _render_pdf_pages(pdf_bytes: bytes, dpi: int, max_pages: int | None = None) 
 
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     pages: list[dict[str, Any]] = []
-    scale = dpi / 72.0
-    matrix = pymupdf.Matrix(scale, scale)
-    total_page_count = doc.page_count
-    for page_index, page in enumerate(doc):
-        if max_pages is not None and page_index >= max_pages:
-            break
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        image_bytes = pix.tobytes("png")
-        pages.append(
-            {
-                "width": float(page.rect.width),
-                "height": float(page.rect.height),
-                "image_bytes": image_bytes,
-            }
+    try:
+        scale = dpi / 72.0
+        matrix = pymupdf.Matrix(scale, scale)
+        safe_start = max(0, start_page_index)
+        safe_end = min(max(safe_start, end_page_index), doc.page_count)
+        for page_index in range(safe_start, safe_end):
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            image_bytes = pix.tobytes("png")
+            pages.append(
+                {
+                    "page_number": page_index + 1,
+                    "width": float(page.rect.width),
+                    "height": float(page.rect.height),
+                    "image_bytes": image_bytes,
+                }
+            )
+    finally:
+        doc.close()
+    return pages
+
+
+def _render_pdf_page_range_resilient(
+    pdf_bytes: bytes,
+    dpi: int,
+    start_page_index: int,
+    end_page_index: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    try:
+        return _render_pdf_page_range(pdf_bytes, dpi, start_page_index, end_page_index), []
+    except Exception as exc:
+        if end_page_index - start_page_index <= 1:
+            return [], [f"Unable to render PDF page {start_page_index + 1}: {exc}"]
+
+        mid_page_index = start_page_index + max(1, (end_page_index - start_page_index) // 2)
+        left_pages, left_warnings = _render_pdf_page_range_resilient(
+            pdf_bytes,
+            dpi,
+            start_page_index,
+            mid_page_index,
         )
-    return pages, total_page_count
+        right_pages, right_warnings = _render_pdf_page_range_resilient(
+            pdf_bytes,
+            dpi,
+            mid_page_index,
+            end_page_index,
+        )
+        warning = (
+            f"PDF render batch pages {start_page_index + 1}-{end_page_index} failed; "
+            f"retried with smaller page chunks: {exc}"
+        )
+        return [*left_pages, *right_pages], [warning, *left_warnings, *right_warnings]
+
+
+def _get_pdf_page_batch_size(options: OCRPipelineOptions) -> int:
+    if options.page_chunk_size is not None:
+        return max(1, min(50, int(options.page_chunk_size)))
+    raw_value = os.getenv(PDF_PARSE_PAGE_BATCH_SIZE_ENV)
+    if raw_value:
+        try:
+            return max(1, min(50, int(raw_value)))
+        except ValueError:
+            return DEFAULT_PDF_PARSE_PAGE_BATCH_SIZE
+    if options.enable_formula_recognition or options.render_dpi >= 260:
+        return 2
+    if options.render_dpi <= 170:
+        return 8
+    return DEFAULT_PDF_PARSE_PAGE_BATCH_SIZE
+
+
+def _process_pdf_ocr_page_range(
+    pdf_bytes: bytes,
+    options: OCRPipelineOptions,
+    *,
+    ocr_engine: Any,
+    ocr_engine_name: str,
+    formula_engine: Any,
+    page_results: list[OCRPageResult],
+    document_warnings: list[str],
+    progress_callback: OCRProgressCallback | None,
+    target_page_count: int,
+    page_batch_size: int,
+    checkpoint_dir: Path,
+    total_chunks: int,
+    resumed_pages: int,
+    resumed_chunks: int,
+    resume_start_page: int | None,
+    start_page: int,
+    end_page: int,
+) -> None:
+    for batch_start in range(start_page - 1, end_page, page_batch_size):
+        batch_end = min(batch_start + page_batch_size, end_page)
+        pages, render_warnings = _render_pdf_page_range_resilient(
+            pdf_bytes,
+            options.render_dpi,
+            batch_start,
+            batch_end,
+        )
+        document_warnings.extend(render_warnings)
+
+        for page in pages:
+            page_number = int(page.get("page_number") or 0)
+            page_result = _ocr_single_page(
+                page=page,
+                page_number=page_number,
+                ocr_engine=ocr_engine,
+                ocr_engine_name=ocr_engine_name,
+                formula_engine=formula_engine,
+                options=options,
+            )
+            page_results.append(page_result)
+            _save_pdf_ocr_checkpoint_page(checkpoint_dir, page_result)
+            if progress_callback is not None:
+                progress_callback(
+                    page_number,
+                    target_page_count,
+                    {
+                        "done_pages": len(page_results),
+                        "total_pages": target_page_count,
+                        "page_batch_size": page_batch_size,
+                        "chunk_count": total_chunks,
+                        "completed_chunk_count": _count_fully_completed_chunks(
+                            len(page_results),
+                            target_page_count,
+                            page_batch_size,
+                        ),
+                        "current_chunk_index": (batch_start // page_batch_size) + 1,
+                        "current_chunk_page_from": batch_start + 1,
+                        "current_chunk_page_to": batch_end,
+                        "resumed_pages": resumed_pages,
+                        "resumed_chunk_count": resumed_chunks,
+                        "resume_start_page": resume_start_page,
+                    },
+                )
+
+        release_paddle_ocr_resources(clear_cached_engines=False, force_clear_cache=True)
+
+
+def _get_pdf_ocr_checkpoint_root() -> Path:
+    raw = os.getenv(PDF_OCR_CHECKPOINT_DIR_ENV)
+    if raw and raw.strip():
+        root = Path(raw.strip())
+    else:
+        try:
+            from settings import get_settings
+
+            root = get_settings().storage.root_path / "cache" / "pdf_ocr_checkpoints"
+        except Exception:
+            root = PROJECT_ROOT / "data" / "cache" / "pdf_ocr_checkpoints"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _get_pdf_ocr_checkpoint_dir(
+    pdf_bytes: bytes,
+    options: OCRPipelineOptions,
+    root: Path,
+) -> Path:
+    options_payload = {
+        key: value
+        for key, value in asdict(options).items()
+        if key not in {"max_pages", "page_chunk_size"}
+    }
+    payload = json.dumps(
+        {
+            "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+            "options": options_payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    checkpoint_dir = root / digest[:2] / digest
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    return checkpoint_dir
+
+
+def _load_pdf_ocr_checkpoint_page(checkpoint_dir: Path, page_number: int) -> OCRPageResult | None:
+    path = checkpoint_dir / f"page_{page_number:05d}.json"
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return _ocr_page_result_from_dict(raw)
+
+
+def _save_pdf_ocr_checkpoint_page(checkpoint_dir: Path, page_result: OCRPageResult) -> None:
+    if not _should_persist_pdf_ocr_page(page_result):
+        return
+    path = checkpoint_dir / f"page_{page_result.page_number:05d}.json"
+    tmp_path = path.with_suffix(".json.tmp")
+    payload = json.dumps(_ocr_page_result_to_dict(page_result), ensure_ascii=False, indent=2)
+    tmp_path.write_text(payload, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _should_persist_pdf_ocr_page(page_result: OCRPageResult) -> bool:
+    transient_prefixes = (
+        "OCR prediction failed:",
+        "PIL is not installed",
+        "numpy is unavailable",
+    )
+    return not any((warning or "").startswith(transient_prefixes) for warning in page_result.warnings)
+
+
+def _ocr_page_result_to_dict(page_result: OCRPageResult) -> dict[str, Any]:
+    payload = asdict(page_result)
+    return payload
+
+
+def _ocr_page_result_from_dict(raw: dict[str, Any]) -> OCRPageResult:
+    blocks: list[OCRTextBlock] = []
+    for item in raw.get("blocks") or []:
+        if not isinstance(item, dict):
+            continue
+        blocks.append(
+            OCRTextBlock(
+                page_number=int(item.get("page_number") or raw.get("page_number") or 0),
+                block_id=str(item.get("block_id") or ""),
+                text=str(item.get("text") or ""),
+                bbox=[float(value) for value in item.get("bbox") or [] if isinstance(value, (int, float))],
+                score=_safe_float(item.get("score")),
+                block_type=str(item.get("block_type") or "text"),
+                latex=item.get("latex") if item.get("latex") is None else str(item.get("latex") or ""),
+                removed_as_noise=bool(item.get("removed_as_noise")),
+            )
+        )
+    return OCRPageResult(
+        page_number=int(raw.get("page_number") or 0),
+        width=float(raw.get("width") or 0.0),
+        height=float(raw.get("height") or 0.0),
+        text=str(raw.get("text") or ""),
+        markdown=str(raw.get("markdown") or ""),
+        blocks=blocks,
+        headers_removed=[str(item) for item in raw.get("headers_removed") or [] if str(item).strip()],
+        footers_removed=[str(item) for item in raw.get("footers_removed") or [] if str(item).strip()],
+        repeated_noise_removed=[str(item) for item in raw.get("repeated_noise_removed") or [] if str(item).strip()],
+        formulas=[str(item) for item in raw.get("formulas") or [] if str(item).strip()],
+        warnings=[str(item) for item in raw.get("warnings") or [] if str(item).strip()],
+    )
+
+
+def _count_pdf_chunks(total_pages: int, page_batch_size: int) -> int:
+    if total_pages <= 0:
+        return 0
+    return ((total_pages - 1) // max(1, page_batch_size)) + 1
+
+
+def _count_completed_chunks(page_numbers: Any, page_batch_size: int) -> int:
+    return len(
+        {
+            ((int(page_number) - 1) // max(1, page_batch_size)) + 1
+            for page_number in page_numbers
+            if int(page_number) > 0
+        }
+    )
+
+
+def _count_fully_completed_chunks(done_pages: int, total_pages: int, page_batch_size: int) -> int:
+    if done_pages <= 0:
+        return 0
+    if done_pages >= total_pages:
+        return _count_pdf_chunks(total_pages, page_batch_size)
+    return done_pages // max(1, page_batch_size)
+
+
+def _first_missing_page(cached_pages_by_number: dict[int, OCRPageResult], target_page_count: int) -> int | None:
+    for page_number in range(1, target_page_count + 1):
+        if page_number not in cached_pages_by_number:
+            return page_number
+    return None
 
 
 def _get_paddle_ocr_engine():
@@ -331,11 +780,22 @@ def _get_paddle_ocr_engine():
                         "use_doc_orientation_classify": settings["use_doc_orientation_classify"],
                         "use_doc_unwarping": settings["use_doc_unwarping"],
                         "use_textline_orientation": settings["use_textline_orientation"],
-                        "text_detection_model_name": settings["text_detection_model_name"],
-                        "text_recognition_model_name": settings["text_recognition_model_name"],
                         "text_rec_score_thresh": 0.0,
                     }
-                    if not settings["text_detection_model_name"] and not settings["text_recognition_model_name"]:
+                    if settings["text_detection_model_dir"]:
+                        init_kwargs["text_detection_model_dir"] = settings["text_detection_model_dir"]
+                    else:
+                        init_kwargs["text_detection_model_name"] = settings["text_detection_model_name"]
+                    if settings["text_recognition_model_dir"]:
+                        init_kwargs["text_recognition_model_dir"] = settings["text_recognition_model_dir"]
+                    else:
+                        init_kwargs["text_recognition_model_name"] = settings["text_recognition_model_name"]
+                    if (
+                        not settings["text_detection_model_name"]
+                        and not settings["text_recognition_model_name"]
+                        and not settings["text_detection_model_dir"]
+                        and not settings["text_recognition_model_dir"]
+                    ):
                         init_kwargs["lang"] = "ch"
                         init_kwargs["ocr_version"] = settings["ocr_version"]
                     _get_paddle_ocr_engine._engine = PaddleOCR(**init_kwargs)
@@ -355,6 +815,8 @@ def _get_paddle_ocr_settings() -> dict[str, Any]:
             PADDLE_OCR_RECOGNITION_MODEL_ENV,
             DEFAULT_PADDLE_OCR_RECOGNITION_MODEL,
         ),
+        "text_detection_model_dir": _env_optional_text(PADDLE_OCR_DETECTION_MODEL_DIR_ENV),
+        "text_recognition_model_dir": _env_optional_text(PADDLE_OCR_RECOGNITION_MODEL_DIR_ENV),
         "use_textline_orientation": _env_bool(PADDLE_OCR_TEXTLINE_ORIENTATION_ENV, True),
         "use_doc_orientation_classify": _env_bool(PADDLE_OCR_DOC_ORIENTATION_ENV, False),
         "use_doc_unwarping": _env_bool(PADDLE_OCR_DOC_UNWARPING_ENV, False),
@@ -366,6 +828,13 @@ def _env_text(name: str, default: str) -> str:
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
+    return value.strip()
+
+
+def _env_optional_text(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
     return value.strip()
 
 

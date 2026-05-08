@@ -7,17 +7,19 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.orm import load_only
 
 from app.db.session import SessionLocal
 from app.models.legacy import (
     LegacyBackgroundTask,
     LegacyGenerationJob,
     LegacyLibraryFile,
+    LegacyLibraryParseResult,
     LegacyWorkflowEvent,
     LegacyWorkflowTopic,
 )
 from schemas.generation import GenerationJob
-from schemas.library import LibraryFile, LibraryFilePatch
+from schemas.library import LibraryFile, LibraryFilePatch, LibraryParseResultSummary
 from schemas.workflow import WorkflowEvent, WorkflowTopic, WorkflowTopicPatch
 
 
@@ -44,12 +46,12 @@ class Database:
 
     def get_library_by_sha(self, sha256: str) -> LibraryFile | None:
         with SessionLocal() as session:
-            row = session.scalar(select(LegacyLibraryFile).where(LegacyLibraryFile.sha256 == sha256))
+            row = session.scalar(self._library_metadata_statement().where(LegacyLibraryFile.sha256 == sha256))
             return self._library_from_model(row) if row else None
 
     def get_library_file(self, file_id: str) -> LibraryFile | None:
         with SessionLocal() as session:
-            row = session.get(LegacyLibraryFile, file_id)
+            row = session.scalar(self._library_metadata_statement().where(LegacyLibraryFile.id == file_id))
             return self._library_from_model(row) if row else None
 
     def list_library_files(
@@ -59,7 +61,7 @@ class Database:
         source_type: str | None = None,
         search: str | None = None,
     ) -> list[LibraryFile]:
-        statement = select(LegacyLibraryFile)
+        statement = self._library_metadata_statement()
         if subject:
             statement = statement.where(LegacyLibraryFile.subject == subject)
         if category:
@@ -79,6 +81,32 @@ class Database:
         with SessionLocal() as session:
             rows = session.scalars(statement).all()
             return [self._library_from_model(row) for row in rows]
+
+    def _library_metadata_statement(self):
+        return select(LegacyLibraryFile).options(
+            load_only(
+                LegacyLibraryFile.id,
+                LegacyLibraryFile.sha256,
+                LegacyLibraryFile.filename,
+                LegacyLibraryFile.size,
+                LegacyLibraryFile.mime,
+                LegacyLibraryFile.storage_path,
+                LegacyLibraryFile.subject,
+                LegacyLibraryFile.category,
+                LegacyLibraryFile.chapter,
+                LegacyLibraryFile.source_type,
+                LegacyLibraryFile.source_authority,
+                LegacyLibraryFile.source_title,
+                LegacyLibraryFile.source_publisher,
+                LegacyLibraryFile.source_code,
+                LegacyLibraryFile.source_version,
+                LegacyLibraryFile.year,
+                LegacyLibraryFile.tags,
+                LegacyLibraryFile.token_count,
+                LegacyLibraryFile.created_at,
+                LegacyLibraryFile.last_used_at,
+            )
+        )
 
     def update_library_file(self, file_id: str, patch: LibraryFilePatch) -> LibraryFile | None:
         current = self.get_library_file(file_id)
@@ -130,6 +158,106 @@ class Database:
                 row.token_count = token_count
                 session.commit()
 
+    def get_latest_library_parse_result(self, file_id: str) -> dict[str, Any] | None:
+        with SessionLocal() as session:
+            result_row = session.scalar(
+                select(LegacyLibraryParseResult)
+                .where(LegacyLibraryParseResult.file_id == file_id)
+                .order_by(
+                    LegacyLibraryParseResult.sequence_number.desc(),
+                    LegacyLibraryParseResult.created_at.desc(),
+                )
+            )
+            if result_row is not None:
+                return self._library_parse_result_payload(result_row)
+
+            file_row = session.get(LegacyLibraryFile, file_id)
+            if file_row is None or file_row.parsed_text is None:
+                return None
+
+            return {
+                "provider": "stored_parse",
+                "token_count": int(file_row.token_count or 0),
+                "parsed_text": file_row.parsed_text,
+                "markdown": file_row.parsed_text,
+                "parse_options": {},
+                "warnings": [],
+            }
+
+    def store_library_parse_result(
+        self,
+        file_id: str,
+        *,
+        provider: str,
+        parsed_text: str,
+        markdown: str | None,
+        parse_options: dict[str, Any],
+        warnings: list[str],
+        token_count: int,
+    ) -> tuple[str, int, list[LibraryParseResultSummary]]:
+        with SessionLocal() as session:
+            file_row = session.get(LegacyLibraryFile, file_id)
+            if file_row:
+                file_row.parsed_text = parsed_text
+                file_row.token_count = token_count
+            current_max = session.scalar(
+                select(func.max(LegacyLibraryParseResult.sequence_number)).where(
+                    LegacyLibraryParseResult.file_id == file_id
+                )
+            )
+            sequence_number = (current_max or 0) + 1
+            result_id = str(uuid4())
+            row = LegacyLibraryParseResult(
+                id=result_id,
+                file_id=file_id,
+                sequence_number=sequence_number,
+                provider=provider,
+                token_count=token_count,
+                parsed_text=parsed_text,
+                markdown=markdown,
+                parse_options=json.dumps(parse_options, ensure_ascii=False),
+                warnings=json.dumps(warnings, ensure_ascii=False),
+                created_at=datetime.utcnow(),
+            )
+            session.add(row)
+            session.flush()
+
+            keep_ids = [
+                item.id
+                for item in session.scalars(
+                    select(LegacyLibraryParseResult)
+                    .where(LegacyLibraryParseResult.file_id == file_id)
+                    .order_by(LegacyLibraryParseResult.sequence_number.desc())
+                    .limit(2)
+                ).all()
+            ]
+            if keep_ids:
+                session.execute(
+                    delete(LegacyLibraryParseResult).where(
+                        LegacyLibraryParseResult.file_id == file_id,
+                        ~LegacyLibraryParseResult.id.in_(keep_ids),
+                    )
+                )
+            session.commit()
+
+            kept_rows = session.scalars(
+                select(LegacyLibraryParseResult)
+                .where(LegacyLibraryParseResult.file_id == file_id)
+                .order_by(LegacyLibraryParseResult.sequence_number.asc())
+            ).all()
+            kept = [
+                LibraryParseResultSummary(
+                    id=item.id,
+                    file_id=item.file_id,
+                    sequence_number=item.sequence_number,
+                    provider=item.provider,
+                    token_count=item.token_count,
+                    created_at=item.created_at,
+                )
+                for item in kept_rows
+            ]
+            return result_id, sequence_number, kept
+
     def mark_library_used(self, file_id: str) -> None:
         with SessionLocal() as session:
             row = session.get(LegacyLibraryFile, file_id)
@@ -145,6 +273,7 @@ class Database:
             row = session.get(LegacyLibraryFile, file_id)
             if row:
                 session.delete(row)
+                session.execute(delete(LegacyLibraryParseResult).where(LegacyLibraryParseResult.file_id == file_id))
                 session.commit()
         return current
 
@@ -423,12 +552,43 @@ class Database:
         return LegacyLibraryFile(**data)
 
     def _library_from_model(self, row: LegacyLibraryFile) -> LibraryFile:
-        data = self._model_to_dict(row)
+        data = {
+            "id": row.id,
+            "sha256": row.sha256,
+            "filename": row.filename,
+            "size": row.size,
+            "mime": row.mime,
+            "storage_path": row.storage_path,
+            "subject": row.subject,
+            "category": row.category,
+            "chapter": row.chapter,
+            "source_type": row.source_type,
+            "source_authority": row.source_authority,
+            "source_title": row.source_title,
+            "source_publisher": row.source_publisher,
+            "source_code": row.source_code,
+            "source_version": row.source_version,
+            "year": row.year,
+            "tags": row.tags,
+            "token_count": row.token_count,
+            "created_at": row.created_at,
+            "last_used_at": row.last_used_at,
+        }
         data["tags"] = json.loads(data["tags"] or "[]")
         source_title = (data.get("source_title") or "").strip()
         if source_title in {"鎵归噺涓婁紶璧勬枡", "uploaded source"}:
             data["source_title"] = Path(data.get("filename") or "untitled").stem
         return LibraryFile.model_validate(data)
+
+    def _library_parse_result_payload(self, row: LegacyLibraryParseResult) -> dict[str, Any]:
+        return {
+            "provider": row.provider,
+            "token_count": int(row.token_count),
+            "parsed_text": row.parsed_text,
+            "markdown": row.markdown,
+            "parse_options": json.loads(row.parse_options or "{}"),
+            "warnings": json.loads(row.warnings or "[]"),
+        }
 
     def _job_values(self, job: GenerationJob) -> dict[str, Any]:
         data = job.model_dump(mode="json")

@@ -12,12 +12,14 @@ from library.pdf_ocr_pipeline import OCRPipelineOptions
 
 
 ParsePreset = Literal["auto", "fast", "balanced", "accurate", "formula"]
+ParseOutputFormat = Literal["markdown", "text"]
 
 
 class DocumentParseOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     preset: ParsePreset = "auto"
+    output_format: ParseOutputFormat = "markdown"
     force_ocr: bool | None = None
     render_dpi: int | None = Field(default=None, ge=96, le=300)
     crop_header_ratio: float | None = Field(default=None, ge=0.0, le=0.2)
@@ -26,12 +28,13 @@ class DocumentParseOptions(BaseModel):
     remove_repeated_lines: bool | None = None
     watermark_detection: bool | None = None
     enable_formula_recognition: bool | None = None
+    pdf_page_chunk_size: int | None = Field(default=None, ge=1, le=50)
 
     def should_use_layout_pipeline(self) -> bool:
         return self.preset in {"accurate", "formula"}
 
     def is_default(self) -> bool:
-        return self.normalized_dump() == {"preset": "auto"}
+        return self._parse_behavior_dump() == {"preset": "auto"}
 
     def normalized_dump(self) -> dict[str, Any]:
         return self.model_dump(exclude_none=True)
@@ -39,8 +42,13 @@ class DocumentParseOptions(BaseModel):
     def cache_key(self) -> str:
         if self.is_default():
             return "default"
-        payload = json.dumps(self.normalized_dump(), ensure_ascii=False, sort_keys=True)
+        payload = json.dumps(self._parse_behavior_dump(), ensure_ascii=False, sort_keys=True)
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+    def select_output(self, *, text: str, markdown: str) -> str:
+        if self.output_format == "text":
+            return text or markdown
+        return markdown or text
 
     def should_use_pdf_ocr(self, filename: str, mime: str) -> bool:
         suffix = Path(filename).suffix.lower()
@@ -60,6 +68,7 @@ class DocumentParseOptions(BaseModel):
                 "remove_repeated_lines",
                 "watermark_detection",
                 "enable_formula_recognition",
+                "pdf_page_chunk_size",
             )
         )
 
@@ -81,6 +90,8 @@ class DocumentParseOptions(BaseModel):
             options.watermark_detection = self.watermark_detection
         if self.enable_formula_recognition is not None:
             options.enable_formula_recognition = self.enable_formula_recognition
+        if self.pdf_page_chunk_size is not None:
+            options.page_chunk_size = self.pdf_page_chunk_size
         if self.preset != "auto" or any(
             value is not None
             for value in (
@@ -91,6 +102,7 @@ class DocumentParseOptions(BaseModel):
                 self.remove_repeated_lines,
                 self.watermark_detection,
                 self.enable_formula_recognition,
+                self.pdf_page_chunk_size,
             )
         ):
             options.force_ocr = True
@@ -100,8 +112,12 @@ class DocumentParseOptions(BaseModel):
         pipeline_options = self.to_pipeline_options()
         summary = asdict(pipeline_options)
         summary["preset"] = self.preset
+        summary["output_format"] = self.output_format
         summary["cache_key"] = self.cache_key()
         return summary
+
+    def _parse_behavior_dump(self) -> dict[str, Any]:
+        return self.model_dump(exclude_none=True, exclude={"output_format"})
 
 
 def _preset_defaults(preset: ParsePreset) -> OCRPipelineOptions:

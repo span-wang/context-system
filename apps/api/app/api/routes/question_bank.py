@@ -9,6 +9,7 @@ from app.schemas.question_bank import (
     GenerateMockExamRequest,
     GeneratePracticeSetRequest,
     MockExamResponse,
+    PracticeSetDetailResponse,
     PracticeSetResponse,
     QuestionBankItemResponse,
     StandardizeQuestionsRequest,
@@ -29,6 +30,11 @@ def list_questions(session: Session = Depends(get_session)) -> list[QuestionBank
 @router.get("/practice-sets", response_model=list[PracticeSetResponse])
 def list_practice_sets(session: Session = Depends(get_session)) -> list[PracticeSetResponse]:
     return QuestionBankService(session).list_practice_sets()
+
+
+@router.get("/practice-sets/{practice_set_id}", response_model=PracticeSetDetailResponse)
+def get_practice_set_detail(practice_set_id: int, session: Session = Depends(get_session)) -> PracticeSetDetailResponse:
+    return QuestionBankService(session).get_practice_set_detail(practice_set_id)
 
 
 @router.get("/mock-exams", response_model=list[MockExamResponse])

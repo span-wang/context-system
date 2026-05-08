@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from deps import get_db
 from llm.providers import get_llm_provider
 from rag.ragflow import RAGFlowAPIError, RAGFlowProvider
-from settings import PROJECT_ROOT, LLMEndpointConfig, LLMTarget, get_settings, resolve_llm_api_key
+from settings import PROJECT_ROOT, LLMEndpointConfig, LLMTarget, get_settings, list_subject_configs, resolve_llm_api_key
 
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -96,7 +96,7 @@ def config() -> dict:
             "base_url": settings.ragflow.base_url,
             "has_api_key": bool(settings.ragflow.api_key),
         },
-        "subjects": [subject.model_dump() for subject in settings.subjects],
+        "subjects": [subject.model_dump() for subject in list_subject_configs()],
     }
 
 

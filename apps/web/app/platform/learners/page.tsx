@@ -90,7 +90,7 @@ export default function LearnersPage() {
     try {
       const session = await apiFetch<PracticeSessionResponse>("/api/learning/sessions", {
         method: "POST",
-        body: JSON.stringify({ practice_set_id: practiceSet.id }),
+        body: JSON.stringify({ practice_set_id: practiceSet.id, practice_mode: "deferred_feedback" }),
       });
       const submitted = await apiFetch<PracticeSessionResponse>(`/api/learning/sessions/${session.id}/submit`, {
         method: "POST",
@@ -170,7 +170,7 @@ export default function LearnersPage() {
                   {sessions.map((session) => (
                     <article key={session.id} className="infoCard">
                       <div className="infoCardTop">
-                        <strong>{session.session_type}</strong>
+                        <strong>{formatSessionLabel(session)}</strong>
                         <StatusBadge value={session.status} tone={session.status === "submitted" ? "good" : "warn"} />
                       </div>
                       <div className="metaLine">
@@ -227,4 +227,9 @@ export default function LearnersPage() {
       )}
     </>
   );
+}
+
+function formatSessionLabel(session: PracticeSessionResponse) {
+  const modeLabel = session.practice_mode === "instant_feedback" ? "逐题判题" : "整套交卷";
+  return session.session_type.startsWith("practice_set") ? `题包练习 · ${modeLabel}` : session.session_type;
 }

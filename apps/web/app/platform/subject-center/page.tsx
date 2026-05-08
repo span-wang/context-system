@@ -3,11 +3,16 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   apiFetch,
+  ChapterBatchDeleteResponse,
+  ChapterDeleteResponse,
+  ChapterMarkdownImportResponse,
   ChapterResponse,
+  KnowledgePointMarkdownImportResponse,
   KnowledgePointResponse,
+  SubjectBatchDeleteResponse,
+  SubjectDeleteResponse,
   SubjectCategoryResponse,
   SubjectResponse,
-  TextbookResponse,
 } from "../../../lib/pro-api";
 import { LoadState } from "../../../components/shared/LoadState";
 import { StatusBadge } from "../../../components/shared/StatusBadge";
@@ -19,30 +24,18 @@ import {
   useLatestRequestGate,
 } from "../../../lib/request-guard";
 
-type ManageTab = "overview" | "categories" | "textbooks" | "chapters" | "points";
-type EditableType = "subject" | "category" | "textbook" | "chapter" | "point";
+type ManageTab = "overview" | "categories" | "chapters" | "points" | "pointDetails";
+type EditableType = "subject" | "category" | "chapter" | "point" | "pointDetail";
 type EditableItem =
   | SubjectResponse
   | SubjectCategoryResponse
-  | TextbookResponse
   | ChapterResponse
   | KnowledgePointResponse
   | null;
 
 const defaultSubjectForm = { code: "", name: "", status: "active" };
 const defaultCategoryForm = { name: "", sort_order: "0" };
-const defaultTextbookForm = {
-  source_title: "",
-  filename: "",
-  category_id: "",
-  year: "",
-  region: "",
-  source_version: "",
-  tags: "",
-  parse_status: "metadata",
-  token_count: "",
-};
-const defaultChapterForm = { name: "", parent_id: "", path: "", level: "", sort_order: "0" };
+const defaultChapterForm = { category_id: "", name: "", parent_id: "", path: "", level: "", sort_order: "0" };
 const defaultPointForm = {
   name: "",
   category_id: "",
@@ -59,7 +52,6 @@ const defaultPointForm = {
 export default function SubjectCenterPage() {
   const [subjects, setSubjects] = useState<SubjectResponse[]>([]);
   const [categories, setCategories] = useState<SubjectCategoryResponse[]>([]);
-  const [textbooks, setTextbooks] = useState<TextbookResponse[]>([]);
   const [chapters, setChapters] = useState<ChapterResponse[]>([]);
   const [points, setPoints] = useState<KnowledgePointResponse[]>([]);
   const [selectedSubjectId, setSelectedSubjectId] = useState<number | null>(null);
@@ -67,11 +59,23 @@ export default function SubjectCenterPage() {
   const [editing, setEditing] = useState<{ type: EditableType; item: EditableItem } | null>(null);
   const [subjectForm, setSubjectForm] = useState(defaultSubjectForm);
   const [categoryForm, setCategoryForm] = useState(defaultCategoryForm);
-  const [textbookForm, setTextbookForm] = useState(defaultTextbookForm);
   const [chapterForm, setChapterForm] = useState(defaultChapterForm);
+  const [chapterImportMarkdown, setChapterImportMarkdown] = useState("");
+  const [chapterImportOpen, setChapterImportOpen] = useState(false);
+  const [pointImportMarkdown, setPointImportMarkdown] = useState("");
+  const [pointImportOpen, setPointImportOpen] = useState(false);
+  const [pointDetailImportMarkdown, setPointDetailImportMarkdown] = useState("");
+  const [pointDetailImportOpen, setPointDetailImportOpen] = useState(false);
+  const [selectedChapterCategoryId, setSelectedChapterCategoryId] = useState<number | null>(null);
+  const [selectedChapterRootId, setSelectedChapterRootId] = useState<number | null>(null);
+  const [selectedSubjectIds, setSelectedSubjectIds] = useState<number[]>([]);
+  const [selectedChapterIds, setSelectedChapterIds] = useState<number[]>([]);
   const [pointForm, setPointForm] = useState(defaultPointForm);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [importingChapters, setImportingChapters] = useState(false);
+  const [importingPoints, setImportingPoints] = useState(false);
+  const [importingPointDetails, setImportingPointDetails] = useState(false);
   const [error, setError] = useState("");
   const [loadWarning, setLoadWarning] = useState("");
   const [actionMessage, setActionMessage] = useState("");
@@ -83,17 +87,16 @@ export default function SubjectCenterPage() {
     setError("");
     setLoadWarning("");
     try {
-      const [nextSubjects, nextCategories, nextTextbooks, nextChapters, nextPoints] = await Promise.allSettled([
+      const [nextSubjects, nextCategories, nextChapters, nextPoints] = await Promise.allSettled([
         apiFetch<SubjectResponse[]>("/api/knowledge/subjects"),
         apiFetch<SubjectCategoryResponse[]>("/api/knowledge/categories"),
-        apiFetch<TextbookResponse[]>("/api/knowledge/textbooks"),
         apiFetch<ChapterResponse[]>("/api/knowledge/chapters"),
         apiFetch<KnowledgePointResponse[]>("/api/knowledge/points"),
       ]);
 
       if (!requestGate.isCurrent(requestId)) return;
 
-      const results = [nextSubjects, nextCategories, nextTextbooks, nextChapters, nextPoints];
+      const results = [nextSubjects, nextCategories, nextChapters, nextPoints];
       if (allRejected(results)) {
         throw firstRejectedReason(results) || new Error("No subject-center requests succeeded.");
       }
@@ -101,7 +104,6 @@ export default function SubjectCenterPage() {
       const subjectList = nextSubjects.status === "fulfilled" ? nextSubjects.value : [];
       setSubjects(subjectList);
       setCategories(nextCategories.status === "fulfilled" ? nextCategories.value : []);
-      setTextbooks(nextTextbooks.status === "fulfilled" ? nextTextbooks.value : []);
       setChapters(nextChapters.status === "fulfilled" ? nextChapters.value : []);
       setPoints(nextPoints.status === "fulfilled" ? nextPoints.value : []);
       setSelectedSubjectId((current) => {
@@ -113,8 +115,7 @@ export default function SubjectCenterPage() {
         summarizeRejectedRequests([
           { label: "学科", result: nextSubjects },
           { label: "类目", result: nextCategories },
-          { label: "教材", result: nextTextbooks },
-          { label: "章节", result: nextChapters },
+          { label: "章 / 节", result: nextChapters },
           { label: "知识点", result: nextPoints },
         ]),
       );
@@ -139,10 +140,6 @@ export default function SubjectCenterPage() {
     () => categories.filter((category) => category.subject_id === selectedSubjectId),
     [categories, selectedSubjectId],
   );
-  const scopedTextbooks = useMemo(
-    () => textbooks.filter((textbook) => textbook.subject_id === selectedSubjectId),
-    [textbooks, selectedSubjectId],
-  );
   const scopedChapters = useMemo(
     () => chapters.filter((chapter) => chapter.subject_id === selectedSubjectId),
     [chapters, selectedSubjectId],
@@ -151,6 +148,114 @@ export default function SubjectCenterPage() {
     () => points.filter((point) => point.subject_id === selectedSubjectId),
     [points, selectedSubjectId],
   );
+  const chapterCategories = useMemo(() => {
+    const ranked = [...scopedCategories].sort((left, right) => (
+      left.sort_order - right.sort_order || left.id - right.id
+    ));
+    const uncategorizedCount = scopedChapters.filter((chapter) => !chapter.category_id).length;
+    if (uncategorizedCount) {
+      return [...ranked, { id: 0, subject_id: selectedSubjectId || 0, name: "未归类章 / 节", sort_order: Number.MAX_SAFE_INTEGER }];
+    }
+    return ranked;
+  }, [scopedCategories, scopedChapters, selectedSubjectId]);
+  const activeChapterCategoryId = useMemo(() => {
+    if (selectedChapterCategoryId === 0 && scopedChapters.some((chapter) => !chapter.category_id)) return 0;
+    if (selectedChapterCategoryId && scopedCategories.some((category) => category.id === selectedChapterCategoryId)) {
+      return selectedChapterCategoryId;
+    }
+    const firstNonEmptyCategory = chapterCategories.find((category) => (
+      category.id === 0
+        ? scopedChapters.some((chapter) => !chapter.category_id) || scopedPoints.some((point) => !point.category_id)
+        : scopedChapters.some((chapter) => chapter.category_id === category.id) || scopedPoints.some((point) => point.category_id === category.id)
+    ));
+    return firstNonEmptyCategory?.id ?? chapterCategories[0]?.id ?? null;
+  }, [chapterCategories, scopedCategories, scopedChapters, selectedChapterCategoryId]);
+  const activeChapterCategory = useMemo(
+    () => chapterCategories.find((category) => category.id === activeChapterCategoryId) || null,
+    [activeChapterCategoryId, chapterCategories],
+  );
+  const scopedChaptersForCategory = useMemo(
+    () => scopedChapters.filter((chapter) => (activeChapterCategoryId === 0 ? !chapter.category_id : chapter.category_id === activeChapterCategoryId)),
+    [activeChapterCategoryId, scopedChapters],
+  );
+  const rootChapters = useMemo(
+    () => scopedChaptersForCategory.filter((chapter) => !chapter.parent_id || chapter.level <= 1),
+    [scopedChaptersForCategory],
+  );
+  const childChaptersByParent = useMemo(() => {
+    const map = new Map<number, ChapterResponse[]>();
+    for (const chapter of scopedChaptersForCategory) {
+      if (!chapter.parent_id) continue;
+      const children = map.get(chapter.parent_id) || [];
+      children.push(chapter);
+      map.set(chapter.parent_id, children);
+    }
+    return map;
+  }, [scopedChaptersForCategory]);
+  const chapterById = useMemo(
+    () => new Map(scopedChapters.map((chapter) => [chapter.id, chapter])),
+    [scopedChapters],
+  );
+  const selectedChapterRoot = useMemo(() => {
+    if (selectedChapterRootId && rootChapters.some((chapter) => chapter.id === selectedChapterRootId)) {
+      return rootChapters.find((chapter) => chapter.id === selectedChapterRootId) || null;
+    }
+    return rootChapters[0] || null;
+  }, [rootChapters, selectedChapterRootId]);
+  const rootPoints = useMemo(
+    () => scopedPoints.filter((point) => !point.parent_id),
+    [scopedPoints],
+  );
+  const pointDetails = useMemo(
+    () => scopedPoints.filter((point) => !!point.parent_id),
+    [scopedPoints],
+  );
+  const pointById = useMemo(
+    () => new Map(scopedPoints.map((point) => [point.id, point])),
+    [scopedPoints],
+  );
+  const rootPointsByChapter = useMemo(() => {
+    const map = new Map<number, KnowledgePointResponse[]>();
+    for (const point of rootPoints) {
+      if (!point.chapter_id) continue;
+      const items = map.get(point.chapter_id) || [];
+      items.push(point);
+      map.set(point.chapter_id, items);
+    }
+    return map;
+  }, [rootPoints]);
+  const pointDetailsByParent = useMemo(() => {
+    const map = new Map<number, KnowledgePointResponse[]>();
+    for (const detail of pointDetails) {
+      if (!detail.parent_id) continue;
+      const items = map.get(detail.parent_id) || [];
+      items.push(detail);
+      map.set(detail.parent_id, items);
+    }
+    return map;
+  }, [pointDetails]);
+  const detailCountByPoint = useMemo(() => {
+    const map = new Map<number, number>();
+    for (const detail of pointDetails) {
+      if (!detail.parent_id) continue;
+      map.set(detail.parent_id, (map.get(detail.parent_id) || 0) + 1);
+    }
+    return map;
+  }, [pointDetails]);
+  const bindableChapters = useMemo(
+    () => scopedChapters.filter((chapter) => !scopedChapters.some((candidate) => candidate.parent_id === chapter.id)),
+    [scopedChapters],
+  );
+  const bindableChaptersByCategory = useMemo(() => {
+    const map = new Map<number, ChapterResponse[]>();
+    for (const category of scopedCategories) {
+      map.set(
+        category.id,
+        scopedChapters.filter((chapter) => chapter.category_id === category.id && !scopedChapters.some((candidate) => candidate.parent_id === chapter.id)),
+      );
+    }
+    return map;
+  }, [scopedCategories, scopedChapters]);
 
   const pointCountByChapter = useMemo(() => {
     const map = new Map<number, number>();
@@ -161,6 +266,17 @@ export default function SubjectCenterPage() {
     }
     return map;
   }, [scopedPoints]);
+  const pointCountByChapterTree = useMemo(() => {
+    const map = new Map<number, number>();
+    for (const point of scopedPoints) {
+      let currentChapterId = point.chapter_id || null;
+      while (currentChapterId) {
+        map.set(currentChapterId, (map.get(currentChapterId) || 0) + 1);
+        currentChapterId = chapterById.get(currentChapterId)?.parent_id || null;
+      }
+    }
+    return map;
+  }, [chapterById, scopedPoints]);
 
   const pointCountByCategory = useMemo(() => {
     const map = new Map<number, number>();
@@ -173,26 +289,61 @@ export default function SubjectCenterPage() {
   }, [scopedPoints]);
 
   const unmappedPoints = scopedPoints.filter((point) => !point.chapter_id).length;
-  const mappedChapters = scopedChapters.filter((chapter) => (pointCountByChapter.get(chapter.id) || 0) > 0).length;
+  const mappedBindableChapters = bindableChapters.filter((chapter) => (pointCountByChapter.get(chapter.id) || 0) > 0).length;
+  const selectedDetailParentPoint = useMemo(() => {
+    const parentId = toNullableNumber(pointForm.parent_id);
+    return parentId ? rootPoints.find((point) => point.id === parentId) || null : null;
+  }, [pointForm.parent_id, rootPoints]);
+  const pointSectionOptions = useMemo(() => {
+    const categoryId = toNullableNumber(pointForm.category_id);
+    if (!categoryId) return [] as ChapterResponse[];
+    const options = bindableChaptersByCategory.get(categoryId) || [];
+    const currentChapterId = toNullableNumber(pointForm.chapter_id);
+    if (currentChapterId && !options.some((chapter) => chapter.id === currentChapterId)) {
+      const currentChapter = chapterById.get(currentChapterId);
+      if (currentChapter) {
+        return [currentChapter, ...options];
+      }
+    }
+    return options;
+  }, [bindableChaptersByCategory, chapterById, pointForm.category_id, pointForm.chapter_id]);
 
   function pickSubject(subjectId: number) {
     setSelectedSubjectId(subjectId);
     setEditing(null);
+    setChapterImportOpen(false);
+    setPointImportOpen(false);
+    setPointDetailImportOpen(false);
+    setSelectedChapterCategoryId(null);
+    setSelectedChapterRootId(null);
+    setSelectedChapterIds([]);
     setActionMessage("");
   }
 
   function beginCreate(type: EditableType) {
     setActionMessage("");
+    setChapterImportOpen(false);
+    setPointImportOpen(false);
+    setPointDetailImportOpen(false);
     setEditing({ type, item: null });
     if (type === "subject") setSubjectForm(defaultSubjectForm);
     if (type === "category") setCategoryForm(defaultCategoryForm);
-    if (type === "textbook") setTextbookForm(defaultTextbookForm);
-    if (type === "chapter") setChapterForm(defaultChapterForm);
-    if (type === "point") setPointForm(defaultPointForm);
+    if (type === "chapter") {
+      setChapterForm({ ...defaultChapterForm, category_id: activeChapterCategoryId && activeChapterCategoryId > 0 ? String(activeChapterCategoryId) : "" });
+    }
+    if (type === "point" || type === "pointDetail") {
+      setPointForm({
+        ...defaultPointForm,
+        category_id: activeChapterCategoryId && activeChapterCategoryId > 0 ? String(activeChapterCategoryId) : "",
+      });
+    }
   }
 
   function beginEdit(type: EditableType, item: EditableItem) {
     setActionMessage("");
+    setChapterImportOpen(false);
+    setPointImportOpen(false);
+    setPointDetailImportOpen(false);
     setEditing({ type, item });
     if (type === "subject") {
       const subject = item as SubjectResponse;
@@ -202,23 +353,11 @@ export default function SubjectCenterPage() {
       const category = item as SubjectCategoryResponse;
       setCategoryForm({ name: category.name, sort_order: String(category.sort_order) });
     }
-    if (type === "textbook") {
-      const textbook = item as TextbookResponse;
-      setTextbookForm({
-        source_title: textbook.source_title,
-        filename: textbook.filename,
-        category_id: textbook.category_id ? String(textbook.category_id) : "",
-        year: textbook.year ? String(textbook.year) : "",
-        region: textbook.region || "",
-        source_version: textbook.source_version || "",
-        tags: userTags(textbook.tags_json).join(", "),
-        parse_status: textbook.parse_status,
-        token_count: textbook.token_count ? String(textbook.token_count) : "",
-      });
-    }
     if (type === "chapter") {
       const chapter = item as ChapterResponse;
+      if (chapter.category_id) setSelectedChapterCategoryId(chapter.category_id);
       setChapterForm({
+        category_id: chapter.category_id ? String(chapter.category_id) : "",
         name: chapter.name,
         parent_id: chapter.parent_id ? String(chapter.parent_id) : "",
         path: chapter.path,
@@ -226,7 +365,7 @@ export default function SubjectCenterPage() {
         sort_order: String(chapter.sort_order),
       });
     }
-    if (type === "point") {
+    if (type === "point" || type === "pointDetail") {
       const point = item as KnowledgePointResponse;
       setPointForm({
         name: point.name,
@@ -241,6 +380,82 @@ export default function SubjectCenterPage() {
         sort_order: String(point.sort_order),
       });
     }
+  }
+
+  function beginChapterImport() {
+    setActionMessage("");
+    setEditing(null);
+    setPointImportOpen(false);
+    setPointDetailImportOpen(false);
+    setChapterImportOpen(true);
+  }
+
+  function beginPointImport() {
+    setActionMessage("");
+    setEditing(null);
+    setChapterImportOpen(false);
+    setPointDetailImportOpen(false);
+    setPointImportOpen(true);
+  }
+
+  function beginPointDetailImport() {
+    setActionMessage("");
+    setEditing(null);
+    setChapterImportOpen(false);
+    setPointImportOpen(false);
+    setPointDetailImportOpen(true);
+  }
+
+  function beginCreatePointForChapter(chapter: ChapterResponse) {
+    setActionMessage("");
+    setChapterImportOpen(false);
+    setPointImportOpen(false);
+    setPointDetailImportOpen(false);
+    setEditing({ type: "point", item: null });
+    setPointForm({
+      ...defaultPointForm,
+      category_id: chapter.category_id ? String(chapter.category_id) : "",
+      chapter_id: String(chapter.id),
+      path: "",
+    });
+  }
+
+  function beginCreatePointDetailForPoint(point: KnowledgePointResponse) {
+    setActionMessage("");
+    setChapterImportOpen(false);
+    setPointImportOpen(false);
+    setPointDetailImportOpen(false);
+    setEditing({ type: "pointDetail", item: null });
+    setPointForm({
+      ...defaultPointForm,
+      parent_id: String(point.id),
+      category_id: point.category_id ? String(point.category_id) : "",
+      chapter_id: point.chapter_id ? String(point.chapter_id) : "",
+      path: "",
+    });
+  }
+
+  function toggleSubjectSelection(subjectId: number) {
+    setSelectedSubjectIds((current) =>
+      current.includes(subjectId) ? current.filter((id) => id !== subjectId) : [...current, subjectId],
+    );
+  }
+
+  function toggleChapterSelection(chapterId: number) {
+    setSelectedChapterIds((current) =>
+      current.includes(chapterId) ? current.filter((id) => id !== chapterId) : [...current, chapterId],
+    );
+  }
+
+  function toggleSectionGroupSelection(chapterIds: number[]) {
+    if (!chapterIds.length) return;
+    setSelectedChapterIds((current) => {
+      const allSelected = chapterIds.every((id) => current.includes(id));
+      if (allSelected) {
+        return current.filter((id) => !chapterIds.includes(id));
+      }
+      return Array.from(new Set([...current, ...chapterIds]));
+    });
   }
 
   async function submitSubject(event: FormEvent) {
@@ -275,46 +490,54 @@ export default function SubjectCenterPage() {
     );
   }
 
-  async function submitTextbook(event: FormEvent) {
-    event.preventDefault();
-    if (!selectedSubjectId) return setError("请先选择学科");
-    const textbook = editing?.item as TextbookResponse | null;
-    await saveEntity(
-      textbook ? `/api/knowledge/textbooks/${textbook.id}` : "/api/knowledge/textbooks",
-      textbook ? "PATCH" : "POST",
-      {
-        subject_id: selectedSubjectId,
-        category_id: toNullableNumber(textbookForm.category_id),
-        source_title: textbookForm.source_title.trim(),
-        filename: textbookForm.filename.trim() || null,
-        year: toNullableNumber(textbookForm.year),
-        region: textbookForm.region.trim() || null,
-        source_version: textbookForm.source_version.trim() || null,
-        tags_json: splitList(textbookForm.tags),
-        parse_status: textbookForm.parse_status.trim() || "metadata",
-        token_count: toNullableNumber(textbookForm.token_count),
-      },
-      "教材已保存",
-    );
-  }
-
   async function submitChapter(event: FormEvent) {
     event.preventDefault();
     if (!selectedSubjectId) return setError("请先选择学科");
+    if (!chapterForm.category_id) return setError("请先选择章 / 节所属类目");
     const chapter = editing?.item as ChapterResponse | null;
     await saveEntity(
       chapter ? `/api/knowledge/chapters/${chapter.id}` : "/api/knowledge/chapters",
       chapter ? "PATCH" : "POST",
       {
         subject_id: selectedSubjectId,
+        category_id: toNullableNumber(chapterForm.category_id),
         parent_id: toNullableNumber(chapterForm.parent_id),
         name: chapterForm.name.trim(),
         level: toNullableNumber(chapterForm.level),
         path: chapterForm.path.trim() || null,
         sort_order: toNumber(chapterForm.sort_order),
       },
-      "章节已保存",
+      "章 / 节已保存",
     );
+  }
+
+  async function submitChapterImport(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedSubjectId) return setError("请先选择学科");
+    if (!activeChapterCategoryId || activeChapterCategoryId === 0) return setError("请先选择一个已创建的类目");
+    if (!chapterImportMarkdown.trim()) return setError("请粘贴 Markdown 目录");
+    const subjectId = selectedSubjectId;
+    setImportingChapters(true);
+    setError("");
+    setActionMessage("");
+    try {
+      const result = await apiFetch<ChapterMarkdownImportResponse>("/api/knowledge/chapters/import-markdown", {
+        method: "POST",
+        body: JSON.stringify({
+          subject_id: subjectId,
+          category_id: activeChapterCategoryId,
+          markdown: chapterImportMarkdown,
+        }),
+      });
+      setChapterImportMarkdown("");
+      setChapterImportOpen(false);
+      setActionMessage(result.message);
+      await loadAll(subjectId);
+    } catch (err) {
+      setError(toErrorMessage(err, "导入目录失败"));
+    } finally {
+      setImportingChapters(false);
+    }
   }
 
   async function submitPoint(event: FormEvent) {
@@ -341,6 +564,91 @@ export default function SubjectCenterPage() {
     );
   }
 
+  async function submitPointDetail(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedSubjectId) return setError("请先选择学科");
+    if (!selectedDetailParentPoint) return setError("请先选择父级知识点");
+    const point = editing?.item as KnowledgePointResponse | null;
+    await saveEntity(
+      point ? `/api/knowledge/points/${point.id}` : "/api/knowledge/points",
+      point ? "PATCH" : "POST",
+      {
+        subject_id: selectedSubjectId,
+        category_id: selectedDetailParentPoint.category_id ?? null,
+        chapter_id: selectedDetailParentPoint.chapter_id ?? null,
+        parent_id: selectedDetailParentPoint.id,
+        name: pointForm.name.trim(),
+        level: toNullableNumber(pointForm.level),
+        path: pointForm.path.trim() || null,
+        description: pointForm.description.trim() || null,
+        keywords_json: splitList(pointForm.keywords),
+        status: pointForm.status.trim() || "active",
+        sort_order: toNumber(pointForm.sort_order),
+      },
+      "知识点详情已保存",
+    );
+  }
+
+  async function submitPointImport(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedSubjectId) return setError("请先选择学科");
+    if (!activeChapterCategoryId || activeChapterCategoryId === 0) return setError("请先选择一个已创建的类目");
+    if (!pointImportMarkdown.trim()) return setError("请粘贴知识点 Markdown 目录");
+    const subjectId = selectedSubjectId;
+    setImportingPoints(true);
+    setError("");
+    setActionMessage("");
+    try {
+      const result = await apiFetch<KnowledgePointMarkdownImportResponse>("/api/knowledge/points/import-markdown", {
+        method: "POST",
+        body: JSON.stringify({
+          subject_id: subjectId,
+          category_id: activeChapterCategoryId,
+          markdown: pointImportMarkdown,
+          import_mode: "point",
+        }),
+      });
+      setPointImportMarkdown("");
+      setPointImportOpen(false);
+      setActionMessage(result.message);
+      await loadAll(subjectId);
+    } catch (err) {
+      setError(toErrorMessage(err, "导入知识点失败"));
+    } finally {
+      setImportingPoints(false);
+    }
+  }
+
+  async function submitPointDetailImport(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedSubjectId) return setError("请先选择学科");
+    if (!activeChapterCategoryId || activeChapterCategoryId === 0) return setError("请先选择一个已创建的类目");
+    if (!pointDetailImportMarkdown.trim()) return setError("请粘贴知识点详情 Markdown 目录");
+    const subjectId = selectedSubjectId;
+    setImportingPointDetails(true);
+    setError("");
+    setActionMessage("");
+    try {
+      const result = await apiFetch<KnowledgePointMarkdownImportResponse>("/api/knowledge/points/import-markdown", {
+        method: "POST",
+        body: JSON.stringify({
+          subject_id: subjectId,
+          category_id: activeChapterCategoryId,
+          markdown: pointDetailImportMarkdown,
+          import_mode: "detail",
+        }),
+      });
+      setPointDetailImportMarkdown("");
+      setPointDetailImportOpen(false);
+      setActionMessage(result.message);
+      await loadAll(subjectId);
+    } catch (err) {
+      setError(toErrorMessage(err, "导入知识点详情失败"));
+    } finally {
+      setImportingPointDetails(false);
+    }
+  }
+
   async function saveEntity(path: string, method: "POST" | "PATCH", body: object, message: string, preferredSubjectId?: number) {
     setSaving(true);
     setError("");
@@ -360,16 +668,103 @@ export default function SubjectCenterPage() {
     }
   }
 
+  async function deleteSubject(subject: SubjectResponse) {
+    if (!window.confirm(`确定删除学科「${subject.name}」吗？会连同下挂的所有内容一起删除。`)) return;
+    setSaving(true);
+    setError("");
+    setActionMessage("");
+    try {
+      const result = await apiFetch<SubjectDeleteResponse>(`/api/knowledge/subjects/${subject.id}`, { method: "DELETE" });
+      setEditing(null);
+      setActionMessage(`学科「${result.name}」已删除`);
+      await loadAll(null);
+    } catch (err) {
+      setError(toErrorMessage(err, "删除学科失败"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteChapter(chapter: ChapterResponse) {
+    const childCount = childChaptersByParent.get(chapter.id)?.length || 0;
+    const message = childCount > 0
+      ? `确定删除章「${chapter.name}」及其 ${childCount} 个节吗？关联知识点会一并删除。`
+      : `确定删除${chapter.parent_id ? "节" : "章"}「${chapter.name}」吗？关联知识点会一并删除。`;
+    if (!window.confirm(message)) return;
+    setSaving(true);
+    setError("");
+    setActionMessage("");
+    try {
+      const result = await apiFetch<ChapterDeleteResponse>(`/api/knowledge/chapters/${chapter.id}`, { method: "DELETE" });
+      setEditing(null);
+      setSelectedChapterRootId(null);
+      setActionMessage(`已删除 ${result.removed_chapter_count} 个章 / 节节点，解绑 ${result.unbound_point_count} 个知识点。`);
+      await loadAll(selectedSubjectId);
+    } catch (err) {
+      setError(toErrorMessage(err, "删除章 / 节失败"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteSelectedSubjects() {
+    if (!selectedSubjectIds.length) return;
+    if (!window.confirm(`确定批量删除选中的 ${selectedSubjectIds.length} 个学科吗？会连同下挂内容一起删除。`)) return;
+    setSaving(true);
+    setError("");
+    setActionMessage("");
+    try {
+      const result = await apiFetch<SubjectBatchDeleteResponse>("/api/knowledge/subjects/batch-delete", {
+        method: "POST",
+        body: JSON.stringify({ ids: selectedSubjectIds }),
+      });
+      setSelectedSubjectIds([]);
+      setEditing(null);
+      setActionMessage(result.message);
+      await loadAll(null);
+    } catch (err) {
+      setError(toErrorMessage(err, "批量删除学科失败"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteSelectedChapters() {
+    if (!selectedChapterIds.length) return;
+    if (!window.confirm(`确定批量删除选中的 ${selectedChapterIds.length} 个章 / 节节点吗？子节和关联知识点会一并删除。`)) return;
+    setSaving(true);
+    setError("");
+    setActionMessage("");
+    try {
+      const result = await apiFetch<ChapterBatchDeleteResponse>("/api/knowledge/chapters/batch-delete", {
+        method: "POST",
+        body: JSON.stringify({ ids: selectedChapterIds }),
+      });
+      setSelectedChapterIds([]);
+      setEditing(null);
+      setSelectedChapterRootId(null);
+      setActionMessage(result.message);
+      await loadAll(selectedSubjectId);
+    } catch (err) {
+      setError(toErrorMessage(err, "批量删除章 / 节失败"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <>
       <header className="pageHeader">
         <div>
           <h1>学科中心</h1>
-          <p>统一维护学科、类目、教材、章节和知识点，后续原始题的考点映射会以这里的知识资产为准。</p>
+          <p>统一维护学科、类目、章、节和知识点，后续原始题的考点映射会以这里的知识资产为准。</p>
         </div>
         <div className="buttonRow">
           <button className="button" type="button" onClick={() => beginCreate("subject")}>
             新增学科
+          </button>
+          <button className="button danger" type="button" disabled={saving || !selectedSubjectIds.length} onClick={deleteSelectedSubjects}>
+            批量删除学科
           </button>
           <button className="button" type="button" onClick={() => loadAll(selectedSubjectId)}>
             刷新
@@ -399,18 +794,26 @@ export default function SubjectCenterPage() {
                 const active = subject.id === selectedSubjectId;
                 const subjectPoints = points.filter((point) => point.subject_id === subject.id).length;
                 return (
-                  <button
-                    key={subject.id}
-                    className={active ? "subjectPickButton active" : "subjectPickButton"}
-                    type="button"
-                    onClick={() => pickSubject(subject.id)}
-                  >
-                    <span>
-                      <strong>{subject.name}</strong>
-                      <small>{subject.code} · {subjectPoints} 个知识点</small>
-                    </span>
-                    <StatusBadge value={subject.status} tone={subject.status === "active" ? "good" : "info"} />
-                  </button>
+                  <div key={subject.id} className="selectableRow">
+                    <label className="rowCheck">
+                      <input
+                        type="checkbox"
+                        checked={selectedSubjectIds.includes(subject.id)}
+                        onChange={() => toggleSubjectSelection(subject.id)}
+                      />
+                    </label>
+                    <button
+                      className={active ? "subjectPickButton active" : "subjectPickButton"}
+                      type="button"
+                      onClick={() => pickSubject(subject.id)}
+                    >
+                      <span>
+                        <strong>{subject.name}</strong>
+                        <small>{subject.code} · {subjectPoints} 个知识点</small>
+                      </span>
+                      <StatusBadge value={subject.status} tone={subject.status === "active" ? "good" : "info"} />
+                    </button>
+                  </div>
                 );
               })}
               {!subjects.length && <div className="empty compact">请先新增一个学科</div>}
@@ -422,22 +825,22 @@ export default function SubjectCenterPage() {
               <article className="statCard">
                 <span>类目</span>
                 <strong>{scopedCategories.length}</strong>
-                <small>用于区分教材目录、试卷分类和知识点归属。</small>
+                <small>用于区分章、节和知识点归属。</small>
               </article>
               <article className="statCard">
-                <span>教材</span>
-                <strong>{scopedTextbooks.length}</strong>
-                <small>已登记到素材资产中的教材资料。</small>
-              </article>
-              <article className="statCard">
-                <span>章节</span>
-                <strong>{mappedChapters}/{scopedChapters.length}</strong>
-                <small>已有知识点覆盖的章节 / 总章节。</small>
+                <span>章 / 节</span>
+                <strong>{mappedBindableChapters}/{bindableChapters.length}</strong>
+                <small>章、节归属于类目；没有节时知识点可直接绑定到章。</small>
               </article>
               <article className="statCard">
                 <span>知识点</span>
-                <strong>{scopedPoints.length}</strong>
-                <small>{unmappedPoints} 个知识点尚未绑定章节。</small>
+                <strong>{rootPoints.length}</strong>
+                <small>{unmappedPoints} 个知识点节点尚未绑定章 / 节。</small>
+              </article>
+              <article className="statCard">
+                <span>知识点详情</span>
+                <strong>{pointDetails.length}</strong>
+                <small>挂在一级知识点下的二级节点。</small>
               </article>
             </section>
 
@@ -449,20 +852,26 @@ export default function SubjectCenterPage() {
                     <p>{selectedSubject ? `${selectedSubject.code} · ${selectedSubject.status}` : "请选择或新增学科后继续维护内容。"}</p>
                   </div>
                   {selectedSubject && (
-                    <button className="button" type="button" onClick={() => beginEdit("subject", selectedSubject)}>
-                      编辑学科
-                    </button>
+                    <div className="buttonRow">
+                      <button className="button" type="button" onClick={() => beginEdit("subject", selectedSubject)}>
+                        编辑学科
+                      </button>
+                      <button className="button danger" type="button" disabled={saving} onClick={() => deleteSubject(selectedSubject)}>
+                        删除学科
+                      </button>
+                    </div>
                   )}
                 </div>
               </div>
               <div className="panelBody stackList">
+                <p className="muted">默认在“总览”里查看主目录；“类目 / 章 / 节 / 知识点 / 知识点详情”页签保留给后期调整使用。</p>
                 <div className="tabs">
                   {[
                     ["overview", "总览"],
                     ["categories", "类目"],
-                    ["textbooks", "教材"],
-                    ["chapters", "章节"],
+                    ["chapters", "章 / 节"],
                     ["points", "知识点"],
+                    ["pointDetails", "知识点详情"],
                   ].map(([value, label]) => (
                     <button
                       key={value}
@@ -478,9 +887,9 @@ export default function SubjectCenterPage() {
                 {renderEditor()}
                 {activeTab === "overview" && renderOverview()}
                 {activeTab === "categories" && renderCategories()}
-                {activeTab === "textbooks" && renderTextbooks()}
                 {activeTab === "chapters" && renderChapters()}
                 {activeTab === "points" && renderPoints()}
+                {activeTab === "pointDetails" && renderPointDetails()}
               </div>
             </section>
           </div>
@@ -539,80 +948,39 @@ export default function SubjectCenterPage() {
             <SubmitButton saving={saving} />
           </form>
         )}
-        {editing.type === "textbook" && (
-          <form className="formGrid" onSubmit={submitTextbook}>
+        {editing.type === "chapter" && (
+          <form className="formGrid" onSubmit={submitChapter}>
             <div className="row">
               <label className="field">
-                <span>教材名称</span>
-                <input value={textbookForm.source_title} onChange={(event) => setTextbookForm({ ...textbookForm, source_title: event.target.value })} />
-              </label>
-              <label className="field">
-                <span>文件名</span>
-                <input value={textbookForm.filename} onChange={(event) => setTextbookForm({ ...textbookForm, filename: event.target.value })} />
-              </label>
-            </div>
-            <div className="row">
-              <label className="field">
-                <span>类目</span>
-                <select value={textbookForm.category_id} onChange={(event) => setTextbookForm({ ...textbookForm, category_id: event.target.value })}>
-                  <option value="">未分类</option>
+                <span>所属类目</span>
+                <select
+                  value={chapterForm.category_id}
+                  onChange={(event) => setChapterForm({ ...chapterForm, category_id: event.target.value, parent_id: "", path: "" })}
+                >
+                  <option value="">请选择类目</option>
                   {scopedCategories.map((category) => (
                     <option key={category.id} value={category.id}>{category.name}</option>
                   ))}
                 </select>
               </label>
               <label className="field">
-                <span>版本</span>
-                <input value={textbookForm.source_version} onChange={(event) => setTextbookForm({ ...textbookForm, source_version: event.target.value })} />
-              </label>
-            </div>
-            <div className="row">
-              <label className="field">
-                <span>年份</span>
-                <input value={textbookForm.year} onChange={(event) => setTextbookForm({ ...textbookForm, year: event.target.value })} />
-              </label>
-              <label className="field">
-                <span>地区</span>
-                <input value={textbookForm.region} onChange={(event) => setTextbookForm({ ...textbookForm, region: event.target.value })} />
-              </label>
-            </div>
-            <div className="row">
-              <label className="field">
-                <span>解析状态</span>
-                <input value={textbookForm.parse_status} onChange={(event) => setTextbookForm({ ...textbookForm, parse_status: event.target.value })} />
-              </label>
-              <label className="field">
-                <span>Token</span>
-                <input value={textbookForm.token_count} onChange={(event) => setTextbookForm({ ...textbookForm, token_count: event.target.value })} />
-              </label>
-            </div>
-            <label className="field">
-              <span>标签</span>
-              <input value={textbookForm.tags} onChange={(event) => setTextbookForm({ ...textbookForm, tags: event.target.value })} placeholder="用逗号、空格或顿号分隔" />
-            </label>
-            <SubmitButton saving={saving} />
-          </form>
-        )}
-        {editing.type === "chapter" && (
-          <form className="formGrid" onSubmit={submitChapter}>
-            <div className="row">
-              <label className="field">
-                <span>章节名称</span>
+                <span>章 / 节名称</span>
                 <input value={chapterForm.name} onChange={(event) => setChapterForm({ ...chapterForm, name: event.target.value })} />
               </label>
+            </div>
+            <div className="row">
               <label className="field">
-                <span>父级章节</span>
-                <select value={chapterForm.parent_id} onChange={(event) => setChapterForm({ ...chapterForm, parent_id: event.target.value })}>
+                <span>父级节点</span>
+                <select value={chapterForm.parent_id} onChange={(event) => setChapterForm({ ...chapterForm, parent_id: event.target.value, path: "" })}>
                   <option value="">无</option>
                   {scopedChapters
+                    .filter((chapter) => chapter.category_id === toNullableNumber(chapterForm.category_id))
                     .filter((chapter) => chapter.id !== (editing.item as ChapterResponse | null)?.id)
                     .map((chapter) => (
                       <option key={chapter.id} value={chapter.id}>{chapter.path}</option>
                     ))}
                 </select>
               </label>
-            </div>
-            <div className="row">
               <label className="field">
                 <span>路径</span>
                 <input value={chapterForm.path} onChange={(event) => setChapterForm({ ...chapterForm, path: event.target.value })} />
@@ -629,45 +997,82 @@ export default function SubjectCenterPage() {
             <SubmitButton saving={saving} />
           </form>
         )}
-        {editing.type === "point" && (
-          <form className="formGrid" onSubmit={submitPoint}>
+        {(editing.type === "point" || editing.type === "pointDetail") && (
+          <form className="formGrid" onSubmit={editing.type === "pointDetail" ? submitPointDetail : submitPoint}>
             <div className="row">
               <label className="field">
-                <span>知识点名称</span>
+                <span>{editing.type === "pointDetail" ? "知识点详情名称" : "知识点名称"}</span>
                 <input value={pointForm.name} onChange={(event) => setPointForm({ ...pointForm, name: event.target.value })} />
               </label>
-              <label className="field">
-                <span>章节</span>
-                <select value={pointForm.chapter_id} onChange={(event) => setPointForm({ ...pointForm, chapter_id: event.target.value })}>
-                  <option value="">未绑定</option>
-                  {scopedChapters.map((chapter) => (
-                    <option key={chapter.id} value={chapter.id}>{chapter.path}</option>
-                  ))}
-                </select>
-              </label>
+              {editing.type === "point" ? (
+                <label className="field">
+                  <span>类目</span>
+                  <select value={pointForm.category_id} onChange={(event) => updatePointCategory(event.target.value)}>
+                    <option value="">未分类</option>
+                    {scopedCategories.map((category) => (
+                      <option key={category.id} value={category.id}>{category.name}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                <label className="field">
+                  <span>父级知识点</span>
+                  <select
+                    value={pointForm.parent_id}
+                    onChange={(event) => updatePointDetailParent(event.target.value, editing.item as KnowledgePointResponse | null)}
+                  >
+                    <option value="">请选择</option>
+                    {rootPoints
+                      .filter((point) => point.id !== (editing.item as KnowledgePointResponse | null)?.id)
+                      .map((point) => (
+                        <option key={point.id} value={point.id}>{point.path}</option>
+                      ))}
+                  </select>
+                </label>
+              )}
             </div>
             <div className="row">
-              <label className="field">
-                <span>类目</span>
-                <select value={pointForm.category_id} onChange={(event) => setPointForm({ ...pointForm, category_id: event.target.value })}>
-                  <option value="">未分类</option>
-                  {scopedCategories.map((category) => (
-                    <option key={category.id} value={category.id}>{category.name}</option>
-                  ))}
-                </select>
-              </label>
-              <label className="field">
-                <span>父级知识点</span>
-                <select value={pointForm.parent_id} onChange={(event) => setPointForm({ ...pointForm, parent_id: event.target.value })}>
-                  <option value="">无</option>
-                  {scopedPoints
-                    .filter((point) => point.id !== (editing.item as KnowledgePointResponse | null)?.id)
-                    .map((point) => (
-                      <option key={point.id} value={point.id}>{point.path}</option>
-                    ))}
-                </select>
-              </label>
+              {editing.type === "point" ? (
+                <>
+                  <label className="field">
+                    <span>章 / 节</span>
+                    <select value={pointForm.chapter_id} onChange={(event) => setPointForm({ ...pointForm, chapter_id: event.target.value, path: "" })}>
+                      <option value="">{pointForm.category_id ? "请选择章 / 节" : "请先选择类目"}</option>
+                      {pointSectionOptions.map((chapter) => {
+                        const isLegacyBinding = chapter.id === toNullableNumber(pointForm.chapter_id)
+                          && scopedChapters.some((candidate) => candidate.parent_id === chapter.id);
+                        return (
+                          <option key={chapter.id} value={chapter.id}>
+                            {isLegacyBinding ? `${chapter.path}（当前绑定，建议改到具体节）` : chapter.path}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>所属类目</span>
+                    <input value={categoryName(toNullableNumber(pointForm.category_id))} readOnly />
+                  </label>
+                </>
+              ) : (
+                <>
+                  <label className="field">
+                    <span>所属章 / 节</span>
+                    <input value={selectedDetailParentPoint ? chapterName(selectedDetailParentPoint.chapter_id) : ""} readOnly />
+                  </label>
+                  <label className="field">
+                    <span>所属知识点</span>
+                    <input value={selectedDetailParentPoint?.name || ""} readOnly />
+                  </label>
+                </>
+              )}
             </div>
+            {editing.type === "point" && toNullableNumber(pointForm.chapter_id) && scopedChapters.some((chapter) => chapter.parent_id === toNullableNumber(pointForm.chapter_id)) ? (
+              <div className="calloutBox">当前知识点仍绑定在章上，建议改到该类目下的具体节。</div>
+            ) : null}
+            {editing.type === "pointDetail" && !selectedDetailParentPoint ? (
+              <div className="calloutBox">知识点详情会自动继承父级知识点所在的章 / 节和类目。</div>
+            ) : null}
             <div className="row">
               <label className="field">
                 <span>路径</span>
@@ -706,37 +1111,77 @@ export default function SubjectCenterPage() {
   function renderOverview() {
     if (!selectedSubject) return <div className="empty compact">请选择学科</div>;
     return (
-      <div className="dashboardGrid">
-        <div className="panel softPanel">
-          <div className="panelHeader">
-            <h2>章节覆盖</h2>
-            <p>按章节查看知识点数量，便于发现教材目录中尚未覆盖的节点。</p>
+      <div className="subjectDirectoryWorkspace">
+        <aside className="directoryCategoryRail">
+          <div className="directoryRailHeader">
+            <div>
+              <h2>类目总览</h2>
+              <p>先选类目，再在右侧查看完整目录树。</p>
+            </div>
+            <button className="button primary" type="button" onClick={() => beginCreate("category")} disabled={!selectedSubject}>
+              新增类目
+            </button>
           </div>
-          <div className="panelBody metricTable">
-            {scopedChapters.slice(0, 8).map((chapter) => (
-              <div key={chapter.id} className="metricRow">
-                <div>
-                  <strong>{chapter.name}</strong>
-                  <span className="muted">{chapter.path}</span>
-                </div>
-                <StatusBadge value={`${pointCountByChapter.get(chapter.id) || 0} 个`} tone="info" />
+          <div className="directoryCategoryList">
+            {chapterCategories.map((category) => {
+              const active = activeChapterCategory?.id === category.id;
+              const categoryChapters = scopedChapters.filter((chapter) => (
+                category.id === 0 ? !chapter.category_id : chapter.category_id === category.id
+              ));
+              const pointCount = category.id === 0
+                ? scopedPoints.filter((point) => !point.category_id).length
+                : (pointCountByCategory.get(category.id) || 0);
+              return (
+                <button
+                  key={category.id}
+                  className={active ? "directoryCategoryCard active" : "directoryCategoryCard"}
+                  type="button"
+                  onClick={() => {
+                    setSelectedChapterCategoryId(category.id);
+                    setSelectedChapterRootId(null);
+                  }}
+                >
+                  <div className="directoryCategoryCardMain">
+                    <span className="directoryCategoryEyebrow">{category.id === 0 ? "未归类" : "类目"}</span>
+                    <strong>{category.name}</strong>
+                    <small>{categoryChapters.length} 个章/节节点 · {pointCount} 个知识点相关节点</small>
+                  </div>
+                  <StatusBadge value={`${categoryChapters.length} 节点`} tone={active ? "good" : "info"} />
+                </button>
+              );
+            })}
+            {!chapterCategories.length && <div className="empty compact">暂无类目</div>}
+          </div>
+        </aside>
+
+        <section className="directoryStage">
+          <div className="directoryStageHeader">
+            <div className="directoryStageTitle">
+              <h2>{activeChapterCategory?.name || "目录主视图"}</h2>
+              <p>按“学科 → 类目 → 章 → 节 → 知识点 → 知识点详情”浏览，调整操作保留到后面的页签里。</p>
+              <div className="directoryStageMeta">
+                <StatusBadge value={`${rootChapters.length} 个章入口`} tone="info" />
+                <StatusBadge value={`${scopedChaptersForCategory.length} 个章/节节点`} tone="info" />
+                <StatusBadge value={`${rootPoints.length} 个知识点`} tone="good" />
+                <StatusBadge value={`${pointDetails.length} 个详情`} tone="good" />
               </div>
-            ))}
-            {!scopedChapters.length && <div className="empty compact">暂无章节</div>}
+            </div>
+            <div className="buttonRow">
+              <button className="button small" type="button" onClick={() => setActiveTab("chapters")}>
+                调整章 / 节
+              </button>
+              <button className="button small" type="button" onClick={() => setActiveTab("points")}>
+                调整知识点
+              </button>
+            </div>
           </div>
-        </div>
-        <div className="panel softPanel">
-          <div className="panelHeader">
-            <h2>映射准备度</h2>
-            <p>原始题映射依赖知识点名称、关键词、章节和类目。</p>
+
+          <div className="directoryStageBody">
+            {!activeChapterCategory && <div className="empty compact">请先新增类目，并在类目下维护章和节</div>}
+            {!!activeChapterCategory && !rootChapters.length && <div className="empty compact">当前类目下暂无章目录</div>}
+            {rootChapters.map((chapter) => renderOverviewChapterTree(chapter, true))}
           </div>
-          <div className="panelBody stackList">
-            <div className="detailRow"><span>知识点总数</span><strong>{scopedPoints.length}</strong></div>
-            <div className="detailRow"><span>绑定章节</span><strong>{scopedPoints.length - unmappedPoints}</strong></div>
-            <div className="detailRow"><span>未绑定章节</span><strong>{unmappedPoints}</strong></div>
-            <div className="detailRow"><span>教材资料</span><strong>{scopedTextbooks.length}</strong></div>
-          </div>
-        </div>
+        </section>
       </div>
     );
   }
@@ -765,54 +1210,176 @@ export default function SubjectCenterPage() {
     );
   }
 
-  function renderTextbooks() {
-    return (
-      <div className="stackList">
-        <div className="buttonRow">
-          <button className="button primary" type="button" onClick={() => beginCreate("textbook")} disabled={!selectedSubject}>
-            新增教材
-          </button>
-        </div>
-        <div className="metricTable">
-          {scopedTextbooks.map((textbook) => (
-            <button key={textbook.id} className="listButton" type="button" onClick={() => beginEdit("textbook", textbook)}>
-              <div>
-                <strong>{textbook.source_title}</strong>
-                <span className="muted">
-                  {[categoryName(textbook.category_id), textbook.source_version, textbook.year].filter(Boolean).join(" / ") || textbook.filename}
-                </span>
-              </div>
-              <StatusBadge value={textbook.parse_status} tone={textbook.parse_status === "parsed" ? "good" : "info"} />
-            </button>
-          ))}
-          {!scopedTextbooks.length && <div className="empty compact">暂无教材</div>}
-        </div>
-      </div>
-    );
-  }
-
   function renderChapters() {
     return (
       <div className="stackList">
         <div className="buttonRow">
           <button className="button primary" type="button" onClick={() => beginCreate("chapter")} disabled={!selectedSubject}>
-            新增章节
+            新增章 / 节
+          </button>
+          <button className="button danger" type="button" disabled={saving || !selectedChapterIds.length} onClick={deleteSelectedChapters}>
+            批量删除章 / 节
+          </button>
+          <button className="button" type="button" onClick={beginChapterImport} disabled={!selectedSubject}>
+            导入目录
+          </button>
+          <button className="button" type="button" onClick={beginPointImport} disabled={!selectedSubject}>
+            导入知识点
+          </button>
+          <button className="button" type="button" onClick={beginPointDetailImport} disabled={!selectedSubject || !rootPoints.length}>
+            导入知识点详情
           </button>
         </div>
-        <div className="metricTable">
-          {scopedChapters.map((chapter) => (
-            <button key={chapter.id} className="listButton" type="button" onClick={() => beginEdit("chapter", chapter)}>
+        {chapterImportOpen && (
+          <div className="editorPanel">
+            <div className="panelHeaderActions">
               <div>
-                <strong>{chapter.name}</strong>
-                <span className="muted">{chapter.path}</span>
+                <strong>导入章 / 节目录</strong>
+                <p className="muted">章 / 节会导入到当前选中的类目下，保存后会刷新当前学科中心数据。</p>
               </div>
-              <div className="badgeStack">
-                <StatusBadge value={`L${chapter.level}`} tone="info" />
-                <StatusBadge value={`${pointCountByChapter.get(chapter.id) || 0} 个知识点`} tone="good" />
+              <button className="button small" type="button" onClick={() => setChapterImportOpen(false)}>
+                取消
+              </button>
+            </div>
+            <form className="formGrid" onSubmit={submitChapterImport}>
+              <label className="field">
+                <span>Markdown 目录</span>
+                <textarea rows={10} value={chapterImportMarkdown} onChange={(event) => setChapterImportMarkdown(event.target.value)} />
+              </label>
+              <div className="buttonRow">
+                <button className="button primary" type="submit" disabled={importingChapters}>
+                  {importingChapters ? "导入中..." : "导入"}
+                </button>
               </div>
-            </button>
-          ))}
-          {!scopedChapters.length && <div className="empty compact">暂无章节</div>}
+            </form>
+          </div>
+        )}
+        {pointImportOpen && (
+          <div className="editorPanel">
+            <div className="panelHeaderActions">
+              <div>
+                <strong>导入知识点</strong>
+                <p className="muted">请按“章 / 节 / 知识点”结构粘贴 Markdown，保存后会自动绑定到当前类目下的对应章或节。</p>
+              </div>
+              <button className="button small" type="button" onClick={() => setPointImportOpen(false)}>
+                取消
+              </button>
+            </div>
+            <form className="formGrid" onSubmit={submitPointImport}>
+              <label className="field">
+                <span>Markdown 目录</span>
+                <textarea rows={10} value={pointImportMarkdown} onChange={(event) => setPointImportMarkdown(event.target.value)} />
+              </label>
+              <div className="buttonRow">
+                <button className="button primary" type="submit" disabled={importingPoints}>
+                  {importingPoints ? "导入中..." : "导入"}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+        {pointDetailImportOpen && (
+          <div className="editorPanel">
+            <div className="panelHeaderActions">
+              <div>
+                <strong>导入知识点详情</strong>
+                <p className="muted">请按“章 / 节 / 知识点 / 知识点详情”结构粘贴 Markdown，保存后会自动挂到当前类目下对应知识点。</p>
+              </div>
+              <button className="button small" type="button" onClick={() => setPointDetailImportOpen(false)}>
+                取消
+              </button>
+            </div>
+            <form className="formGrid" onSubmit={submitPointDetailImport}>
+              <label className="field">
+                <span>Markdown 目录</span>
+                <textarea rows={10} value={pointDetailImportMarkdown} onChange={(event) => setPointDetailImportMarkdown(event.target.value)} />
+              </label>
+              <div className="buttonRow">
+                <button className="button primary" type="submit" disabled={importingPointDetails}>
+                  {importingPointDetails ? "导入中..." : "导入"}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+        <div className="chapterDirectory">
+          <div className="chapterRootList">
+            {chapterCategories.map((category) => {
+              const active = activeChapterCategory?.id === category.id;
+              const categoryChapters = scopedChapters.filter((chapter) => (
+                category.id === 0 ? !chapter.category_id : chapter.category_id === category.id
+              ));
+              const pointCount = categoryChapters.reduce((total, chapter) => total + (pointCountByChapterTree.get(chapter.id) || 0), 0);
+              return (
+                <div key={category.id} className="selectableRow">
+                  <button
+                    className={active ? "chapterRootButton active" : "chapterRootButton"}
+                    type="button"
+                    onClick={() => {
+                      setSelectedChapterCategoryId(category.id);
+                      setSelectedChapterRootId(null);
+                    }}
+                  >
+                    <span>
+                      <strong>{category.name}</strong>
+                      <small>{categoryChapters.length} 个章/节节点 · {pointCount} 个知识点相关节点</small>
+                    </span>
+                    <StatusBadge value="类目" tone="info" />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          <div className="chapterSectionList">
+            {activeChapterCategory && (
+              <div className="chapterSectionHeader">
+                <div>
+                  <strong>{activeChapterCategory.name}</strong>
+                  <span className="muted">
+                    {rootChapters.length} 个章入口 · {scopedChaptersForCategory.length} 个章/节节点
+                  </span>
+                </div>
+              </div>
+            )}
+            {rootChapters.map((chapter) => {
+              const expanded = selectedChapterRoot ? selectedChapterRoot.id === chapter.id : true;
+              const sectionIds = [chapter.id, ...(childChaptersByParent.get(chapter.id) || []).map((item) => item.id)];
+              return (
+                <div key={chapter.id} className="stackList">
+                  <div className="chapterSectionHeader">
+                    <div>
+                      <strong>{chapter.name}</strong>
+                      <span className="muted">
+                        {(childChaptersByParent.get(chapter.id)?.length || 0)} 个节 · {pointCountByChapterTree.get(chapter.id) || 0} 个知识点相关节点
+                      </span>
+                    </div>
+                    <label className="rowCheck inlineCheck">
+                      <input
+                        type="checkbox"
+                        checked={sectionIds.every((id) => selectedChapterIds.includes(id))}
+                        onChange={() => toggleSectionGroupSelection(sectionIds)}
+                      />
+                      <span>全选本组</span>
+                    </label>
+                    <div className="buttonRow">
+                      <button className="button small" type="button" onClick={() => setSelectedChapterRootId(expanded ? null : chapter.id)}>
+                        {expanded ? "收起" : "展开"}
+                      </button>
+                      <button className="button small" type="button" onClick={() => beginEdit("chapter", chapter)}>
+                        编辑
+                      </button>
+                      <button className="button small danger" type="button" disabled={saving} onClick={() => deleteChapter(chapter)}>
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                  {expanded && renderSectionTree(chapter, { showCheckbox: true, showDelete: true, isRootChapter: true })}
+                </div>
+              );
+            })}
+            {!activeChapterCategory && <div className="empty compact">请先新增类目，并在类目下维护章和节</div>}
+          </div>
+          {!scopedChapters.length && <div className="empty compact">暂无章 / 节</div>}
         </div>
       </div>
     );
@@ -825,9 +1392,36 @@ export default function SubjectCenterPage() {
           <button className="button primary" type="button" onClick={() => beginCreate("point")} disabled={!selectedSubject}>
             新增知识点
           </button>
+          <button className="button" type="button" onClick={beginPointImport} disabled={!selectedSubject}>
+            导入知识点
+          </button>
         </div>
+        {pointImportOpen && (
+          <div className="editorPanel">
+            <div className="panelHeaderActions">
+              <div>
+                <strong>导入知识点</strong>
+                <p className="muted">请按“章 / 节 / 知识点”结构粘贴 Markdown，保存后会自动绑定到当前类目下的对应章或节。</p>
+              </div>
+              <button className="button small" type="button" onClick={() => setPointImportOpen(false)}>
+                取消
+              </button>
+            </div>
+            <form className="formGrid" onSubmit={submitPointImport}>
+              <label className="field">
+                <span>Markdown 目录</span>
+                <textarea rows={10} value={pointImportMarkdown} onChange={(event) => setPointImportMarkdown(event.target.value)} />
+              </label>
+              <div className="buttonRow">
+                <button className="button primary" type="submit" disabled={importingPoints}>
+                  {importingPoints ? "导入中..." : "导入"}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
         <div className="metricTable">
-          {scopedPoints.map((point) => (
+          {rootPoints.map((point) => (
             <button key={point.id} className="listButton" type="button" onClick={() => beginEdit("point", point)}>
               <div>
                 <strong>{point.name}</strong>
@@ -836,13 +1430,272 @@ export default function SubjectCenterPage() {
                   {[chapterName(point.chapter_id), categoryName(point.category_id), keywordPreview(point.keywords_json)].filter(Boolean).join(" / ")}
                 </span>
               </div>
-              <StatusBadge value={point.status} tone={point.status === "active" ? "good" : "info"} />
+              <div className="badgeStack">
+                <StatusBadge value={`${detailCountByPoint.get(point.id) || 0} 个详情`} tone="info" />
+                <StatusBadge value={point.status} tone={point.status === "active" ? "good" : point.status === "draft" ? "warn" : "info"} />
+              </div>
             </button>
           ))}
-          {!scopedPoints.length && <div className="empty compact">暂无知识点</div>}
+          {!rootPoints.length && <div className="empty compact">暂无知识点</div>}
         </div>
       </div>
     );
+  }
+
+  function renderPointDetails() {
+    return (
+      <div className="stackList">
+        <div className="buttonRow">
+          <button className="button primary" type="button" onClick={() => beginCreate("pointDetail")} disabled={!selectedSubject || !rootPoints.length}>
+            新增知识点详情
+          </button>
+          <button className="button" type="button" onClick={beginPointDetailImport} disabled={!selectedSubject || !rootPoints.length}>
+            导入知识点详情
+          </button>
+        </div>
+        {pointDetailImportOpen && (
+          <div className="editorPanel">
+            <div className="panelHeaderActions">
+              <div>
+                <strong>导入知识点详情</strong>
+                <p className="muted">请按“章 / 节 / 知识点 / 知识点详情”结构粘贴 Markdown，保存后会自动挂到当前类目下对应知识点。</p>
+              </div>
+              <button className="button small" type="button" onClick={() => setPointDetailImportOpen(false)}>
+                取消
+              </button>
+            </div>
+            <form className="formGrid" onSubmit={submitPointDetailImport}>
+              <label className="field">
+                <span>Markdown 目录</span>
+                <textarea rows={10} value={pointDetailImportMarkdown} onChange={(event) => setPointDetailImportMarkdown(event.target.value)} />
+              </label>
+              <div className="buttonRow">
+                <button className="button primary" type="submit" disabled={importingPointDetails}>
+                  {importingPointDetails ? "导入中..." : "导入"}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+        <div className="metricTable">
+          {pointDetails.map((point) => (
+            <button key={point.id} className="listButton" type="button" onClick={() => beginEdit("pointDetail", point)}>
+              <div>
+                <strong>{point.name}</strong>
+                <span className="muted">{point.description || point.path}</span>
+                <span className="muted">
+                  {[pointById.get(point.parent_id || 0)?.name || "", chapterName(point.chapter_id), keywordPreview(point.keywords_json)].filter(Boolean).join(" / ")}
+                </span>
+              </div>
+              <StatusBadge value={point.status} tone={point.status === "active" ? "good" : point.status === "draft" ? "warn" : "info"} />
+            </button>
+          ))}
+          {!pointDetails.length && <div className="empty compact">暂无知识点详情</div>}
+        </div>
+      </div>
+    );
+  }
+
+  function renderOverviewChapterTree(chapter: ChapterResponse, isRoot: boolean) {
+    const childSections = childChaptersByParent.get(chapter.id) || [];
+    const pointsInChapter = rootPointsByChapter.get(chapter.id) || [];
+    const detailCount = pointsInChapter.reduce((total, point) => total + (detailCountByPoint.get(point.id) || 0), 0);
+    const expanded = isRoot ? (selectedChapterRoot ? selectedChapterRoot.id === chapter.id : true) : true;
+    const summary = isRoot
+      ? `${childSections.length} 个节 · ${pointCountByChapterTree.get(chapter.id) || 0} 个知识点相关节点`
+      : `${pointsInChapter.length} 个知识点 · ${detailCount} 个详情`;
+
+    return (
+      <article key={chapter.id} className={isRoot ? "directoryNode root" : "directoryNode section"}>
+        <div className="directoryNodeHeader">
+          <div className="directoryNodeTitle">
+            <span className="chapterLevelPill section">{isRoot ? "章" : "节"}</span>
+            <div>
+              <strong>{chapter.name}</strong>
+              <small>{summary}</small>
+            </div>
+          </div>
+          <div className="directoryNodeTools">
+            {!isRoot && <StatusBadge value={`${detailCount} 个详情`} tone={detailCount ? "good" : "info"} />}
+            {isRoot && (
+              <button className="button small" type="button" onClick={() => setSelectedChapterRootId(expanded ? null : chapter.id)}>
+                {expanded ? "收起" : "展开"}
+              </button>
+            )}
+          </div>
+        </div>
+        {expanded && (
+          <div className="directoryNodeBody">
+            {!!childSections.length && (
+              <div className="directorySectionStack">
+                {childSections.map((child) => renderOverviewChapterTree(child, false))}
+              </div>
+            )}
+            {!!pointsInChapter.length && (
+              <div className="directoryPointGrid">
+                {pointsInChapter.map((point) => renderOverviewPointCard(point))}
+              </div>
+            )}
+            {!childSections.length && !pointsInChapter.length && <div className="directoryNodeEmpty">当前层级下还没有知识点</div>}
+          </div>
+        )}
+      </article>
+    );
+  }
+
+  function renderOverviewPointCard(point: KnowledgePointResponse) {
+    const details = pointDetailsByParent.get(point.id) || [];
+    const preview = point.description || keywordPreview(point.keywords_json) || "暂无知识点说明";
+    return (
+      <article key={point.id} className="directoryPointCard">
+        <div className="directoryPointHeader">
+          <span className="chapterLevelPill point">知识点</span>
+          <StatusBadge value={`${details.length} 个详情`} tone={details.length ? "good" : "info"} />
+        </div>
+        <strong className="directoryPointName">{point.name}</strong>
+        <p className="directoryPointMeta">{preview}</p>
+        {!!details.length && (
+          <div className="directoryDetailList">
+            {details.map((detail) => (
+              <div key={detail.id} className="directoryDetailItem">
+                <span className="directoryDetailLabel">详情</span>
+                <strong>{detail.name}</strong>
+                <small>{detail.description || keywordPreview(detail.keywords_json) || "暂无详情说明"}</small>
+              </div>
+            ))}
+          </div>
+        )}
+      </article>
+    );
+  }
+
+  function renderSectionTree(
+    chapter: ChapterResponse,
+    options: { showCheckbox: boolean; showDelete: boolean; isRootChapter?: boolean },
+  ) {
+    const childSections = childChaptersByParent.get(chapter.id) || [];
+    const pointsInChapter = rootPointsByChapter.get(chapter.id) || [];
+    const detailCount = pointsInChapter.reduce((total, point) => total + (detailCountByPoint.get(point.id) || 0), 0);
+
+    return (
+      <div key={chapter.id} className="chapterSectionTree">
+        <div className="chapterSectionShell">
+          {options.showCheckbox && (
+            <label className="rowCheck chapterTreeCheck">
+              <input
+                type="checkbox"
+                checked={selectedChapterIds.includes(chapter.id)}
+                onChange={() => toggleChapterSelection(chapter.id)}
+              />
+            </label>
+          )}
+          <div className="chapterSectionCard">
+            <div className="chapterSectionCardTop">
+              <button className="chapterSectionCardButton" type="button" onClick={() => beginEdit("chapter", chapter)}>
+                <div className="chapterSectionCardTitle">
+                  <span className="chapterLevelPill section">{options.isRootChapter ? "章" : "节"}</span>
+                  <div>
+                    <strong>{chapter.name}</strong>
+                    <small>{pointsInChapter.length} 个知识点 · {detailCount} 个详情</small>
+                  </div>
+                </div>
+              </button>
+              <div className="chapterNodeActions compact">
+                <button className="button small" type="button" onClick={() => beginCreatePointForChapter(chapter)}>
+                  新增知识点
+                </button>
+                {options.showDelete && (
+                  <button className="button small danger" type="button" disabled={saving} onClick={() => deleteChapter(chapter)}>
+                    删除
+                  </button>
+                )}
+              </div>
+            </div>
+            {!!childSections.length && (
+              <div className="chapterSectionList">
+                {childSections.map((child) => renderSectionTree(child, { showCheckbox: true, showDelete: true, isRootChapter: false }))}
+              </div>
+            )}
+            <div className="chapterTreeLane">
+              {pointsInChapter.map((point) => {
+                const details = pointDetailsByParent.get(point.id) || [];
+                return (
+                  <div key={point.id} className="chapterTreeNode">
+                    <div className="chapterPointNode">
+                      <button className="chapterTreeButton point" type="button" onClick={() => beginEdit("point", point)}>
+                        <div className="chapterTreeButtonMain">
+                          <span className="chapterLevelPill point">知识点</span>
+                          <div>
+                            <strong>{point.name}</strong>
+                            <small>{point.description || keywordPreview(point.keywords_json) || "点击编辑知识点说明"}</small>
+                          </div>
+                        </div>
+                        <div className="badgeStack">
+                          <StatusBadge value={`${details.length} 个详情`} tone="good" />
+                        </div>
+                      </button>
+                      <div className="chapterNodeActions compact">
+                        <button className="button small" type="button" onClick={() => beginCreatePointDetailForPoint(point)}>
+                          新增详情
+                        </button>
+                      </div>
+                    </div>
+                    {!!details.length && (
+                      <div className="chapterDetailLane">
+                        {details.map((detail) => (
+                          <button key={detail.id} className="chapterTreeButton detail" type="button" onClick={() => beginEdit("pointDetail", detail)}>
+                            <div className="chapterTreeButtonMain">
+                              <span className="chapterLevelPill detail">详情</span>
+                              <div>
+                                <strong>{detail.name}</strong>
+                                <small>{detail.description || keywordPreview(detail.keywords_json) || "点击编辑详情说明"}</small>
+                              </div>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {!pointsInChapter.length && !childSections.length && <div className="empty compact">当前层级下还没有知识点</div>}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function updatePointCategory(categoryId: string) {
+    const numericCategoryId = toNullableNumber(categoryId);
+    if (!numericCategoryId) {
+      setPointForm((current) => ({ ...current, category_id: "", chapter_id: "", path: "" }));
+      return;
+    }
+    const nextOptions = bindableChaptersByCategory.get(numericCategoryId) || [];
+    setPointForm((current) => {
+      const currentChapterId = toNullableNumber(current.chapter_id);
+      const nextChapterId = nextOptions.some((chapter) => chapter.id === currentChapterId)
+        ? current.chapter_id
+        : (nextOptions[0] ? String(nextOptions[0].id) : "");
+      return {
+        ...current,
+        category_id: categoryId,
+        chapter_id: nextChapterId,
+        path: "",
+      };
+    });
+  }
+
+  function updatePointDetailParent(parentId: string, currentItem: KnowledgePointResponse | null) {
+    const selectedParent = rootPoints.find((point) => point.id === toNullableNumber(parentId)) || null;
+    setPointForm((current) => ({
+      ...current,
+      parent_id: parentId,
+      category_id: selectedParent?.category_id ? String(selectedParent.category_id) : "",
+      chapter_id: selectedParent?.chapter_id ? String(selectedParent.chapter_id) : "",
+      path: selectedParent && currentItem?.parent_id !== selectedParent.id ? "" : current.path,
+    }));
   }
 
   function categoryName(categoryId?: number | null) {
@@ -866,7 +1719,15 @@ function SubmitButton({ saving }: { saving: boolean }) {
 
 function editorTitle(type: EditableType, isEdit: boolean): string {
   const action = isEdit ? "编辑" : "新增";
-  const label = type === "subject" ? "学科" : type === "category" ? "类目" : type === "textbook" ? "教材" : type === "chapter" ? "章节" : "知识点";
+  const label = type === "subject"
+    ? "学科"
+    : type === "category"
+      ? "类目"
+      : type === "chapter"
+          ? "章 / 节"
+          : type === "pointDetail"
+            ? "知识点详情"
+            : "知识点";
   return `${action}${label}`;
 }
 

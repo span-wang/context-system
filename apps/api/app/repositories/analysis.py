@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 
 from sqlalchemy import select
 
-from app.models import AnalysisJob, AnalysisReport, ExamPaper, ExamQuestion, KnowledgePoint, QuestionKnowledgeLink, Subject
+from app.models import AnalysisJob, AnalysisReport, Chapter, ExamPaper, ExamQuestion, KnowledgePoint, QuestionKnowledgeLink, Subject, SubjectCategory
 from app.repositories.base import Repository
 
 
@@ -29,6 +29,12 @@ class AnalysisRepository(Repository):
 
     def list_knowledge_points(self) -> list[KnowledgePoint]:
         return list(self.session.scalars(select(KnowledgePoint).order_by(KnowledgePoint.id.asc())))
+
+    def list_chapters(self) -> list[Chapter]:
+        return list(self.session.scalars(select(Chapter).order_by(Chapter.sort_order.asc(), Chapter.id.asc())))
+
+    def list_categories(self) -> list[SubjectCategory]:
+        return list(self.session.scalars(select(SubjectCategory).order_by(SubjectCategory.sort_order.asc(), SubjectCategory.id.asc())))
 
     def list_question_knowledge_links(self) -> list[QuestionKnowledgeLink]:
         return list(self.session.scalars(select(QuestionKnowledgeLink).order_by(QuestionKnowledgeLink.id.asc())))

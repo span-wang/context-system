@@ -6,7 +6,8 @@ param(
   [string]$MySqlDatabase = "exam_kit_local",
   [switch]$NoInstall,
   [switch]$NoBrowser,
-  [switch]$NoTunnel
+  [switch]$NoTunnel,
+  [string]$TunnelConfigPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,8 +22,19 @@ $VenvDir = Join-Path $ApiDir ".venv"
 $PythonExe = Join-Path $VenvDir "Scripts\python.exe"
 $PipExe = Join-Path $VenvDir "Scripts\pip.exe"
 $PipCacheDir = Join-Path $CacheDir "pip"
-$TunnelScript = Join-Path $Root "deploy\cloudflare\start_named_tunnel.bat"
-$TunnelConfig = Join-Path $Root "deploy\cloudflare\config.yml"
+$TunnelExe = Join-Path $Root "deploy\cloudflare\cloudflared.exe"
+if (-not (Test-Path -LiteralPath $TunnelExe -PathType Leaf)) {
+  $TunnelExe = Join-Path $Root "deploy\cloudflare\cloudflared_run.exe"
+}
+$TunnelConfig = if ($TunnelConfigPath) {
+  if ([System.IO.Path]::IsPathRooted($TunnelConfigPath)) {
+    $TunnelConfigPath
+  } else {
+    Join-Path $Root $TunnelConfigPath
+  }
+} else {
+  Join-Path $Root "deploy\cloudflare\config.yml"
+}
 $LocalMySqlScript = Join-Path $Root "scripts\start-local-mysql.ps1"
 $LocalMySqlInfoPath = Join-Path $RunDir "mysql-local-$MySqlPort.json"
 $LocalMySqlDbUrl = $null
@@ -88,25 +100,45 @@ function Save-Pid([string]$Name, [int]$ProcessId) {
   Set-Content -LiteralPath (Join-Path $RunDir "$Name.pid") -Value $ProcessId -Encoding ascii
 }
 
+function Get-TunnelHostnames {
+  if (-not (Test-Path -LiteralPath $TunnelConfig -PathType Leaf)) {
+    return @()
+  }
+  $lines = Get-Content -LiteralPath $TunnelConfig -ErrorAction SilentlyContinue
+  $hosts = @()
+  foreach ($line in $lines) {
+    if ($line -match '^\s*-\s+hostname:\s*(.+?)\s*$' -or $line -match '^\s*hostname:\s*(.+?)\s*$') {
+      $tunnelHostname = $matches[1].Trim().Trim("'`"")
+      if ($tunnelHostname) {
+        $hosts += $tunnelHostname
+      }
+    }
+  }
+  return @($hosts | Select-Object -Unique)
+}
+
 function Start-TunnelIfReady {
   if ($NoTunnel) {
     Write-Host "Tunnel: disabled by switch." -ForegroundColor DarkYellow
     return
   }
-  if (-not (Test-Path -LiteralPath $TunnelScript -PathType Leaf)) {
-    Write-Host "Tunnel: skipped because start_named_tunnel.bat is missing." -ForegroundColor DarkYellow
+  if (-not (Test-Path -LiteralPath $TunnelExe -PathType Leaf)) {
+    Write-Host "Tunnel: skipped because cloudflared executable is missing." -ForegroundColor DarkYellow
     return
   }
   if (-not (Test-Path -LiteralPath $TunnelConfig -PathType Leaf)) {
-    Write-Host "Tunnel: skipped because deploy\\cloudflare\\config.yml is missing." -ForegroundColor DarkYellow
+    Write-Host "Tunnel: skipped because tunnel config is missing: $TunnelConfig" -ForegroundColor DarkYellow
     return
   }
 
   Write-Step "Start Cloudflare named tunnel"
   $tunnelOut = Join-Path $LogDir "tunnel.out.log"
   $tunnelErr = Join-Path $LogDir "tunnel.err.log"
-  $tunnelProc = Start-Process -FilePath $TunnelScript `
-    -WorkingDirectory $Root `
+  $tunnelConfigDir = Split-Path -Parent $TunnelConfig
+  $tunnelConfigFile = Split-Path -Leaf $TunnelConfig
+  $tunnelProc = Start-Process -FilePath $TunnelExe `
+    -ArgumentList @("tunnel", "--config", $tunnelConfigFile, "--protocol", "http2", "run") `
+    -WorkingDirectory $tunnelConfigDir `
     -WindowStyle Hidden `
     -RedirectStandardOutput $tunnelOut `
     -RedirectStandardError $tunnelErr `
@@ -114,12 +146,18 @@ function Start-TunnelIfReady {
   Save-Pid "tunnel" $tunnelProc.Id
 }
 
-function Save-PortInfo([int]$Api, [int]$Web) {
+function Save-PortInfo([int]$Api, [int]$Web, [string[]]$PublicHosts) {
+  $publicUrl = $null
+  if ($PublicHosts -and $PublicHosts.Count -gt 0) {
+    $publicUrl = "https://$($PublicHosts[0])"
+  }
   $json = @{
     api_port = $Api
     web_port = $Web
     api_base = "http://127.0.0.1:$Api"
     web_url = "http://127.0.0.1:$Web"
+    public_web_url = $publicUrl
+    public_hostnames = @($PublicHosts)
     use_local_mysql = [bool]$UseLocalMySql
     mysql_port = if ($UseLocalMySql) { $MySqlPort } else { $null }
     mysql_db_url = if ($UseLocalMySql) { $LocalMySqlDbUrl } else { $null }
@@ -249,6 +287,9 @@ if ($UseLocalMySql -and $ProjectNextDevProcesses.Count -gt 0) {
 
 Start-LocalMySqlIfRequested
 
+$TunnelHosts = Get-TunnelHostnames
+$PublicWebUrl = if ($TunnelHosts.Count -gt 0) { "https://$($TunnelHosts[0])" } else { $null }
+
 if (-not (Test-Http $ApiHealth)) {
   Write-Step "Start API: $ApiHealth"
   $apiOut = Join-Path $LogDir "api.out.log"
@@ -290,12 +331,20 @@ if ((-not $ReuseExistingWeb) -and (-not (Test-Http $WebUrl))) {
   $oldApiProxyTarget = $env:API_PROXY_TARGET
   $oldLayoutProxyTarget = $env:LAYOUT_PROXY_TARGET
   $oldLayoutPublicUrl = $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL
+  $oldAllowedDevOrigins = $env:NEXT_ALLOWED_DEV_ORIGINS
+  $oldPublicWebOrigin = $env:PUBLIC_WEB_ORIGIN
+  $oldPublicWebUrl = $env:PUBLIC_WEB_URL
   $env:API_PROXY_TARGET = "http://127.0.0.1:$ApiPort"
   if (-not $env:LAYOUT_PROXY_TARGET) {
     $env:LAYOUT_PROXY_TARGET = "https://xhs.panspan.cloud"
   }
   if (-not $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL) {
     $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL = "https://xhs.panspan.cloud"
+  }
+  if ($TunnelHosts.Count -gt 0) {
+    $env:NEXT_ALLOWED_DEV_ORIGINS = ($TunnelHosts -join ",")
+    $env:PUBLIC_WEB_ORIGIN = $TunnelHosts[0]
+    $env:PUBLIC_WEB_URL = $PublicWebUrl
   }
   try {
     $webOut = Join-Path $LogDir "web.out.log"
@@ -312,13 +361,16 @@ if ((-not $ReuseExistingWeb) -and (-not (Test-Http $WebUrl))) {
     $env:API_PROXY_TARGET = $oldApiProxyTarget
     $env:LAYOUT_PROXY_TARGET = $oldLayoutProxyTarget
     $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL = $oldLayoutPublicUrl
+    $env:NEXT_ALLOWED_DEV_ORIGINS = $oldAllowedDevOrigins
+    $env:PUBLIC_WEB_ORIGIN = $oldPublicWebOrigin
+    $env:PUBLIC_WEB_URL = $oldPublicWebUrl
   }
   if (-not (Wait-Http $WebUrl 90)) {
     throw "Web startup timed out. Check log: $webErr"
   }
 }
 
-Save-PortInfo $ApiPort $WebPort
+Save-PortInfo $ApiPort $WebPort $TunnelHosts
 Start-TunnelIfReady
 
 Write-Host ""
@@ -328,8 +380,10 @@ Write-Host "API: http://127.0.0.1:$ApiPort"
 if ($UseLocalMySql) {
   Write-Host "MySQL: $LocalMySqlDbUrl"
 }
-if ((-not $NoTunnel) -and (Test-Path -LiteralPath $TunnelConfig -PathType Leaf)) {
-  Write-Host "Tunnel: https://context.panspan.cloud"
+if ($PublicWebUrl) {
+  Write-Host "Public Web: $PublicWebUrl"
+} elseif ((-not $NoTunnel) -and (Test-Path -LiteralPath $TunnelConfig -PathType Leaf)) {
+  Write-Host "Tunnel: configured, but no hostname was parsed from deploy\\cloudflare\\config.yml" -ForegroundColor DarkYellow
 }
 Write-Host "Logs: $LogDir"
 

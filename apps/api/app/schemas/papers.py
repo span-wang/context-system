@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from app.schemas.common import ORMModel
@@ -15,8 +17,11 @@ class PaperParseResponse(ORMModel):
     tagged_count: int
     preview: str | None = None
     provider: str | None = None
+    output_format: Literal["markdown", "text"] = "markdown"
     warnings: list[str] = Field(default_factory=list)
     parse_options: dict[str, object] = Field(default_factory=dict)
+    dataset_sample_path: str | None = None
+    dataset_auto_exported: bool = False
 
 
 class PaperParseJobResponse(ORMModel):
@@ -47,6 +52,7 @@ class PaperDeleteResponse(ORMModel):
 
 class PaperSummary(ORMModel):
     id: int
+    subject_id: int | None = None
     paper_name: str
     paper_code: str | None = None
     category: str | None = None
@@ -76,4 +82,8 @@ class PaperDetailResponse(PaperSummary):
     subject_name: str | None = None
     asset_filename: str | None = None
     asset_parse_status: str | None = None
+    active_parse_job_id: int | None = None
+    active_parse_job_status: str | None = None
+    active_parse_stage: str | None = None
+    active_parse_progress: int | None = None
     sections: list[PaperSectionResponse]

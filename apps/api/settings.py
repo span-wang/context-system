@@ -159,6 +159,7 @@ class SubjectConfig(BaseModel):
     id: str
     name: str
     categories: list[str] = Field(default_factory=list)
+    platform_id: int | None = None
 
 
 class Settings(BaseModel):
@@ -171,13 +172,25 @@ class Settings(BaseModel):
     subjects: list[SubjectConfig] = Field(default_factory=list)
 
 
+def list_subject_configs() -> list[SubjectConfig]:
+    platform_subjects = _load_platform_subject_configs()
+    if platform_subjects:
+        return platform_subjects
+    return get_settings().subjects
+
+
 def normalize_subject_name(subject: str) -> str | None:
     value = subject.strip()
     if not value:
         return None
     value_lower = value.lower()
-    for configured in get_settings().subjects:
-        if value == configured.name or value == configured.id or value_lower == configured.id.lower():
+    for configured in list_subject_configs():
+        if (
+            value == configured.name
+            or value == configured.id
+            or value_lower == configured.id.lower()
+            or (configured.platform_id is not None and value == str(configured.platform_id))
+        ):
             return configured.name
     return None
 
@@ -232,3 +245,46 @@ def get_settings() -> Settings:
     if settings.db.url.startswith("sqlite:///") and settings.db.url != "sqlite:///:memory:":
         settings.db.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     return settings
+
+
+def _load_platform_subject_configs() -> list[SubjectConfig]:
+    try:
+        from sqlalchemy import select
+
+        from app.db.session import SessionLocal
+        from app.models import Subject, SubjectCategory
+    except Exception:
+        return []
+
+    try:
+        with SessionLocal() as session:
+            subjects = session.scalars(select(Subject).order_by(Subject.id.asc())).all()
+            categories = session.scalars(
+                select(SubjectCategory).order_by(
+                    SubjectCategory.subject_id.asc(),
+                    SubjectCategory.sort_order.asc(),
+                    SubjectCategory.id.asc(),
+                )
+            ).all()
+    except Exception:
+        return []
+
+    if not subjects:
+        return []
+
+    categories_by_subject: dict[int, list[str]] = {}
+    for category in categories:
+        values = categories_by_subject.setdefault(int(category.subject_id), [])
+        if category.name not in values:
+            values.append(category.name)
+
+    return [
+        SubjectConfig(
+            id=(subject.code or str(subject.id)).strip(),
+            name=subject.name,
+            categories=categories_by_subject.get(int(subject.id), []),
+            platform_id=int(subject.id),
+        )
+        for subject in subjects
+        if str(subject.name).strip()
+    ]

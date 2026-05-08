@@ -217,7 +217,7 @@ export default function WorkflowPage() {
       return;
     }
     if (!form.subject) {
-      setMessage("请先在设置页添加学科。");
+      setMessage("请先在学科中心添加学科。");
       return;
     }
     setSaving(true);
@@ -410,7 +410,7 @@ export default function WorkflowPage() {
                   value={form.subject}
                   onChange={(event) => setForm(selectSubject(form, subjects, event.target.value))}
                 >
-                  {!subjects.length && <option value="">请先添加学科</option>}
+                  {!subjects.length && <option value="">请先在学科中心添加学科</option>}
                   {subjects.map((subject) => (
                     <option key={subject.id} value={subject.name}>
                       {subject.name}

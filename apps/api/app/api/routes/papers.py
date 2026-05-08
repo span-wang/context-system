@@ -16,7 +16,7 @@ from app.schemas.papers import (
 from app.services.audit import AuditService
 from app.services.paper_parse_jobs import start_paper_parse_job
 from app.services.papers import PaperService
-from library.parse_options import DocumentParseOptions, ParsePreset
+from library.parse_options import DocumentParseOptions, ParseOutputFormat, ParsePreset
 
 
 router = APIRouter(prefix="/api/papers", tags=["papers"])
@@ -73,6 +73,7 @@ async def upload_paper(
 def parse_paper(
     paper_id: int,
     preset: ParsePreset = Form("auto"),
+    output_format: ParseOutputFormat = Form("markdown"),
     force_ocr: bool | None = Form(None),
     render_dpi: int | None = Form(None),
     crop_header_ratio: float | None = Form(None),
@@ -81,11 +82,13 @@ def parse_paper(
     remove_repeated_lines: bool | None = Form(None),
     watermark_detection: bool | None = Form(None),
     enable_formula_recognition: bool | None = Form(None),
+    pdf_page_chunk_size: int | None = Form(None, ge=1, le=50),
     session: Session = Depends(get_session),
     current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "reviewer")),
 ) -> PaperParseResponse:
     options = DocumentParseOptions(
         preset=preset,
+        output_format=output_format,
         force_ocr=force_ocr,
         render_dpi=render_dpi,
         crop_header_ratio=crop_header_ratio,
@@ -94,6 +97,7 @@ def parse_paper(
         remove_repeated_lines=remove_repeated_lines,
         watermark_detection=watermark_detection,
         enable_formula_recognition=enable_formula_recognition,
+        pdf_page_chunk_size=pdf_page_chunk_size,
     )
     result = PaperService(session).parse_paper(paper_id, options=options)
     AuditService(session).log(
@@ -116,6 +120,7 @@ def parse_paper(
 def start_parse_paper_job(
     paper_id: int,
     preset: ParsePreset = Form("auto"),
+    output_format: ParseOutputFormat = Form("markdown"),
     force_ocr: bool | None = Form(None),
     render_dpi: int | None = Form(None),
     crop_header_ratio: float | None = Form(None),
@@ -124,11 +129,13 @@ def start_parse_paper_job(
     remove_repeated_lines: bool | None = Form(None),
     watermark_detection: bool | None = Form(None),
     enable_formula_recognition: bool | None = Form(None),
+    pdf_page_chunk_size: int | None = Form(None, ge=1, le=50),
     session: Session = Depends(get_session),
     current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "reviewer")),
 ) -> PaperParseJobResponse:
     options = DocumentParseOptions(
         preset=preset,
+        output_format=output_format,
         force_ocr=force_ocr,
         render_dpi=render_dpi,
         crop_header_ratio=crop_header_ratio,
@@ -137,6 +144,7 @@ def start_parse_paper_job(
         remove_repeated_lines=remove_repeated_lines,
         watermark_detection=watermark_detection,
         enable_formula_recognition=enable_formula_recognition,
+        pdf_page_chunk_size=pdf_page_chunk_size,
     )
     job = start_paper_parse_job(session, paper_id, options)
     job_id = job.id

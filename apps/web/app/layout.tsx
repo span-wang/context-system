@@ -13,7 +13,7 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="zh-CN">
+    <html lang="zh-CN" suppressHydrationWarning>
       <head>
         <Script
           id="strip-injected-text-size-adjust"
@@ -89,7 +89,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           }}
         />
       </head>
-      <body>
+      <body suppressHydrationWarning>
         <Nav />
         <main className="pageShell">{children}</main>
       </body>

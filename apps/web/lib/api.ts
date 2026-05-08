@@ -15,6 +15,7 @@ export type ContentType =
 export type ReviewMode = "llm_only" | "document_only" | "hybrid";
 export type ReviewItemStatus = "pending" | "confirmed" | "replaced" | "skipped";
 export type ParsePreset = "auto" | "fast" | "balanced" | "accurate" | "formula";
+export type ParseOutputFormat = "markdown" | "text";
 export type WorkflowTopicStatus =
   | "idea"
   | "planned"
@@ -60,11 +61,59 @@ export type LibraryFilePreview = {
   provider: string;
   text: string;
   markdown: string;
+  content: string;
+  output_format: ParseOutputFormat;
   table_count: number;
   warning_count: number;
   warnings: string[];
   truncated: boolean;
   parse_options: Record<string, unknown>;
+};
+
+export type LibraryParseResultSummary = {
+  id: string;
+  file_id: string;
+  sequence_number: number;
+  provider: string;
+  token_count: number;
+  created_at: string;
+};
+
+export type LibraryReparseResponse = LibraryFilePreview & {
+  stored_result_id: string;
+  stored_sequence_number: number;
+  kept_results: LibraryParseResultSummary[];
+};
+
+export type LibraryParseMode = "preview" | "reparse";
+
+export type LibraryParseJobResponse = {
+  job_id: number;
+  file_id: string;
+  mode: LibraryParseMode;
+  status: string;
+  progress: number;
+};
+
+export type LibraryParseJobStatus = {
+  id: number;
+  job_type: string;
+  scope_type: string;
+  scope_config_json?: {
+    stage?: string;
+    detail?: Record<string, unknown>;
+    file_id?: string;
+    filename?: string;
+    mode?: LibraryParseMode;
+    [key: string]: unknown;
+  } | null;
+  status: string;
+  progress: number;
+  result_summary_json?: Record<string, unknown> | null;
+  error_message?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  created_at: string;
 };
 
 export type LayoutMode = {
@@ -269,6 +318,7 @@ export type SubjectConfig = {
   id: string;
   name: string;
   categories: string[];
+  platform_id?: number | null;
 };
 
 export type RAGFlowDataset = {

@@ -8,6 +8,8 @@ type RawPortsPayload = {
   api_port?: unknown;
   web_url?: unknown;
   web_port?: unknown;
+  public_web_url?: unknown;
+  public_hostnames?: unknown;
   use_local_mysql?: unknown;
   mysql_port?: unknown;
   mysql_db_url?: unknown;
@@ -114,6 +116,10 @@ export async function GET() {
     const webUrl = asNullableString(payload.web_url);
     const apiPort = asNullableNumber(payload.api_port);
     const webPort = asNullableNumber(payload.web_port);
+    const publicWebUrl = asNullableString(payload.public_web_url);
+    const publicHostnames = Array.isArray(payload.public_hostnames)
+      ? payload.public_hostnames.map((item) => asNullableString(item)).filter((item): item is string => Boolean(item))
+      : [];
     const mysqlPort = asNullableNumber(payload.mysql_port);
     const [apiProbe, webProbe, mysqlProbe] = await Promise.all([
       probeHttp(apiBase ? `${apiBase}/api/system/healthz` : null),
@@ -128,6 +134,8 @@ export async function GET() {
       api_port: apiPort,
       web_url: webUrl,
       web_port: webPort,
+      public_web_url: publicWebUrl,
+      public_hostnames: publicHostnames,
       use_local_mysql: asNullableBoolean(payload.use_local_mysql),
       mysql_port: mysqlPort,
       mysql_db_url: asNullableString(payload.mysql_db_url),
@@ -154,6 +162,8 @@ export async function GET() {
       api_port: null,
       web_url: null,
       web_port: null,
+      public_web_url: null,
+      public_hostnames: [],
       use_local_mysql: null,
       mysql_port: null,
       mysql_db_url: null,

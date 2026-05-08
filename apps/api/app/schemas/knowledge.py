@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from app.schemas.common import ORMModel
@@ -18,6 +20,31 @@ class SubjectResponse(ORMModel):
     status: str
 
 
+class SubjectDeleteResponse(BaseModel):
+    id: int
+    name: str
+    deleted: bool
+
+
+class BatchDeleteRequest(BaseModel):
+    ids: list[int] = Field(min_length=1)
+
+
+class SubjectDeleteSkippedItem(BaseModel):
+    id: int
+    name: str | None = None
+    reason: str
+
+
+class SubjectBatchDeleteResponse(BaseModel):
+    requested_count: int
+    deleted_count: int
+    skipped_count: int
+    deleted: list[SubjectDeleteResponse]
+    skipped: list[SubjectDeleteSkippedItem]
+    message: str
+
+
 class SubjectCategoryUpsertRequest(BaseModel):
     subject_id: int
     name: str
@@ -33,6 +60,7 @@ class SubjectCategoryResponse(ORMModel):
 
 class ChapterUpsertRequest(BaseModel):
     subject_id: int
+    category_id: int | None = None
     parent_id: int | None = None
     name: str
     level: int | None = None
@@ -43,11 +71,42 @@ class ChapterUpsertRequest(BaseModel):
 class ChapterResponse(ORMModel):
     id: int
     subject_id: int
+    category_id: int | None = None
     parent_id: int | None = None
     name: str
     level: int
     path: str
     sort_order: int
+
+
+class ChapterDeleteResponse(BaseModel):
+    id: int
+    name: str
+    deleted: bool
+    removed_chapter_count: int
+    unbound_point_count: int
+
+
+class ChapterBatchDeleteResponse(BaseModel):
+    requested_count: int
+    removed_chapter_count: int
+    unbound_point_count: int
+    missing_count: int
+    message: str
+
+
+class ChapterMarkdownImportRequest(BaseModel):
+    subject_id: int
+    category_id: int
+    markdown: str = Field(min_length=1)
+
+
+class ChapterMarkdownImportResponse(BaseModel):
+    subject_id: int
+    chapter_created: int
+    chapter_skipped: int
+    chapters: list[ChapterResponse]
+    message: str
 
 
 class KnowledgePointUpsertRequest(BaseModel):
@@ -79,6 +138,21 @@ class KnowledgePointResponse(ORMModel):
     sort_order: int
 
 
+class KnowledgePointMarkdownImportRequest(BaseModel):
+    subject_id: int
+    category_id: int | None = None
+    markdown: str = Field(min_length=1)
+    import_mode: Literal["point", "detail"] = "point"
+
+
+class KnowledgePointMarkdownImportResponse(BaseModel):
+    subject_id: int
+    point_created: int
+    point_skipped: int
+    points: list[KnowledgePointResponse]
+    message: str
+
+
 class TextbookUpsertRequest(BaseModel):
     subject_id: int
     category_id: int | None = None
@@ -106,3 +180,22 @@ class TextbookResponse(ORMModel):
     ocr_status: str
     token_count: int | None = None
     file_size: int
+
+
+class TextbookAutoBuildRequest(BaseModel):
+    max_chapters: int = Field(default=12, ge=1, le=30)
+    knowledge_points_per_chapter: int = Field(default=4, ge=1, le=8)
+
+
+class TextbookAutoBuildResponse(BaseModel):
+    textbook_id: int
+    subject_id: int
+    source: str
+    chapter_created: int
+    chapter_skipped: int
+    point_created: int
+    point_skipped: int
+    review_task_created: int
+    chapters: list[ChapterResponse]
+    points: list[KnowledgePointResponse]
+    message: str

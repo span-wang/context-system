@@ -171,6 +171,8 @@ export type RuntimePortsResponse = {
   api_port?: number | null;
   web_url?: string | null;
   web_port?: number | null;
+  public_web_url?: string | null;
+  public_hostnames?: string[];
   use_local_mysql?: boolean | null;
   mysql_port?: number | null;
   mysql_db_url?: string | null;
@@ -246,7 +248,29 @@ export type SubjectResponse = {
   status: string;
 };
 
+export type SubjectDeleteResponse = {
+  id: number;
+  name: string;
+  deleted: boolean;
+};
+
+export type SubjectDeleteSkippedItem = {
+  id: number;
+  name?: string | null;
+  reason: string;
+};
+
+export type SubjectBatchDeleteResponse = {
+  requested_count: number;
+  deleted_count: number;
+  skipped_count: number;
+  deleted: SubjectDeleteResponse[];
+  skipped: SubjectDeleteSkippedItem[];
+  message: string;
+};
+
 export type ParsePreset = "auto" | "fast" | "balanced" | "accurate" | "formula";
+export type ParseOutputFormat = "markdown" | "text";
 
 export type SubjectCategoryResponse = {
   id: number;
@@ -258,11 +282,36 @@ export type SubjectCategoryResponse = {
 export type ChapterResponse = {
   id: number;
   subject_id: number;
+  category_id?: number | null;
   parent_id?: number | null;
   name: string;
   level: number;
   path: string;
   sort_order: number;
+};
+
+export type ChapterDeleteResponse = {
+  id: number;
+  name: string;
+  deleted: boolean;
+  removed_chapter_count: number;
+  unbound_point_count: number;
+};
+
+export type ChapterBatchDeleteResponse = {
+  requested_count: number;
+  removed_chapter_count: number;
+  unbound_point_count: number;
+  missing_count: number;
+  message: string;
+};
+
+export type ChapterMarkdownImportResponse = {
+  subject_id: number;
+  chapter_created: number;
+  chapter_skipped: number;
+  chapters: ChapterResponse[];
+  message: string;
 };
 
 export type KnowledgePointResponse = {
@@ -278,6 +327,14 @@ export type KnowledgePointResponse = {
   keywords_json?: string[] | null;
   status: string;
   sort_order: number;
+};
+
+export type KnowledgePointMarkdownImportResponse = {
+  subject_id: number;
+  point_created: number;
+  point_skipped: number;
+  points: KnowledgePointResponse[];
+  message: string;
 };
 
 export type TextbookResponse = {
@@ -296,8 +353,23 @@ export type TextbookResponse = {
   file_size: number;
 };
 
+export type TextbookAutoBuildResponse = {
+  textbook_id: number;
+  subject_id: number;
+  source: string;
+  chapter_created: number;
+  chapter_skipped: number;
+  point_created: number;
+  point_skipped: number;
+  review_task_created: number;
+  chapters: ChapterResponse[];
+  points: KnowledgePointResponse[];
+  message: string;
+};
+
 export type PaperSummary = {
   id: number;
+  subject_id?: number | null;
   paper_name: string;
   paper_code?: string | null;
   category?: string | null;
@@ -323,8 +395,11 @@ export type PaperParseResponse = {
   tagged_count: number;
   preview?: string | null;
   provider?: string | null;
+  output_format: ParseOutputFormat;
   warnings: string[];
   parse_options: Record<string, unknown>;
+  dataset_sample_path?: string | null;
+  dataset_auto_exported?: boolean;
 };
 
 export type PaperParseJobResponse = {
@@ -368,6 +443,10 @@ export type PaperDetailResponse = PaperSummary & {
   category?: string | null;
   asset_filename?: string | null;
   asset_parse_status?: string | null;
+  active_parse_job_id?: number | null;
+  active_parse_job_status?: string | null;
+  active_parse_stage?: string | null;
+  active_parse_progress?: number | null;
   sections: PaperSectionResponse[];
 };
 
@@ -386,6 +465,10 @@ export type QuestionSummary = {
   parse_status: string;
   review_status: string;
   review_note?: string | null;
+  paper_name?: string | null;
+  source_label?: string | null;
+  source_year?: number | null;
+  source_region?: string | null;
 };
 
 export type QuestionKnowledgeLinkResponse = {
@@ -428,7 +511,55 @@ export type QuestionKnowledgeReviewResponse = {
 export type QuestionRetagResponse = {
   question_id: number;
   created_links: number;
+  ai_created_links: number;
   total_links: number;
+};
+
+export type QuestionAiCompleteResponse = {
+  requested_count: number;
+  updated_count: number;
+  unchanged_count: number;
+  failed_count: number;
+  question_ids: number[];
+  failed_question_ids: number[];
+  message: string;
+};
+
+export type QuestionAiReviewResponse = {
+  requested_count: number;
+  updated_count: number;
+  approved_count: number;
+  needs_revision_count: number;
+  rejected_count: number;
+  failed_count: number;
+  question_ids: number[];
+  failed_question_ids: number[];
+  message: string;
+};
+
+export type QuestionAiKnowledgeReviewResponse = {
+  question_id: number;
+  updated_count: number;
+  approved_count: number;
+  rejected_count: number;
+  link_ids: number[];
+  primary_link_id?: number | null;
+  message: string;
+};
+
+export type QuestionAiProcessResponse = {
+  requested_count: number;
+  updated_count: number;
+  completed_count: number;
+  approved_count: number;
+  needs_revision_count: number;
+  rejected_count: number;
+  tagged_question_count: number;
+  created_link_count: number;
+  failed_count: number;
+  question_ids: number[];
+  failed_question_ids: number[];
+  message: string;
 };
 
 export type DashboardMetric = {
@@ -436,6 +567,18 @@ export type DashboardMetric = {
   label: string;
   value: string;
   trend?: string | null;
+};
+
+export type AnalysisFilterOption = {
+  value: string;
+  label: string;
+};
+
+export type AnalysisMetric = {
+  key: string;
+  label: string;
+  value: string;
+  helper?: string | null;
 };
 
 export type DashboardFocusItem = {
@@ -465,6 +608,95 @@ export type TrendResponse = {
   label: string;
   year?: number | null;
   question_count: number;
+};
+
+export type AnalysisYearSummary = {
+  year?: number | null;
+  label: string;
+  paper_count: number;
+  question_count: number;
+  mapped_question_count: number;
+  total_score: number;
+};
+
+export type AnalysisTypeBreakdown = {
+  question_type: string;
+  question_type_label: string;
+  count: number;
+  score: number;
+  count_share: number;
+  score_share: number;
+};
+
+export type AnalysisPointYearStat = {
+  year?: number | null;
+  label: string;
+  frequency: number;
+  paper_count: number;
+  score: number;
+  score_share: number;
+};
+
+export type AnalysisPointRow = {
+  knowledge_point_id: number;
+  knowledge_point_name: string;
+  chapter_id?: number | null;
+  chapter_name?: string | null;
+  chapter_path?: string | null;
+  category_name?: string | null;
+  frequency: number;
+  paper_coverage: number;
+  total_score: number;
+  score_share: number;
+  avg_score: number;
+  continuous_years: number;
+  last_seen_year?: number | null;
+  dominant_question_type?: string | null;
+  dominant_question_type_label?: string | null;
+  dominant_question_type_share: number;
+  hot_score: number;
+  importance_level: string;
+  type_breakdown: AnalysisTypeBreakdown[];
+  yearly_stats: AnalysisPointYearStat[];
+};
+
+export type AnalysisChapterYearStat = {
+  year?: number | null;
+  label: string;
+  frequency: number;
+  score: number;
+  score_share: number;
+};
+
+export type AnalysisChapterRow = {
+  chapter_id: number;
+  chapter_name: string;
+  chapter_path: string;
+  point_count: number;
+  frequency: number;
+  paper_coverage: number;
+  total_score: number;
+  score_share: number;
+  yearly_stats: AnalysisChapterYearStat[];
+};
+
+export type AnalysisInsight = {
+  title: string;
+  description: string;
+};
+
+export type KnowledgeAnalysisResponse = {
+  data_as_of: string;
+  coverage_rate: number;
+  summary_metrics: AnalysisMetric[];
+  available_years: number[];
+  available_question_types: AnalysisFilterOption[];
+  available_paper_types: string[];
+  available_regions: string[];
+  years: AnalysisYearSummary[];
+  points: AnalysisPointRow[];
+  chapters: AnalysisChapterRow[];
+  insights: AnalysisInsight[];
 };
 
 export type ReportResponse = {
@@ -501,7 +733,23 @@ export type AnalysisJobResponse = {
 export type StandardizeQuestionsResponse = {
   created: number;
   linked: number;
+  unlinked: number;
   skipped: number;
+  normalized: number;
+  ai_completed: number;
+  tagged: number;
+  ai_tagged: number;
+};
+
+export type QuestionSourceSummaryResponse = {
+  id: number;
+  exam_question_id: number;
+  paper_id: number;
+  paper_name: string;
+  question_no: string;
+  source_label: string;
+  source_year?: number | null;
+  source_region?: string | null;
 };
 
 export type QuestionBankItemResponse = {
@@ -516,6 +764,8 @@ export type QuestionBankItemResponse = {
   quality_score?: number | null;
   source_count: number;
   status: string;
+  source_labels: string[];
+  sources: QuestionSourceSummaryResponse[];
 };
 
 export type PracticeSetResponse = {
@@ -528,6 +778,26 @@ export type PracticeSetResponse = {
   difficulty_policy?: string | null;
   question_count: number;
   status: string;
+};
+
+export type PracticeSetQuestionResponse = {
+  id: number;
+  bank_question_id: number;
+  sort_order: number;
+  score?: number | null;
+  question_type: string;
+  stem_text: string;
+  options_json?: string[] | null;
+  answer_text?: string | null;
+  analysis_text?: string | null;
+  difficulty_level?: number | null;
+  quality_score?: number | null;
+  source_count: number;
+  knowledge_point_names: string[];
+};
+
+export type PracticeSetDetailResponse = PracticeSetResponse & {
+  questions: PracticeSetQuestionResponse[];
 };
 
 export type MockExamResponse = {
@@ -554,6 +824,7 @@ export type PracticeSessionResponse = {
   id: number;
   learner_id: number;
   session_type: string;
+  practice_mode: "instant_feedback" | "deferred_feedback";
   subject_id?: number | null;
   practice_set_id?: number | null;
   mock_exam_id?: number | null;
@@ -563,6 +834,23 @@ export type PracticeSessionResponse = {
   score?: number | null;
   accuracy_rate?: number | null;
   duration_seconds?: number | null;
+};
+
+export type PracticeAnswerResultResponse = {
+  bank_question_id: number;
+  learner_answer?: string | null;
+  correct_answer?: string | null;
+  is_correct?: boolean | null;
+  score?: number | null;
+  full_score?: number | null;
+  spent_seconds?: number | null;
+  analysis_text?: string | null;
+};
+
+export type PracticeSessionDetailResponse = PracticeSessionResponse & {
+  practice_set_title?: string | null;
+  questions: PracticeSetQuestionResponse[];
+  answers: PracticeAnswerResultResponse[];
 };
 
 export type WrongBookResponse = {

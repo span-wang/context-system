@@ -213,6 +213,10 @@ export default function SettingsPage() {
                   <strong>{runtimePorts?.web_url || "-"}</strong>
                 </div>
                 <div className="detailRow">
+                  <span>公网地址</span>
+                  <strong>{runtimePorts?.public_web_url || "-"}</strong>
+                </div>
+                <div className="detailRow">
                   <span>端口状态文件</span>
                   <StatusBadge value={runtimePorts?.found ? "found" : "missing"} tone={runtimePorts?.found ? "good" : "warn"} />
                 </div>

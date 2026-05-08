@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
@@ -11,6 +11,7 @@ from app.schemas.analysis import (
     DashboardResponse,
     FrequencyResponse,
     GenerateReportRequest,
+    KnowledgeAnalysisResponse,
     ReportResponse,
     TrendResponse,
 )
@@ -34,6 +35,26 @@ def frequencies(session: Session = Depends(get_session)) -> list[FrequencyRespon
 @router.get("/trends", response_model=list[TrendResponse])
 def trends(session: Session = Depends(get_session)) -> list[TrendResponse]:
     return FrequencyAnalysisService(session).list_trends()
+
+
+@router.get("/knowledge-overview", response_model=KnowledgeAnalysisResponse)
+def knowledge_overview(
+    subject_id: int | None = Query(default=None),
+    year_from: int | None = Query(default=None),
+    year_to: int | None = Query(default=None),
+    question_type: str | None = Query(default=None),
+    paper_type: str | None = Query(default=None),
+    region: str | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> KnowledgeAnalysisResponse:
+    return FrequencyAnalysisService(session).get_knowledge_analysis(
+        subject_id=subject_id,
+        year_from=year_from,
+        year_to=year_to,
+        question_type=question_type,
+        paper_type=paper_type,
+        region=region,
+    )
 
 
 @router.get("/jobs/{job_id}", response_model=AnalysisJobResponse)

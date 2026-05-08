@@ -78,9 +78,11 @@ export default function QuestionBankOverviewPage() {
       if (kind === "standardize") {
         const result = await apiFetch<StandardizeQuestionsResponse>("/api/question-bank/standardize", {
           method: "POST",
-          body: JSON.stringify({ publish: true }),
+          body: JSON.stringify({ publish: true, use_ai: true }),
         });
-        setMessage(`标准题同步完成：新增 ${result.created}，关联 ${result.linked}，跳过 ${result.skipped}`);
+        setMessage(
+          `标准题同步完成：新增 ${result.created}，关联 ${result.linked}，解除 ${result.unlinked}，跳过 ${result.skipped}；清洗 ${result.normalized}，AI补全 ${result.ai_completed}，考点映射 ${result.tagged + result.ai_tagged}`,
+        );
       }
 
       if (kind === "practice") {
@@ -175,6 +177,14 @@ export default function QuestionBankOverviewPage() {
                         <span>{question.question_type}</span>
                         <span>来源 {question.source_count} 次</span>
                         <span>难度 {question.difficulty_level || "-"}</span>
+                      </div>
+                      <div className="stackList" style={{ gap: 6 }}>
+                        {question.source_labels.slice(0, 3).map((label) => (
+                          <span key={`${question.id}-${label}`} className="muted">
+                            来源标识：{label}
+                          </span>
+                        ))}
+                        {question.source_count > 3 ? <span className="muted">其余 {question.source_count - 3} 条来源可继续用于回组原卷。</span> : null}
                       </div>
                     </article>
                   ))}

@@ -9,6 +9,7 @@ import {
   apiFormFetch,
   AnalysisJobResponse,
   OCRCapabilityResponse,
+  ParseOutputFormat,
   PaperDeleteResponse,
   PaperDetailResponse,
   PaperParseJobResponse,
@@ -16,7 +17,6 @@ import {
   PaperSummary,
   PaperUploadResponse,
   ParsePreset,
-  SubjectResponse,
 } from "../../../../lib/pro-api";
 import { LoadState } from "../../../../components/shared/LoadState";
 import { StatusBadge } from "../../../../components/shared/StatusBadge";
@@ -50,10 +50,14 @@ const presetDefaultDpi: Record<ParsePreset, string> = {
   formula: "280",
 };
 
+const parseOutputFormatOptions: Array<{ value: ParseOutputFormat; label: string }> = [
+  { value: "markdown", label: "Markdown" },
+  { value: "text", label: "TXT" },
+];
+
 export default function PapersPage() {
   const [papers, setPapers] = useState<PaperSummary[]>([]);
   const [subjects, setSubjects] = useState<SubjectConfig[]>([]);
-  const [platformSubjects, setPlatformSubjects] = useState<SubjectResponse[]>([]);
   const [selected, setSelected] = useState<PaperDetailResponse | null>(null);
   const [selectedSubjectId, setSelectedSubjectId] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
@@ -72,13 +76,29 @@ export default function PapersPage() {
   const [ocrCapability, setOcrCapability] = useState<OCRCapabilityResponse | null>(null);
   const [ocrCapabilityError, setOcrCapabilityError] = useState("");
   const [parsePreset, setParsePreset] = useState<ParsePreset>("auto");
+  const [outputFormat, setOutputFormat] = useState<ParseOutputFormat>("markdown");
   const [forceOcr, setForceOcr] = useState(false);
   const [renderDpi, setRenderDpi] = useState(presetDefaultDpi.auto);
+  const [pageChunkSize, setPageChunkSize] = useState("4");
   const [headerRatio, setHeaderRatio] = useState("0.00");
   const [footerRatio, setFooterRatio] = useState("0.00");
   const pageRequestGate = useLatestRequestGate();
   const detailRequestIdRef = useRef(0);
   const activeSubject = subjects.find((subject) => subject.id === selectedSubjectId) || null;
+  const visibleParseJob = selected && parseJob && Number(parseJob.scope_config_json?.paper_id || 0) === selected.id ? parseJob : null;
+
+  function clearParseStateForPaper(paperId?: number | null) {
+    if (paperId == null) {
+      setParseJob(null);
+      setParsingId(null);
+      return;
+    }
+    setParseJob((current) => {
+      if (!current || Number(current.scope_config_json?.paper_id || 0) !== paperId) return current;
+      return null;
+    });
+    setParsingId((current) => (current === paperId ? null : current));
+  }
 
   async function loadPaperDetail(id: number, fallback: string) {
     const requestId = detailRequestIdRef.current + 1;
@@ -87,6 +107,24 @@ export default function PapersPage() {
       const detail = await apiFetch<PaperDetailResponse>(`/api/papers/${id}`);
       if (detailRequestIdRef.current !== requestId) return null;
       setSelected(detail);
+      if (
+        detail.active_parse_job_id &&
+        ["pending", "running"].includes(String(detail.active_parse_job_status || "")) &&
+        (!parseJob || parseJob.id !== detail.active_parse_job_id || !["pending", "running"].includes(parseJob.status))
+      ) {
+        setParseJob({
+          id: detail.active_parse_job_id,
+          job_type: "paper_parse",
+          scope_type: "paper",
+          scope_config_json: { paper_id: detail.id, stage: detail.active_parse_stage || "queued" },
+          status: detail.active_parse_job_status || "running",
+          progress: detail.active_parse_progress || 0,
+          created_at: new Date().toISOString(),
+        });
+        setParsingId(detail.id);
+      } else {
+        clearParseStateForPaper(detail.id);
+      }
       setDetailError("");
       return detail;
     } catch (err) {
@@ -104,15 +142,14 @@ export default function PapersPage() {
     setDetailError("");
     setLoadWarning("");
     try {
-      const [nextPapers, nextSubjects, nextPlatformSubjects] = await Promise.allSettled([
+      const [nextPapers, nextSubjects] = await Promise.allSettled([
         apiFetch<PaperSummary[]>("/api/papers"),
         legacyApiFetch<SystemConfig>("/api/system/config"),
-        apiFetch<SubjectResponse[]>("/api/knowledge/subjects"),
       ]);
 
       if (!pageRequestGate.isCurrent(requestId)) return;
 
-      const results = [nextPapers, nextSubjects, nextPlatformSubjects];
+      const results = [nextPapers, nextSubjects];
       if (allRejected(results)) {
         throw firstRejectedReason(results) || new Error("No paper page requests succeeded.");
       }
@@ -137,16 +174,10 @@ export default function PapersPage() {
         setSelectedSubjectId("");
         setSelectedCategory("");
       }
-      if (nextPlatformSubjects.status === "fulfilled") {
-        setPlatformSubjects(nextPlatformSubjects.value);
-      } else {
-        setPlatformSubjects([]);
-      }
       setLoadWarning(
         summarizeRejectedRequests([
           { label: "试卷列表", result: nextPapers },
           { label: "学科配置", result: nextSubjects },
-          { label: "平台学科", result: nextPlatformSubjects },
         ]),
       );
 
@@ -155,6 +186,7 @@ export default function PapersPage() {
         : preferredPaperId || selected?.id || paperList[0]?.id;
       if (!nextSelectedId) {
         setSelected(null);
+        clearParseStateForPaper();
         return;
       }
       await loadPaperDetail(nextSelectedId, "加载试卷详情失败");
@@ -199,11 +231,15 @@ export default function PapersPage() {
     setParseJob(job);
     if (job.status === "completed") {
       const summary = job.result_summary_json || {};
+      const parseOptions = (summary.parse_options && typeof summary.parse_options === "object")
+        ? (summary.parse_options as Record<string, unknown>)
+        : null;
       const warnings = Array.isArray(summary.warnings) ? summary.warnings.map(String).filter(Boolean) : [];
+      const datasetSamplePath = typeof summary.dataset_sample_path === "string" ? summary.dataset_sample_path : "";
       await refreshPapers(selected?.id || null);
       setParsingId(null);
       setParseMessage(
-        `解析完成：${Number(summary.question_count || 0)} 道题，${Number(summary.tagged_count || 0)} 条候选考点，解析器 ${String(summary.provider || "-")}${warnings.length ? `，${warnings.length} 条待复核提示` : ""}`,
+        `解析完成：${Number(summary.question_count || 0)} 道题已进入题目中心，规则命中 ${Number(summary.tagged_count || 0)} 条候选考点。后续 AI 补全、AI 标注、AI 复核请到 /platform/analysis/questions?paper_id=${selected?.id || 0} 执行${warnings.length ? `；当前有 ${warnings.length} 条待复核提示` : ""}${datasetSamplePath ? `；样本已自动导入 ${datasetSamplePath}` : ""}。`,
       );
     }
     if (job.status === "failed") {
@@ -235,14 +271,13 @@ export default function PapersPage() {
       return;
     }
     if (!activeSubject) {
-      setUploadError("请先在设置页添加学科。");
+      setUploadError("请先在学科中心添加学科。");
       return;
     }
     data.set("subject_code", activeSubject.id);
     data.set("subject_name", activeSubject.name);
-    const platformSubject = findPlatformSubject(platformSubjects, activeSubject);
-    if (platformSubject) {
-      data.set("subject_id", String(platformSubject.id));
+    if (activeSubject.platform_id != null) {
+      data.set("subject_id", String(activeSubject.platform_id));
     }
     if (selectedCategory) {
       data.set("category", selectedCategory);
@@ -290,8 +325,10 @@ export default function PapersPage() {
     try {
       const form = new FormData();
       form.append("preset", parsePreset);
+      form.append("output_format", outputFormat);
       if (forceOcr) form.append("force_ocr", "true");
       if (Number(renderDpi) > 0) form.append("render_dpi", String(Number(renderDpi)));
+      if (Number(pageChunkSize) > 0) form.append("pdf_page_chunk_size", String(Number(pageChunkSize)));
       if (Number(headerRatio) > 0) form.append("crop_header_ratio", String(Number(headerRatio)));
       if (Number(footerRatio) > 0) form.append("crop_footer_ratio", String(Number(footerRatio)));
       if (parsePreset === "formula") form.append("enable_formula_recognition", "true");
@@ -300,12 +337,13 @@ export default function PapersPage() {
         id: result.job_id,
         job_type: "paper_parse",
         scope_type: "paper",
-        scope_config_json: { stage: "queued" },
+        scope_config_json: { paper_id: id, stage: "queued" },
         status: result.status,
         progress: result.progress,
         created_at: new Date().toISOString(),
       });
-      setParseMessage(`解析任务已启动：#${result.job_id}`);
+      setParseMessage(`解析任务已启动：#${result.job_id}。完成后会直接进入题目中心，AI 操作不再自动执行。`);
+      await loadParseJob(result.job_id);
     } catch (err) {
       setError(toErrorMessage(err, "解析试卷失败"));
       setParsingId(null);
@@ -321,6 +359,7 @@ export default function PapersPage() {
     setError("");
     setListMessage("");
     setParseMessage("");
+    clearParseStateForPaper(paper.id);
     try {
       const result = await apiFetch<PaperDeleteResponse>(`/api/papers/${paper.id}`, { method: "DELETE" });
       const nextSelectedId = selected?.id === paper.id
@@ -329,6 +368,7 @@ export default function PapersPage() {
       await refreshPapers(nextSelectedId || null);
       setListMessage(`已删除：${result.paper_name}`);
     } catch (err) {
+      await refreshPapers(selected?.id || null);
       setError(toErrorMessage(err, "删除试卷失败"));
     } finally {
       setDeletingId(null);
@@ -367,7 +407,7 @@ export default function PapersPage() {
                       <div>
                         <strong>{paper.paper_name}</strong>
                         <span className="muted">
-                          {paper.exam_year || "-"} · {paper.category || "未分类"} · {paper.exam_region || "未知地区"} · {paper.total_question_count} 题 · {paper.status}
+                          {paper.exam_year || "-"} · {paper.category || "未分类"} · {paper.exam_region || "未知地区"} · {paper.total_question_count} 题 · {paperStatusLabel(paper.status)}
                         </span>
                       </div>
                       <StatusBadge value={paper.review_status} tone={paper.review_status === "approved" ? "good" : "warn"} />
@@ -419,7 +459,7 @@ export default function PapersPage() {
                       setSelectedCategory(subject?.categories[0] || "");
                     }}
                   >
-                    {!subjects.length && <option value="">请先在设置页添加学科</option>}
+                    {!subjects.length && <option value="">请先在学科中心添加学科</option>}
                     {subjects.map((subject) => (
                       <option key={subject.id} value={subject.id}>
                         {subject.name}
@@ -507,7 +547,17 @@ export default function PapersPage() {
                 </div>
                 <div className="detailRow">
                   <span>解析状态</span>
-                  <StatusBadge value={selected.asset_parse_status || "-"} tone="good" />
+                  <StatusBadge
+                    value={selected.active_parse_stage ? parseStageLabel(selected.active_parse_stage) : parseRuntimeStatusLabel(selected.asset_parse_status)}
+                    tone={selected.asset_parse_status === "parsed" ? "good" : selected.asset_parse_status === "failed" ? "danger" : "info"}
+                  />
+                </div>
+                <div className="detailRow">
+                  <span>试卷状态</span>
+                  <StatusBadge
+                    value={selected.active_parse_stage ? parseStageLabel(selected.active_parse_stage) : paperStatusLabel(selected.status)}
+                    tone={selected.status === "parsed" ? "good" : selected.status === "parse_failed" ? "danger" : "info"}
+                  />
                 </div>
                 <div className="detailRow">
                   <span>审核状态</span>
@@ -573,10 +623,33 @@ export default function PapersPage() {
                       />
                     </label>
                     <label className="field">
+                      <span>每批页数</span>
+                      <input
+                        min="1"
+                        max="50"
+                        step="1"
+                        type="number"
+                        value={pageChunkSize}
+                        onChange={(e) => setPageChunkSize(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <div className="row">
+                    <label className="field">
                       <span>强制 OCR</span>
                       <select value={forceOcr ? "true" : "false"} onChange={(e) => setForceOcr(e.target.value === "true")}>
                         <option value="false">否</option>
                         <option value="true">是</option>
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>输出格式</span>
+                      <select value={outputFormat} onChange={(e) => setOutputFormat(e.target.value as ParseOutputFormat)}>
+                        {parseOutputFormatOptions.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
                       </select>
                     </label>
                   </div>
@@ -597,20 +670,26 @@ export default function PapersPage() {
                   </button>
                   {parseMessage && <span className="muted">{parseMessage}</span>}
                 </div>
-                {parseJob && (
+                {visibleParseJob && (
                   <div className="calloutBox">
                     <div className="detailRow">
-                      <span>任务 #{parseJob.id}</span>
-                      <strong>{parseStageLabel(parseJob.scope_config_json?.stage)} · {parseJob.progress}%</strong>
+                      <span>解析任务 #{visibleParseJob.id}</span>
+                      <strong>{parseStageLabel(visibleParseJob.scope_config_json?.stage)} · {visibleParseJob.progress}%</strong>
                     </div>
                     <div className="progressTrack" aria-label="解析进度">
-                      <div className="progressFill" style={{ width: `${Math.max(3, Math.min(100, parseJob.progress))}%` }} />
+                      <div className="progressFill" style={{ width: `${Math.max(3, Math.min(100, visibleParseJob.progress))}%` }} />
                     </div>
-                    <p className={parseJob.status === "failed" ? "errorText" : "muted"}>
-                      {parseJob.status === "failed"
-                        ? parseJob.error_message || "解析失败"
-                        : parseJobDetailText(parseJob)}
+                    <p className={visibleParseJob.status === "failed" ? "errorText" : "muted"}>
+                      {visibleParseJob.status === "failed"
+                        ? visibleParseJob.error_message || "解析失败"
+                        : parseJobDetailText(visibleParseJob)}
                     </p>
+                    {visibleParseJob.status !== "failed" && parseJobChunkDetailText(visibleParseJob) && (
+                      <p className="muted">{parseJobChunkDetailText(visibleParseJob)}</p>
+                    )}
+                    {visibleParseJob.status !== "failed" && parseJobResumeDetailText(visibleParseJob) && (
+                      <p className="muted">{parseJobResumeDetailText(visibleParseJob)}</p>
+                    )}
                   </div>
                 )}
                 <div className="subsection">
@@ -638,16 +717,6 @@ export default function PapersPage() {
   );
 }
 
-function findPlatformSubject(platformSubjects: SubjectResponse[], subject: SubjectConfig): SubjectResponse | undefined {
-  const normalizedId = subject.id.trim().toLowerCase();
-  return platformSubjects.find(
-    (item) =>
-      item.name === subject.name ||
-      item.code === subject.id ||
-      item.code.trim().toLowerCase() === normalizedId
-  );
-}
-
 function formatMemory(value?: number | null) {
   if (value == null) return "-";
   return `${(value / 1024).toFixed(1)} GB`;
@@ -664,13 +733,53 @@ function parsePresetSummary(preset: ParsePreset) {
   return summaries[preset];
 }
 
+function paperStatusLabel(status?: string) {
+  const labels: Record<string, string> = {
+    uploaded: "已上传",
+    parsing: "解析中",
+    preparing: "准备文件",
+    reading_file: "读取文件",
+    ocr_running: "OCR 识别中",
+    layout_analyzing: "版面分析中",
+    ocr_fallback_running: "OCR 兜底中",
+    splitting_questions: "切题中",
+    building_sections: "生成分区中",
+    tagging: "考点标注中",
+    saving: "保存结果中",
+    parsed: "已解析",
+    parse_failed: "解析失败",
+  };
+  return labels[status || ""] || status || "-";
+}
+
+function parseRuntimeStatusLabel(status?: string | null) {
+  const labels: Record<string, string> = {
+    pending: "待解析",
+    preparing: "准备文件",
+    reading_file: "读取文件",
+    parsing: "解析中",
+    ocr_running: "OCR 识别中",
+    layout_analyzing: "版面分析中",
+    ocr_fallback_running: "OCR 兜底中",
+    splitting_questions: "切题中",
+    building_sections: "生成分区中",
+    tagging: "考点标注中",
+    saving: "保存结果中",
+    parsed: "已解析",
+    failed: "解析失败",
+    empty: "解析为空",
+  };
+  return labels[status || ""] || status || "-";
+}
+
 function parseStageLabel(stage?: string) {
   const labels: Record<string, string> = {
     queued: "等待解析",
     device_check: "设备检测",
     prepare: "准备文件",
     read_file: "读取文件",
-    ocr: "OCR 识别",
+    ocr: "OCR 切片识别",
+    layout_analysis: "版面切片分析",
     split_questions: "切题",
     build_sections: "生成分区",
     tagging: "考点标注",
@@ -692,12 +801,12 @@ function parseJobDetailText(job: AnalysisJobResponse) {
   if (stage === "layout_analysis") {
     const done = Number(detail.done_pages || 0);
     const total = Number(detail.total_pages || 0);
-    return total ? `PP-StructureV3 正在分析第 ${done} / ${total} 页版面` : "正在进行版面与阅读顺序分析";
+    return total ? `PP-StructureV3 正在按切片分析第 ${done} / ${total} 页版面` : "正在进行版面切片与阅读顺序分析";
   }
   if (stage === "ocr_fallback") {
     const done = Number(detail.done_pages || 0);
     const total = Number(detail.total_pages || 0);
-    return total ? `版面结果触发兜底，PP-OCRv5 正在复核第 ${done} / ${total} 页` : "正在执行 PP-OCRv5 兜底复核";
+    return total ? `版面结果触发兜底，PP-OCRv5 正在按切片复核第 ${done} / ${total} 页` : "正在执行 PP-OCRv5 兜底切片复核";
   }
   if (stage === "device_check") {
     const device = String(detail.device_name || "未知设备");
@@ -707,10 +816,42 @@ function parseJobDetailText(job: AnalysisJobResponse) {
   if (stage === "tagging") {
     const done = Number(detail.tagged_questions || 0);
     const total = Number(detail.question_count || 0);
-    return total ? `正在标注第 ${done} / ${total} 题` : "正在标注考点";
+    return total ? `正在生成规则候选第 ${done} / ${total} 题` : "正在生成规则候选";
   }
   if (stage === "build_sections") {
     return String(detail.section_name || "正在生成试卷分区");
   }
+  if (stage === "completed") {
+    const questionCount = Number(detail.question_count || 0);
+    const taggedCount = Number(detail.tagged_count || 0);
+    return `解析完成，生成 ${questionCount} 道题，规则命中 ${taggedCount} 条候选考点。`;
+  }
   return "后台解析中，页面会自动刷新进度。";
+}
+
+function parseJobChunkDetailText(job: AnalysisJobResponse) {
+  const detail = job.scope_config_json?.detail || {};
+  const chunkCount = Number(detail.chunk_count || 0);
+  const completedChunkCount = Number(detail.completed_chunk_count || 0);
+  const currentChunkIndex = Number(detail.current_chunk_index || 0);
+  const chunkFrom = Number(detail.current_chunk_page_from || 0);
+  const chunkTo = Number(detail.current_chunk_page_to || 0);
+  const pageBatchSize = Number(detail.page_batch_size || 0);
+  if (!chunkCount) return "";
+  if (currentChunkIndex && chunkFrom && chunkTo) {
+    return `已完成切片 ${Math.min(completedChunkCount, chunkCount)} / ${chunkCount} · 当前切片第 ${currentChunkIndex} 段（第 ${chunkFrom}-${chunkTo} 页）· 每批 ${pageBatchSize || "-"} 页`;
+  }
+  return `已完成切片 ${Math.min(completedChunkCount, chunkCount)} / ${chunkCount} · 每批 ${pageBatchSize || "-"} 页`;
+}
+
+function parseJobResumeDetailText(job: AnalysisJobResponse) {
+  const detail = job.scope_config_json?.detail || {};
+  const resumedPages = Number(detail.resumed_pages || 0);
+  const resumedChunks = Number(detail.resumed_chunk_count || 0);
+  const resumeStartPage = Number(detail.resume_start_page || 0);
+  if (!resumedPages && !resumedChunks) return "";
+  if (resumeStartPage > 0) {
+    return `断点续跑已复用 ${resumedPages} 页、${resumedChunks} 个切片，从第 ${resumeStartPage} 页继续。`;
+  }
+  return `断点续跑已复用 ${resumedPages} 页、${resumedChunks} 个切片，当前参数下无需重跑已完成部分。`;
 }

@@ -1,8 +1,24 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { FileText, RefreshCw, Trash2, UploadCloud } from "lucide-react";
-import { apiFetch, LibraryFile, LibraryFilePreview, ParsePreset, SubjectConfig, SystemConfig } from "../../lib/api";
+import { FileText, RefreshCw, RotateCcw, Trash2, UploadCloud } from "lucide-react";
+import {
+  apiFetch,
+  LibraryFile,
+  LibraryParseJobResponse,
+  LibraryParseJobStatus,
+  LibraryParseMode,
+  LibraryFilePreview,
+  LibraryReparseResponse,
+  ParseOutputFormat,
+  ParsePreset,
+  SubjectConfig,
+} from "../../lib/api";
+import {
+  apiFetch as platformApiFetch,
+  SubjectCategoryResponse,
+  SubjectResponse,
+} from "../../lib/pro-api";
 
 const libraryPreviewChars = 200_000;
 
@@ -23,16 +39,27 @@ const parsePresetOptions: Array<{ value: ParsePreset; label: string }> = [
   { value: "formula", label: "公式增强" },
 ];
 
+const parseOutputFormatOptions: Array<{ value: ParseOutputFormat; label: string }> = [
+  { value: "markdown", label: "Markdown" },
+  { value: "text", label: "TXT" },
+];
+
 export default function LibraryPage() {
   const [files, setFiles] = useState<LibraryFile[]>([]);
   const [uploadFiles, setUploadFiles] = useState<FileList | null>(null);
   const [message, setMessage] = useState("");
   const [previewError, setPreviewError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [reparsingId, setReparsingId] = useState<string | null>(null);
+  const [parsingFileId, setParsingFileId] = useState<string | null>(null);
+  const [parseJob, setParseJob] = useState<LibraryParseJobStatus | null>(null);
   const [preview, setPreview] = useState<LibraryFilePreview | null>(null);
+  const [reparseResult, setReparseResult] = useState<LibraryReparseResponse | null>(null);
   const [subjects, setSubjects] = useState<SubjectConfig[]>([]);
   const [parsePreset, setParsePreset] = useState<ParsePreset>("auto");
+  const [outputFormat, setOutputFormat] = useState<ParseOutputFormat>("markdown");
   const [forceOcr, setForceOcr] = useState(false);
+  const [pageChunkSize, setPageChunkSize] = useState("4");
   const [headerRatio, setHeaderRatio] = useState("0.00");
   const [footerRatio, setFooterRatio] = useState("0.00");
   const [meta, setMeta] = useState({
@@ -59,15 +86,27 @@ export default function LibraryPage() {
   }
 
   async function loadSubjects() {
-    const data = await apiFetch<SystemConfig>("/api/system/config");
-    setSubjects(data.subjects);
-    setMeta((current) => normalizeMetaSubject(current, data.subjects));
+    const [subjectList, categoryList] = await Promise.all([
+      platformApiFetch<SubjectResponse[]>("/api/knowledge/subjects"),
+      platformApiFetch<SubjectCategoryResponse[]>("/api/knowledge/categories"),
+    ]);
+    const nextSubjects = buildSubjectConfigs(subjectList, categoryList);
+    setSubjects(nextSubjects);
+    setMeta((current) => normalizeMetaSubject(current, nextSubjects));
   }
 
   useEffect(() => {
     loadFiles().catch((error) => setMessage(error.message));
     loadSubjects().catch((error) => setMessage(error.message));
   }, []);
+
+  useEffect(() => {
+    if (!parseJob || !["pending", "running"].includes(parseJob.status)) return;
+    const timer = window.setInterval(() => {
+      loadParseJob(parseJob.id).catch((error) => setPreviewError(error.message || "刷新解析进度失败"));
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [parseJob?.id, parseJob?.status]);
 
   const totalSize = useMemo(() => files.reduce((sum, file) => sum + file.size, 0), [files]);
   const activeSubject = useMemo(
@@ -82,7 +121,7 @@ export default function LibraryPage() {
       return;
     }
     if (!meta.subject) {
-      setMessage("请先在设置页添加学科。");
+      setMessage("请先在学科中心添加学科。");
       return;
     }
     setLoading(true);
@@ -114,24 +153,108 @@ export default function LibraryPage() {
     await loadFiles();
   }
 
-  async function showPreview(file: LibraryFile) {
-    setPreviewError("");
+  function buildParseParams() {
     const params = new URLSearchParams({
       max_chars: String(libraryPreviewChars),
       preset: parsePreset,
+      output_format: outputFormat,
     });
     if (forceOcr) params.set("force_ocr", "true");
+    if (Number(pageChunkSize) > 0) params.set("pdf_page_chunk_size", String(Number(pageChunkSize)));
     if (Number(headerRatio) > 0) params.set("crop_header_ratio", String(Number(headerRatio)));
     if (Number(footerRatio) > 0) params.set("crop_footer_ratio", String(Number(footerRatio)));
+    return params;
+  }
+
+  async function startParseJob(file: LibraryFile, mode: LibraryParseMode) {
+    setPreviewError("");
+    setMessage("");
+    setReparseResult(null);
+    setParseJob(null);
+    setParsingFileId(file.id);
+    setReparsingId(mode === "reparse" ? file.id : null);
     try {
-      const data = await apiFetch<LibraryFilePreview>(
-        `/api/library/files/${file.id}/preview?${params.toString()}`
+      const params = buildParseParams();
+      params.set("mode", mode);
+      const data = await apiFetch<LibraryParseJobResponse>(
+        `/api/library/files/${file.id}/parse-jobs?${params.toString()}`,
+        { method: "POST" }
       );
-      setPreview(data);
-      await loadFiles();
+      setParseJob({
+        id: data.job_id,
+        job_type: "library_parse",
+        scope_type: "library_file",
+        scope_config_json: {
+          stage: "queued",
+          file_id: file.id,
+          filename: file.filename,
+          mode,
+          detail: { file_id: file.id, filename: file.filename, mode },
+        },
+        status: data.status,
+        progress: data.progress,
+        created_at: new Date().toISOString(),
+      });
+      setMessage(`${libraryJobModeLabel(mode)}任务已启动：#${data.job_id}`);
+      await loadParseJob(data.job_id);
     } catch (error) {
-      setPreviewError(error instanceof Error ? error.message : "预览失败");
+      setPreviewError(error instanceof Error ? error.message : "启动解析任务失败");
+      setParsingFileId(null);
+      if (mode === "reparse") setReparsingId(null);
     }
+  }
+
+  async function showPreview(file: LibraryFile) {
+    setPreviewError("");
+    setMessage(file.token_count == null ? "首次预览正在解析..." : "正在加载预览...");
+    setReparseResult(null);
+    setParseJob(null);
+    setParsingFileId(file.id);
+    try {
+      const params = buildParseParams();
+      const result = await apiFetch<LibraryFilePreview>(`/api/library/files/${file.id}/preview?${params.toString()}`);
+      setPreview(result);
+      setMessage(file.token_count == null ? "首次解析预览完成。" : "预览完成。");
+      if (file.token_count == null || file.token_count !== result.token_count) {
+        await loadFiles();
+      }
+    } catch (error) {
+      setPreviewError(error instanceof Error ? error.message : "加载预览失败");
+    } finally {
+      setParsingFileId(null);
+    }
+  }
+
+  async function reparseFile(file: LibraryFile) {
+    await startParseJob(file, "reparse");
+  }
+
+  async function loadParseJob(jobId: number) {
+    const job = await apiFetch<LibraryParseJobStatus>(`/api/library/parse-jobs/${jobId}`);
+    setParseJob(job);
+    if (job.status === "completed") {
+      const result = job.result_summary_json;
+      if (isLibraryPreviewResult(result)) {
+        setPreview(result);
+      }
+      if (isLibraryReparseResult(result)) {
+        setReparseResult(result);
+        setMessage(
+          `重新入库完成：第 ${result.stored_sequence_number} 次结果，完整 Token ${result.token_count.toLocaleString()}，保留 ${result.kept_results.length} 条。`
+        );
+      } else {
+        setMessage("解析预览完成。");
+      }
+      setParsingFileId(null);
+      setReparsingId(null);
+      await loadFiles();
+    }
+    if (job.status === "failed") {
+      setPreviewError(job.error_message || "解析任务失败");
+      setParsingFileId(null);
+      setReparsingId(null);
+    }
+    return job;
   }
 
   return (
@@ -170,7 +293,7 @@ export default function LibraryPage() {
               <div className="field">
                 <label>学科</label>
                 <select value={meta.subject} onChange={(e) => setMeta(selectMetaSubject(meta, subjects, e.target.value))}>
-                  {!subjects.length && <option value="">请先添加学科</option>}
+                  {!subjects.length && <option value="">请先在学科中心添加学科</option>}
                   {subjects.map((subject) => (
                     <option key={subject.id} value={subject.name}>
                       {subject.name}
@@ -263,7 +386,7 @@ export default function LibraryPage() {
         <div className="panel">
           <div className="panelHeader">
             <h2>文件列表</h2>
-            <p>按学科和关键词筛选，预览时会触发解析缓存。</p>
+            <p>按学科和关键词筛选。首次预览会解析入库，后续点击只展示已保存结果；如需按新参数重跑，请点重新解析入库。</p>
           </div>
           <div className="panelBody formGrid">
             <div className="row">
@@ -275,14 +398,37 @@ export default function LibraryPage() {
                       {option.label}
                     </option>
                   ))}
+                  </select>
+              </div>
+              <div className="field">
+                <label>输出格式</label>
+                <select value={outputFormat} onChange={(e) => setOutputFormat(e.target.value as ParseOutputFormat)}>
+                  {parseOutputFormatOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
                 </select>
               </div>
+            </div>
+            <div className="row">
               <div className="field">
                 <label>强制 OCR</label>
                 <select value={forceOcr ? "true" : "false"} onChange={(e) => setForceOcr(e.target.value === "true")}>
                   <option value="false">否</option>
                   <option value="true">是</option>
                 </select>
+              </div>
+              <div className="field">
+                <label>每批页数</label>
+                <input
+                  min="1"
+                  max="50"
+                  step="1"
+                  type="number"
+                  value={pageChunkSize}
+                  onChange={(e) => setPageChunkSize(e.target.value)}
+                />
               </div>
             </div>
             <div className="row">
@@ -346,8 +492,23 @@ export default function LibraryPage() {
                       <td>{renderTokenStatus(file)}</td>
                       <td>
                         <div className="buttonRow">
-                          <button className="button" type="button" onClick={() => showPreview(file)}>
+                          <button
+                            className="button"
+                            type="button"
+                            disabled={parsingFileId === file.id}
+                            title="解析预览"
+                            onClick={() => showPreview(file)}
+                          >
                             <FileText size={16} />
+                          </button>
+                          <button
+                            className="button"
+                            type="button"
+                            disabled={parsingFileId === file.id || reparsingId === file.id}
+                            onClick={() => reparseFile(file)}
+                            title="重新解析并入库"
+                          >
+                            <RotateCcw size={16} />
                           </button>
                           <button className="button danger" type="button" onClick={() => deleteFile(file.id)}>
                             <Trash2 size={16} />
@@ -360,6 +521,28 @@ export default function LibraryPage() {
               </table>
             </div>
             {!files.length && <div className="empty">素材库还没有文件。</div>}
+            {parseJob && (
+              <div className="calloutBox">
+                <div className="detailRow">
+                  <span>解析任务</span>
+                  <strong>
+                    #{parseJob.id} · {libraryStageLabel(parseJob.scope_config_json?.stage)} · {parseJob.progress}%
+                  </strong>
+                </div>
+                <div className="progressTrack" aria-label="素材解析进度">
+                  <div className="progressFill" style={{ width: `${Math.max(3, Math.min(100, parseJob.progress))}%` }} />
+                </div>
+                <p className={parseJob.status === "failed" ? "errorText" : "muted"}>
+                  {parseJob.status === "failed" ? parseJob.error_message || "解析失败" : libraryJobDetailText(parseJob)}
+                </p>
+                {parseJob.status !== "failed" && libraryJobChunkDetailText(parseJob) && (
+                  <p className="muted">{libraryJobChunkDetailText(parseJob)}</p>
+                )}
+                {parseJob.status !== "failed" && libraryJobResumeDetailText(parseJob) && (
+                  <p className="muted">{libraryJobResumeDetailText(parseJob)}</p>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </section>
@@ -369,15 +552,21 @@ export default function LibraryPage() {
           <div className="panelHeader">
             <h2>{preview.filename}</h2>
             <p>
-              估算 Token：{preview.token_count.toLocaleString()} · 解析器：{preview.provider} · 表格：{preview.table_count}
+              估算 Token：{preview.token_count.toLocaleString()} · 解析器：{preview.provider} · 输出：{preview.output_format} · 表格：{preview.table_count}
             </p>
           </div>
           <div className="panelBody">
             {!!Object.keys(preview.parse_options || {}).length && (
               <p className="muted">解析参数：{JSON.stringify(preview.parse_options)}</p>
             )}
+            {reparseResult && (
+              <p className="muted">
+                已入库第 {reparseResult.stored_sequence_number} 次解析结果，当前仅保留第{" "}
+                {reparseResult.kept_results.map((item) => item.sequence_number).join("、")} 次。
+              </p>
+            )}
             {!!preview.warnings.length && <p className="muted">{preview.warnings.join(" | ")}</p>}
-            <pre className="markdown">{preview.markdown || preview.text}</pre>
+            <pre className="markdown">{preview.content || preview.markdown || preview.text}</pre>
           </div>
         </section>
       )}
@@ -389,6 +578,83 @@ function renderTokenStatus(file: LibraryFile) {
   if (file.token_count == null) return "未解析";
   if (file.token_count === 0) return "解析为空";
   return file.token_count.toLocaleString();
+}
+
+function libraryJobModeLabel(mode?: LibraryParseMode | null) {
+  return mode === "reparse" ? "重新解析入库" : "解析预览";
+}
+
+function libraryStageLabel(stage?: string) {
+  const labels: Record<string, string> = {
+    queued: "等待解析",
+    prepare: "准备文件",
+    read_file: "读取文件",
+    cache: "命中缓存",
+    ocr: "OCR 切片识别",
+    layout_analysis: "版面切片分析",
+    ocr_fallback: "OCR 兜底切片",
+    completed: "完成",
+    failed: "失败",
+  };
+  return labels[stage || ""] || stage || "处理中";
+}
+
+function libraryJobDetailText(job: LibraryParseJobStatus) {
+  const detail = job.scope_config_json?.detail || {};
+  const stage = String(job.scope_config_json?.stage || "");
+  if (stage === "ocr" || stage === "layout_analysis" || stage === "ocr_fallback") {
+    const done = Number(detail.done_pages || 0);
+    const total = Number(detail.total_pages || 0);
+    return total ? `${libraryStageLabel(stage)}：第 ${done} / ${total} 页` : libraryStageLabel(stage);
+  }
+  if (stage === "cache") {
+    return "已命中解析缓存，正在整理预览结果。";
+  }
+  if (stage === "completed") {
+    const provider = String(detail.provider || "-");
+    const tokenCount = Number(detail.token_count || 0);
+    return `解析完成：${tokenCount.toLocaleString()} Token，解析器 ${provider}`;
+  }
+  return "后台解析中，页面会自动刷新进度。";
+}
+
+function libraryJobChunkDetailText(job: LibraryParseJobStatus) {
+  const detail = job.scope_config_json?.detail || {};
+  const chunkCount = Number(detail.chunk_count || 0);
+  const completedChunkCount = Number(detail.completed_chunk_count || 0);
+  const currentChunkIndex = Number(detail.current_chunk_index || 0);
+  const chunkFrom = Number(detail.current_chunk_page_from || 0);
+  const chunkTo = Number(detail.current_chunk_page_to || 0);
+  const pageBatchSize = Number(detail.page_batch_size || 0);
+  if (!chunkCount) return "";
+  if (currentChunkIndex && chunkFrom && chunkTo) {
+    return `切片进度：已完成 ${Math.min(completedChunkCount, chunkCount)} / ${chunkCount} · 当前第 ${currentChunkIndex} 段（第 ${chunkFrom}-${chunkTo} 页）· 每批 ${pageBatchSize || "-"} 页`;
+  }
+  return `切片进度：已完成 ${Math.min(completedChunkCount, chunkCount)} / ${chunkCount} · 每批 ${pageBatchSize || "-"} 页`;
+}
+
+function libraryJobResumeDetailText(job: LibraryParseJobStatus) {
+  const detail = job.scope_config_json?.detail || {};
+  const resumedPages = Number(detail.resumed_pages || 0);
+  const resumedChunks = Number(detail.resumed_chunk_count || 0);
+  const resumeStartPage = Number(detail.resume_start_page || 0);
+  if (!resumedPages && !resumedChunks) return "";
+  if (resumeStartPage > 0) {
+    return `断点续跑已复用 ${resumedPages} 页、${resumedChunks} 个切片，从第 ${resumeStartPage} 页继续。`;
+  }
+  return `断点续跑已复用 ${resumedPages} 页、${resumedChunks} 个切片，当前参数下无需重跑已完成部分。`;
+}
+
+function isLibraryPreviewResult(value: unknown): value is LibraryFilePreview {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<LibraryFilePreview>;
+  return typeof item.file_id === "string" && typeof item.filename === "string" && typeof item.token_count === "number";
+}
+
+function isLibraryReparseResult(value: unknown): value is LibraryReparseResponse {
+  if (!isLibraryPreviewResult(value)) return false;
+  const item = value as Partial<LibraryReparseResponse>;
+  return typeof item.stored_sequence_number === "number" && Array.isArray(item.kept_results);
 }
 
 type LibraryMeta = {
@@ -433,4 +699,20 @@ function findSubject(subjects: SubjectConfig[], value: string): SubjectConfig | 
       subject.id.toLowerCase() === normalized ||
       (normalized === "cpa" && subject.id === "cpa")
   );
+}
+
+function buildSubjectConfigs(subjects: SubjectResponse[], categories: SubjectCategoryResponse[]): SubjectConfig[] {
+  const categoriesBySubjectId = new Map<number, string[]>();
+  for (const category of categories) {
+    const current = categoriesBySubjectId.get(category.subject_id) || [];
+    if (!current.includes(category.name)) current.push(category.name);
+    categoriesBySubjectId.set(category.subject_id, current);
+  }
+
+  return subjects.map((subject) => ({
+    id: subject.code || String(subject.id),
+    name: subject.name,
+    categories: categoriesBySubjectId.get(subject.id) || [],
+    platform_id: subject.id,
+  }));
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import func, select
 
 from app.models import (
+    AnalysisJob,
     Asset,
     ExamPaper,
     ExamQuestion,
@@ -27,6 +28,38 @@ class PaperRepository(Repository):
 
     def get_paper(self, paper_id: int) -> ExamPaper | None:
         return self.session.get(ExamPaper, paper_id)
+
+    def find_active_parse_job(self, paper_id: int) -> AnalysisJob | None:
+        return self.find_active_job(paper_id, "paper_parse")
+
+    def find_active_job(self, paper_id: int, job_type: str) -> AnalysisJob | None:
+        stmt = (
+            select(AnalysisJob)
+            .where(
+                AnalysisJob.job_type == job_type,
+                AnalysisJob.scope_type == "paper",
+                AnalysisJob.status.in_(("pending", "running")),
+            )
+            .order_by(AnalysisJob.id.desc())
+        )
+        for job in self.session.scalars(stmt):
+            if (job.scope_config_json or {}).get("paper_id") == paper_id:
+                return job
+        return None
+
+    def list_parse_jobs(self, paper_id: int) -> list[AnalysisJob]:
+        return self.list_jobs(paper_id, job_type="paper_parse")
+
+    def list_jobs(self, paper_id: int, job_type: str | None = None) -> list[AnalysisJob]:
+        stmt = select(AnalysisJob).where(AnalysisJob.scope_type == "paper")
+        if job_type is not None:
+            stmt = stmt.where(AnalysisJob.job_type == job_type)
+        stmt = stmt.order_by(AnalysisJob.id.desc())
+        jobs: list[AnalysisJob] = []
+        for job in self.session.scalars(stmt):
+            if (job.scope_config_json or {}).get("paper_id") == paper_id:
+                jobs.append(job)
+        return jobs
 
     def list_sections(self, paper_id: int) -> list[PaperSection]:
         stmt = select(PaperSection).where(PaperSection.paper_id == paper_id).order_by(PaperSection.sort_order.asc())

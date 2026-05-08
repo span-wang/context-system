@@ -1,8 +1,12 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.db.bootstrap import initialize_database
+from app.db.session import SessionLocal
+from app.job_recovery import fail_interrupted_analysis_jobs, sync_paper_parse_job_statuses
 from app.middleware.audit import FailedRequestAuditMiddleware
 from background import start_background_worker, stop_background_worker
 from deps import get_db, get_storage
@@ -13,14 +17,35 @@ from settings import get_settings
 settings = get_settings()
 app = FastAPI(title=settings.app.name, version="0.1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+
+def _allowed_origins() -> list[str]:
+    defaults = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
-    ],
+    ]
+    raw_values = [
+        os.getenv("APP_CORS_ORIGINS"),
+        os.getenv("PUBLIC_WEB_URL"),
+        os.getenv("PUBLIC_WEB_ORIGIN"),
+    ]
+    extras: list[str] = []
+    for raw in raw_values:
+        if not raw:
+            continue
+        for item in raw.replace("\n", ",").split(","):
+            value = item.strip()
+            if not value:
+                continue
+            if "://" not in value:
+                value = f"https://{value}"
+            extras.append(value.rstrip("/"))
+    return list(dict.fromkeys([*defaults, *extras]))
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,6 +69,10 @@ async def startup() -> None:
     get_db()
     get_storage()
     initialize_database()
+    with SessionLocal() as session:
+        fail_interrupted_analysis_jobs(session)
+    with SessionLocal() as session:
+        sync_paper_parse_job_statuses(session)
     await start_background_worker()
 
 

@@ -29,6 +29,7 @@ class Chapter(Base, ManagedEntityMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id"), index=True)
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("subject_categories.id"), nullable=True, index=True)
     parent_id: Mapped[int | None] = mapped_column(ForeignKey("chapters.id"), nullable=True)
     name: Mapped[str] = mapped_column(String(128))
     level: Mapped[int] = mapped_column(Integer, default=1)

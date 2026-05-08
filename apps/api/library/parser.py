@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 import re
 import tempfile
 from collections.abc import Callable
@@ -14,7 +15,15 @@ from library.parse_options import DocumentParseOptions
 from library.pdf_ocr_pipeline import (
     OCRPipelineOptions,
     PADDLE_OCR_LOCK,
+    _count_completed_chunks,
+    _count_fully_completed_chunks,
+    _count_pdf_chunks,
+    _first_missing_page,
+    _get_pdf_page_batch_size,
+    _get_pdf_page_count,
+    _get_pdf_ocr_checkpoint_root,
     _get_paddle_ocr_settings,
+    _render_pdf_page_range_resilient,
     release_paddle_ocr_resources,
     run_pdf_ocr_pipeline,
 )
@@ -61,7 +70,9 @@ def parse_bytes(
     mime: str,
     options: DocumentParseOptions | None = None,
 ) -> str:
-    return parse_document(data, filename, mime, options=options).text
+    options = options or DocumentParseOptions()
+    parsed = parse_document(data, filename, mime, options=options)
+    return options.select_output(text=parsed.text, markdown=parsed.markdown)
 
 
 def parse_document(
@@ -306,11 +317,14 @@ def _ocr_progress_callback(
     if progress_callback is None:
         return None
 
-    def on_page(done_pages: int, total_pages: int) -> None:
+    def on_page(done_pages: int, total_pages: int, detail: dict[str, object] | None = None) -> None:
+        payload = dict(detail or {})
+        payload.setdefault("done_pages", done_pages)
+        payload.setdefault("total_pages", total_pages)
         progress_callback(
             stage,
             min(end, start + int((done_pages / max(1, total_pages)) * max(1, end - start))),
-            {"done_pages": done_pages, "total_pages": total_pages},
+            payload,
         )
 
     return on_page
@@ -350,7 +364,7 @@ def _parse_pdf_with_pp_structure(
     progress_callback: ParseProgressCallback | None = None,
 ) -> ParsedDocument | None:
     try:
-        pages, total_page_count = _render_pdf_pages_for_layout(data, options.render_dpi, options.max_pages)
+        total_page_count = _get_pdf_page_count(data)
     except Exception as exc:
         return ParsedDocument(
             text="",
@@ -360,7 +374,8 @@ def _parse_pdf_with_pp_structure(
             warnings=[f"PP-StructureV3 PDF render failed: {exc}"],
         )
 
-    if not pages:
+    target_page_count = min(total_page_count, options.max_pages) if options.max_pages is not None else total_page_count
+    if target_page_count <= 0:
         return ParsedDocument(
             text="",
             markdown="",
@@ -371,24 +386,81 @@ def _parse_pdf_with_pp_structure(
 
     page_docs: list[ParsedDocument] = []
     warnings: list[str] = []
-    for index, page in enumerate(pages, start=1):
-        if progress_callback is not None:
-            progress_callback("layout_analysis", min(70, 15 + int((index / max(1, len(pages))) * 55)), {"done_pages": index, "total_pages": len(pages)})
-        page_doc = _parse_with_pp_structure(
-            page["image_bytes"],
-            ".png",
-            enable_formula_recognition=options.enable_formula_recognition,
-        )
-        if page_doc is None:
-            warnings.append(f"PP-StructureV3 unavailable on page {index}.")
+    page_batch_size = _get_pdf_page_batch_size(options)
+    checkpoint_dir = _get_pdf_layout_checkpoint_dir(data, options)
+    cached_pages_by_number = {
+        page_number: cached_doc
+        for page_number in range(1, target_page_count + 1)
+        if (cached_doc := _load_pdf_layout_checkpoint_page(checkpoint_dir, page_number)) is not None
+    }
+    total_chunks = _count_pdf_chunks(target_page_count, page_batch_size)
+    resumed_pages = len(cached_pages_by_number)
+    resumed_chunks = _count_completed_chunks(cached_pages_by_number.keys(), page_batch_size)
+    resume_start_page = _first_missing_page(cached_pages_by_number, target_page_count)
+    pending_start_page: int | None = None
+    for page_number in range(1, target_page_count + 1):
+        cached_doc = cached_pages_by_number.get(page_number)
+        if cached_doc is not None:
+            if pending_start_page is not None:
+                _process_pdf_layout_page_range(
+                    data,
+                    options,
+                    page_docs=page_docs,
+                    warnings=warnings,
+                    progress_callback=progress_callback,
+                    target_page_count=target_page_count,
+                    page_batch_size=page_batch_size,
+                    checkpoint_dir=checkpoint_dir,
+                    total_chunks=total_chunks,
+                    resumed_pages=resumed_pages,
+                    resumed_chunks=resumed_chunks,
+                    resume_start_page=resume_start_page,
+                    start_page=pending_start_page,
+                    end_page=page_number - 1,
+                )
+                pending_start_page = None
+            page_docs.append(cached_doc)
+            if progress_callback is not None:
+                progress_callback(
+                    "layout_analysis",
+                    min(70, 15 + int((page_number / max(1, target_page_count)) * 55)),
+                    {
+                        "done_pages": len(page_docs),
+                        "total_pages": target_page_count,
+                        "page_batch_size": page_batch_size,
+                        "chunk_count": total_chunks,
+                        "completed_chunk_count": _count_fully_completed_chunks(
+                            len(page_docs),
+                            target_page_count,
+                            page_batch_size,
+                        ),
+                        "resumed_pages": resumed_pages,
+                        "resumed_chunk_count": resumed_chunks,
+                        "resume_start_page": resume_start_page,
+                    },
+                )
             continue
-        if page_doc.warnings:
-            warnings.extend(f"page {index}: {warning}" for warning in page_doc.warnings)
-        for parsed_page in page_doc.pages:
-            parsed_page.page_number = index
-        for table in page_doc.tables:
-            table.page = index
-        page_docs.append(page_doc)
+
+        if pending_start_page is None:
+            pending_start_page = page_number
+
+    if pending_start_page is not None:
+        _process_pdf_layout_page_range(
+            data,
+            options,
+            page_docs=page_docs,
+            warnings=warnings,
+            progress_callback=progress_callback,
+            target_page_count=target_page_count,
+            page_batch_size=page_batch_size,
+            checkpoint_dir=checkpoint_dir,
+            total_chunks=total_chunks,
+            resumed_pages=resumed_pages,
+            resumed_chunks=resumed_chunks,
+            resume_start_page=resume_start_page,
+            start_page=pending_start_page,
+            end_page=target_page_count,
+        )
 
     if not page_docs:
         return ParsedDocument(
@@ -403,8 +475,8 @@ def _parse_pdf_with_pp_structure(
     tables = [table for doc in page_docs for table in doc.tables]
     text = "\n\n".join(doc.text for doc in page_docs if doc.text.strip())
     markdown = "\n\n".join(doc.markdown for doc in page_docs if doc.markdown.strip())
-    if options.max_pages is not None and total_page_count > len(pages):
-        warnings.append(f"Layout analysis limited to first {len(pages)} of {total_page_count} pages.")
+    if options.max_pages is not None and total_page_count > target_page_count:
+        warnings.append(f"Layout analysis limited to first {target_page_count} of {total_page_count} pages.")
     return ParsedDocument(
         text=text,
         markdown=markdown or text,
@@ -416,22 +488,115 @@ def _parse_pdf_with_pp_structure(
     )
 
 
-def _render_pdf_pages_for_layout(pdf_bytes: bytes, dpi: int, max_pages: int | None = None) -> tuple[list[dict[str, Any]], int]:
-    try:
-        import pymupdf
-    except Exception:
-        import fitz as pymupdf
+def _process_pdf_layout_page_range(
+    data: bytes,
+    options: OCRPipelineOptions,
+    *,
+    page_docs: list[ParsedDocument],
+    warnings: list[str],
+    progress_callback: ParseProgressCallback | None,
+    target_page_count: int,
+    page_batch_size: int,
+    checkpoint_dir: Path,
+    total_chunks: int,
+    resumed_pages: int,
+    resumed_chunks: int,
+    resume_start_page: int | None,
+    start_page: int,
+    end_page: int,
+) -> None:
+    for batch_start in range(start_page - 1, end_page, page_batch_size):
+        batch_end = min(batch_start + page_batch_size, end_page)
+        pages, render_warnings = _render_pdf_page_range_resilient(
+            data,
+            options.render_dpi,
+            batch_start,
+            batch_end,
+        )
+        warnings.extend(render_warnings)
 
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    scale = dpi / 72.0
-    matrix = pymupdf.Matrix(scale, scale)
-    pages: list[dict[str, Any]] = []
-    for page_index, page in enumerate(doc):
-        if max_pages is not None and page_index >= max_pages:
-            break
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        pages.append({"image_bytes": pix.tobytes("png")})
-    return pages, doc.page_count
+        for page in pages:
+            page_number = int(page.get("page_number") or 0)
+            if progress_callback is not None:
+                progress_callback(
+                    "layout_analysis",
+                    min(70, 15 + int((page_number / max(1, target_page_count)) * 55)),
+                    {
+                        "done_pages": len(page_docs) + 1,
+                        "total_pages": target_page_count,
+                        "page_batch_size": page_batch_size,
+                        "chunk_count": total_chunks,
+                        "completed_chunk_count": _count_fully_completed_chunks(
+                            len(page_docs) + 1,
+                            target_page_count,
+                            page_batch_size,
+                        ),
+                        "current_chunk_index": (batch_start // page_batch_size) + 1,
+                        "current_chunk_page_from": batch_start + 1,
+                        "current_chunk_page_to": batch_end,
+                        "resumed_pages": resumed_pages,
+                        "resumed_chunk_count": resumed_chunks,
+                        "resume_start_page": resume_start_page,
+                    },
+                )
+            page_doc = _parse_with_pp_structure(
+                page["image_bytes"],
+                ".png",
+                enable_formula_recognition=options.enable_formula_recognition,
+            )
+            if page_doc is None:
+                warnings.append(f"PP-StructureV3 unavailable on page {page_number}.")
+                continue
+            if page_doc.warnings:
+                warnings.extend(f"page {page_number}: {warning}" for warning in page_doc.warnings)
+            for parsed_page in page_doc.pages:
+                parsed_page.page_number = page_number
+            for table in page_doc.tables:
+                table.page = page_number
+            page_docs.append(page_doc)
+            _save_pdf_layout_checkpoint_page(checkpoint_dir, page_number, page_doc)
+
+        release_paddle_ocr_resources(clear_cached_engines=False, force_clear_cache=True)
+
+
+def _get_pdf_layout_checkpoint_dir(data: bytes, options: OCRPipelineOptions) -> Path:
+    options_payload = {
+        key: value
+        for key, value in asdict(options).items()
+        if key not in {"max_pages", "page_chunk_size"}
+    }
+    payload = json.dumps(
+        {
+            "provider": "pp_structure_v3",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "options": options_payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    checkpoint_dir = _get_pdf_ocr_checkpoint_root() / "layout" / digest[:2] / digest
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    return checkpoint_dir
+
+
+def _load_pdf_layout_checkpoint_page(checkpoint_dir: Path, page_number: int) -> ParsedDocument | None:
+    path = checkpoint_dir / f"page_{page_number:05d}.json"
+    if not path.exists():
+        return None
+    parsed = deserialize_parsed_document(path.read_text(encoding="utf-8"))
+    if parsed is None:
+        return None
+    return parsed
+
+
+def _save_pdf_layout_checkpoint_page(checkpoint_dir: Path, page_number: int, document: ParsedDocument) -> None:
+    if any((warning or "").startswith("PP-StructureV3 parse failed:") for warning in document.warnings):
+        return
+    path = checkpoint_dir / f"page_{page_number:05d}.json"
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(serialize_parsed_document(document), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _parse_text_document(data: bytes) -> ParsedDocument:
@@ -463,11 +628,14 @@ def _extract_selectable_pdf_text(data: bytes) -> ParsedDocument | None:
 
     pages: list[ParsedPage] = []
     page_texts: list[str] = []
-    for index, page in enumerate(doc, start=1):
-        text = page.get_text("text").strip()
-        pages.append(ParsedPage(page_number=index, text=text, markdown=text))
-        if text:
-            page_texts.append(text)
+    try:
+        for index, page in enumerate(doc, start=1):
+            text = page.get_text("text").strip()
+            pages.append(ParsedPage(page_number=index, text=text, markdown=text))
+            if text:
+                page_texts.append(text)
+    finally:
+        doc.close()
 
     merged = "\n\n".join(page_texts)
     return ParsedDocument(
@@ -772,16 +940,23 @@ def _get_pp_structure_pipeline():
             if getattr(_get_pp_structure_pipeline, "_pipeline", None) is None:
                 _get_pp_structure_pipeline._touched = True
                 ocr_settings = _get_paddle_ocr_settings()
-                pipeline = PPStructureV3(
-                    device=str(ocr_settings["device"]),
-                    enable_hpi=False,
-                    use_tensorrt=False,
-                    enable_mkldnn=False,
-                    cpu_threads=4,
-                    text_detection_model_name=ocr_settings["text_detection_model_name"],
-                    text_recognition_model_name=ocr_settings["text_recognition_model_name"],
-                    text_rec_score_thresh=0.0,
-                )
+                init_kwargs = {
+                    "device": str(ocr_settings["device"]),
+                    "enable_hpi": False,
+                    "use_tensorrt": False,
+                    "enable_mkldnn": False,
+                    "cpu_threads": 4,
+                    "text_rec_score_thresh": 0.0,
+                }
+                if ocr_settings["text_detection_model_dir"]:
+                    init_kwargs["text_detection_model_dir"] = ocr_settings["text_detection_model_dir"]
+                else:
+                    init_kwargs["text_detection_model_name"] = ocr_settings["text_detection_model_name"]
+                if ocr_settings["text_recognition_model_dir"]:
+                    init_kwargs["text_recognition_model_dir"] = ocr_settings["text_recognition_model_dir"]
+                else:
+                    init_kwargs["text_recognition_model_name"] = ocr_settings["text_recognition_model_name"]
+                pipeline = PPStructureV3(**init_kwargs)
                 _get_pp_structure_pipeline._pipeline = pipeline
     return _get_pp_structure_pipeline._pipeline
 

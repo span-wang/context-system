@@ -4,6 +4,7 @@ from .legacy import (
     LegacyBackgroundTask,
     LegacyGenerationJob,
     LegacyLibraryFile,
+    LegacyLibraryParseResult,
     LegacyWorkflowEvent,
     LegacyWorkflowTopic,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "LegacyBackgroundTask",
     "LegacyGenerationJob",
     "LegacyLibraryFile",
+    "LegacyLibraryParseResult",
     "LegacyWorkflowEvent",
     "LegacyWorkflowTopic",
     "MasterySnapshot",

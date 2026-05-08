@@ -8,12 +8,29 @@ from app.schemas.common import ORMModel
 class StandardizeQuestionsRequest(BaseModel):
     paper_id: int | None = None
     publish: bool = True
+    use_ai: bool = True
 
 
 class StandardizeQuestionsResponse(BaseModel):
     created: int
     linked: int
+    unlinked: int = 0
     skipped: int
+    normalized: int = 0
+    ai_completed: int = 0
+    tagged: int = 0
+    ai_tagged: int = 0
+
+
+class QuestionSourceSummaryResponse(ORMModel):
+    id: int
+    exam_question_id: int
+    paper_id: int
+    paper_name: str
+    question_no: str
+    source_label: str
+    source_year: int | None = None
+    source_region: str | None = None
 
 
 class GeneratePracticeSetRequest(BaseModel):
@@ -42,6 +59,8 @@ class QuestionBankItemResponse(ORMModel):
     quality_score: float | None = None
     source_count: int
     status: str
+    source_labels: list[str] = []
+    sources: list[QuestionSourceSummaryResponse] = []
 
 
 class PracticeSetResponse(ORMModel):
@@ -54,6 +73,26 @@ class PracticeSetResponse(ORMModel):
     difficulty_policy: str | None = None
     question_count: int
     status: str
+
+
+class PracticeSetQuestionResponse(BaseModel):
+    id: int
+    bank_question_id: int
+    sort_order: int
+    score: int | None = None
+    question_type: str
+    stem_text: str
+    options_json: list[str] | None = None
+    answer_text: str | None = None
+    analysis_text: str | None = None
+    difficulty_level: int | None = None
+    quality_score: float | None = None
+    source_count: int = 0
+    knowledge_point_names: list[str] = []
+
+
+class PracticeSetDetailResponse(PracticeSetResponse):
+    questions: list[PracticeSetQuestionResponse] = []
 
 
 class MockExamResponse(ORMModel):

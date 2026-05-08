@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 
 const links = [
   { href: "/platform/analysis/dashboard", label: "分析看板" },
+  { href: "/platform/analysis/knowledge", label: "考点分析" },
   { href: "/platform/analysis/papers", label: "试卷中心" },
   { href: "/platform/analysis/questions", label: "原始题" },
   { href: "/platform/analysis/reports", label: "分析报告" },
@@ -13,6 +14,7 @@ const links = [
   { href: "/platform/question-bank/practice-sets", label: "练习题包" },
   { href: "/platform/question-bank/mock-exams", label: "模考试卷" },
   { href: "/platform/learners", label: "学员学习" },
+  { href: "/platform/training", label: "模型训练" },
   { href: "/platform/workflow", label: "工作流" },
   { href: "/platform/settings", label: "平台设置" },
 ];

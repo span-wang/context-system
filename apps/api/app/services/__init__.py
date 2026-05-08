@@ -1,23 +1,33 @@
-from .analysis import FrequencyAnalysisService
-from .audit import AuditService
-from .auth import AuthService
-from .knowledge import KnowledgeTreeService
-from .learning import PracticeSessionService
-from .papers import PaperService
-from .question_bank import QuestionBankService
-from .questions import QuestionExtractionService
-from .system import SystemService
-from .workflow import AnalysisToTopicService
+from __future__ import annotations
 
-__all__ = [
-    "AnalysisToTopicService",
-    "AuditService",
-    "AuthService",
-    "FrequencyAnalysisService",
-    "KnowledgeTreeService",
-    "PaperService",
-    "PracticeSessionService",
-    "QuestionBankService",
-    "QuestionExtractionService",
-    "SystemService",
-]
+from importlib import import_module
+
+
+_SERVICE_EXPORTS = {
+    "AnalysisToTopicService": ("app.services.workflow", "AnalysisToTopicService"),
+    "AuditService": ("app.services.audit", "AuditService"),
+    "AuthService": ("app.services.auth", "AuthService"),
+    "FrequencyAnalysisService": ("app.services.analysis", "FrequencyAnalysisService"),
+    "KnowledgeTreeService": ("app.services.knowledge", "KnowledgeTreeService"),
+    "PaperService": ("app.services.papers", "PaperService"),
+    "PracticeSessionService": ("app.services.learning", "PracticeSessionService"),
+    "QuestionBankService": ("app.services.question_bank", "QuestionBankService"),
+    "QuestionExtractionService": ("app.services.questions", "QuestionExtractionService"),
+    "SystemService": ("app.services.system", "SystemService"),
+}
+
+__all__ = sorted(_SERVICE_EXPORTS)
+
+
+def __getattr__(name: str):
+    module_name, attr_name = _SERVICE_EXPORTS.get(name, (None, None))
+    if module_name is None or attr_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(list(globals().keys()) + list(_SERVICE_EXPORTS.keys()))
