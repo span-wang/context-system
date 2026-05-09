@@ -19,6 +19,11 @@ def _find_project_root() -> Path:
 
 
 PROJECT_ROOT = _find_project_root()
+DEFAULT_MYSQL_URL = "mysql+pymysql://examkit:examkit123@127.0.0.1:3309/exam_kit_migrate_20260509?charset=utf8mb4"
+MYSQL_URL_HINT = (
+    "Only MySQL is supported. Set DB_URL to "
+    f"{DEFAULT_MYSQL_URL}"
+)
 
 
 _DOTENV_FILENAMES = (".evn", ".env", ".env.local")
@@ -87,6 +92,15 @@ def _resolve_path(path: str | Path) -> Path:
     return resolved
 
 
+def _normalize_mysql_url(url: str) -> str:
+    candidate = url.strip()
+    if candidate.startswith("mysql+pymysql://") or candidate.startswith("mysql+"):
+        return candidate
+    if candidate.startswith("mysql://"):
+        return f"mysql+pymysql://{candidate.removeprefix('mysql://')}"
+    raise ValueError(MYSQL_URL_HINT)
+
+
 class AppConfig(BaseModel):
     name: str = "exam-kit"
     context_token_limit: int = 900_000
@@ -124,23 +138,11 @@ class StorageConfig(BaseModel):
 
 
 class DBConfig(BaseModel):
-    url: str = "sqlite:///./data/app.db"
-
-    @property
-    def sqlite_path(self) -> Path:
-        if not self.url.startswith("sqlite:///"):
-            raise ValueError("sqlite_path is only available for sqlite:/// database URLs.")
-        if self.url == "sqlite:///:memory:":
-            raise ValueError("sqlite_path is not available for in-memory sqlite databases.")
-        return _resolve_path(self.url.replace("sqlite:///", "", 1))
+    url: str = DEFAULT_MYSQL_URL
 
     @property
     def resolved_url(self) -> str:
-        if self.url == "sqlite:///:memory:":
-            return self.url
-        if self.url.startswith("sqlite:///"):
-            return f"sqlite:///{self.sqlite_path.as_posix()}"
-        return self.url
+        return _normalize_mysql_url(self.url)
 
 
 class RAGFlowConfig(BaseModel):
@@ -241,9 +243,8 @@ def get_settings() -> Settings:
     if os.getenv("STORAGE_ROOT"):
         raw.setdefault("storage", {})["root"] = os.getenv("STORAGE_ROOT")
     settings = Settings.model_validate(_expand_env(raw))
+    settings.db.resolved_url
     settings.storage.root_path.mkdir(parents=True, exist_ok=True)
-    if settings.db.url.startswith("sqlite:///") and settings.db.url != "sqlite:///:memory:":
-        settings.db.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     return settings
 
 

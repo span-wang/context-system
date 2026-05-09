@@ -27,9 +27,12 @@ function parseAllowedDevOrigins() {
 const nextConfig = {
   output: "standalone",
   allowedDevOrigins: parseAllowedDevOrigins(),
+  experimental: {
+    proxyClientMaxBodySize: "50mb",
+  },
   async rewrites() {
     const apiBase = process.env.API_PROXY_TARGET || "http://127.0.0.1:8000";
-    const layoutBase = process.env.LAYOUT_PROXY_TARGET || "https://xhs.panspan.cloud";
+    const layoutBase = process.env.LAYOUT_PROXY_TARGET || "https://context.panspan.cloud";
     return [
       {
         source: "/api/:path*",

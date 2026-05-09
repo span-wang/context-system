@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, JSON, String
+from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, ManagedEntityMixin
@@ -22,18 +22,3 @@ class AnalysisJob(Base, ManagedEntityMixin):
     error_message: Mapped[str | None] = mapped_column(String(255), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-
-class AnalysisReport(Base, ManagedEntityMixin):
-    __tablename__ = "analysis_reports"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    subject_id: Mapped[int | None] = mapped_column(ForeignKey("subjects.id"), nullable=True, index=True)
-    report_type: Mapped[str] = mapped_column(String(64))
-    report_name: Mapped[str] = mapped_column(String(255))
-    scope_config_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    filters_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    snapshot_date: Mapped[date | None] = mapped_column(Date, nullable=True)
-    version_no: Mapped[int] = mapped_column(Integer, default=1)
-    status: Mapped[str] = mapped_column(String(32), default="draft")
-    report_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)

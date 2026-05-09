@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import Field
@@ -17,11 +18,13 @@ class PaperParseResponse(ORMModel):
     tagged_count: int
     preview: str | None = None
     provider: str | None = None
+    parse_mode: str = "rules"
     output_format: Literal["markdown", "text"] = "markdown"
     warnings: list[str] = Field(default_factory=list)
     parse_options: dict[str, object] = Field(default_factory=dict)
     dataset_sample_path: str | None = None
     dataset_auto_exported: bool = False
+    dataset_export_error: str | None = None
 
 
 class PaperParseJobResponse(ORMModel):
@@ -29,6 +32,21 @@ class PaperParseJobResponse(ORMModel):
     paper_id: int
     status: str
     progress: int
+
+
+class AnalysisJobResponse(ORMModel):
+    id: int
+    job_type: str
+    subject_id: int | None = None
+    scope_type: str
+    scope_config_json: dict | None = None
+    status: str
+    progress: int
+    result_summary_json: dict | None = None
+    error_message: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime
 
 
 class PaperUploadResponse(ORMModel):
@@ -46,8 +64,12 @@ class PaperDeleteResponse(ORMModel):
     id: int
     paper_name: str
     deleted: bool
-    removed_question_count: int
-    removed_source_link_count: int
+    removed_asset: bool = False
+    removed_storage_file: bool = False
+    removed_dataset_dir: bool = False
+    removed_parsed_cache_files: int = 0
+    removed_pdf_checkpoint_dirs: int = 0
+    cleanup_warnings: list[str] = Field(default_factory=list)
 
 
 class PaperSummary(ORMModel):
@@ -79,6 +101,7 @@ class PaperSectionResponse(ORMModel):
 
 
 class PaperDetailResponse(PaperSummary):
+    asset_id: int | None = None
     subject_name: str | None = None
     asset_filename: str | None = None
     asset_parse_status: str | None = None

@@ -1,14 +1,14 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { FileText, RefreshCw, RotateCcw, Trash2, UploadCloud } from "lucide-react";
+import Link from "next/link";
+import { FileText, RefreshCw, RotateCcw, Trash2, UploadCloud, ExternalLink } from "lucide-react";
 import {
   apiFetch,
   LibraryFile,
   LibraryParseJobResponse,
   LibraryParseJobStatus,
   LibraryParseMode,
-  LibraryFilePreview,
   LibraryReparseResponse,
   ParseOutputFormat,
   ParsePreset,
@@ -53,7 +53,6 @@ export default function LibraryPage() {
   const [reparsingId, setReparsingId] = useState<string | null>(null);
   const [parsingFileId, setParsingFileId] = useState<string | null>(null);
   const [parseJob, setParseJob] = useState<LibraryParseJobStatus | null>(null);
-  const [preview, setPreview] = useState<LibraryFilePreview | null>(null);
   const [reparseResult, setReparseResult] = useState<LibraryReparseResponse | null>(null);
   const [subjects, setSubjects] = useState<SubjectConfig[]>([]);
   const [parsePreset, setParsePreset] = useState<ParsePreset>("auto");
@@ -204,27 +203,6 @@ export default function LibraryPage() {
     }
   }
 
-  async function showPreview(file: LibraryFile) {
-    setPreviewError("");
-    setMessage(file.token_count == null ? "首次预览正在解析..." : "正在加载预览...");
-    setReparseResult(null);
-    setParseJob(null);
-    setParsingFileId(file.id);
-    try {
-      const params = buildParseParams();
-      const result = await apiFetch<LibraryFilePreview>(`/api/library/files/${file.id}/preview?${params.toString()}`);
-      setPreview(result);
-      setMessage(file.token_count == null ? "首次解析预览完成。" : "预览完成。");
-      if (file.token_count == null || file.token_count !== result.token_count) {
-        await loadFiles();
-      }
-    } catch (error) {
-      setPreviewError(error instanceof Error ? error.message : "加载预览失败");
-    } finally {
-      setParsingFileId(null);
-    }
-  }
-
   async function reparseFile(file: LibraryFile) {
     await startParseJob(file, "reparse");
   }
@@ -234,9 +212,6 @@ export default function LibraryPage() {
     setParseJob(job);
     if (job.status === "completed") {
       const result = job.result_summary_json;
-      if (isLibraryPreviewResult(result)) {
-        setPreview(result);
-      }
       if (isLibraryReparseResult(result)) {
         setReparseResult(result);
         setMessage(
@@ -462,7 +437,6 @@ export default function LibraryPage() {
               <RefreshCw size={17} />
               应用筛选
             </button>
-            {previewError && <p className="errorText">{previewError}</p>}
             <div className="tableWrap">
               <table>
                 <thead>
@@ -492,15 +466,9 @@ export default function LibraryPage() {
                       <td>{renderTokenStatus(file)}</td>
                       <td>
                         <div className="buttonRow">
-                          <button
-                            className="button"
-                            type="button"
-                            disabled={parsingFileId === file.id}
-                            title="解析预览"
-                            onClick={() => showPreview(file)}
-                          >
-                            <FileText size={16} />
-                          </button>
+                          <Link className="button" href={`/analysis/papers/preview?file_id=${file.id}`} title="解析预览">
+                            <ExternalLink size={16} />
+                          </Link>
                           <button
                             className="button"
                             type="button"
@@ -547,29 +515,6 @@ export default function LibraryPage() {
         </div>
       </section>
 
-      {preview && (
-        <section className="panel" style={{ marginTop: 18 }}>
-          <div className="panelHeader">
-            <h2>{preview.filename}</h2>
-            <p>
-              估算 Token：{preview.token_count.toLocaleString()} · 解析器：{preview.provider} · 输出：{preview.output_format} · 表格：{preview.table_count}
-            </p>
-          </div>
-          <div className="panelBody">
-            {!!Object.keys(preview.parse_options || {}).length && (
-              <p className="muted">解析参数：{JSON.stringify(preview.parse_options)}</p>
-            )}
-            {reparseResult && (
-              <p className="muted">
-                已入库第 {reparseResult.stored_sequence_number} 次解析结果，当前仅保留第{" "}
-                {reparseResult.kept_results.map((item) => item.sequence_number).join("、")} 次。
-              </p>
-            )}
-            {!!preview.warnings.length && <p className="muted">{preview.warnings.join(" | ")}</p>}
-            <pre className="markdown">{preview.content || preview.markdown || preview.text}</pre>
-          </div>
-        </section>
-      )}
     </>
   );
 }
@@ -645,17 +590,18 @@ function libraryJobResumeDetailText(job: LibraryParseJobStatus) {
   return `断点续跑已复用 ${resumedPages} 页、${resumedChunks} 个切片，当前参数下无需重跑已完成部分。`;
 }
 
-function isLibraryPreviewResult(value: unknown): value is LibraryFilePreview {
+function isLibraryReparseResult(value: unknown): value is LibraryReparseResponse {
   if (!value || typeof value !== "object") return false;
-  const item = value as Partial<LibraryFilePreview>;
-  return typeof item.file_id === "string" && typeof item.filename === "string" && typeof item.token_count === "number";
+  const item = value as Partial<LibraryReparseResponse>;
+  return (
+    typeof item.file_id === "string" &&
+    typeof item.filename === "string" &&
+    typeof item.token_count === "number" &&
+    typeof item.stored_sequence_number === "number" &&
+    Array.isArray(item.kept_results)
+  );
 }
 
-function isLibraryReparseResult(value: unknown): value is LibraryReparseResponse {
-  if (!isLibraryPreviewResult(value)) return false;
-  const item = value as Partial<LibraryReparseResponse>;
-  return typeof item.stored_sequence_number === "number" && Array.isArray(item.kept_results);
-}
 
 type LibraryMeta = {
   subject: string;

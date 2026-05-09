@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from alembic import command
@@ -15,25 +15,11 @@ from app.db.session import SessionLocal, engine
 from app.models.legacy import LEGACY_TABLE_NAMES
 from app.models import (
     AnalysisJob,
-    AnalysisReport,
     Asset,
     Chapter,
     ExamPaper,
-    ExamQuestion,
-    Favorite,
     KnowledgePoint,
-    LearnerProfile,
-    MasterySnapshot,
-    MockExam,
-    MockExamQuestion,
     PaperSection,
-    PracticeAnswer,
-    PracticeSession,
-    PracticeSet,
-    PracticeSetQuestion,
-    QuestionBankItem,
-    QuestionKnowledgeLink,
-    QuestionSourceLink,
     ReviewTask,
     Role,
     Subject,
@@ -41,7 +27,6 @@ from app.models import (
     Tenant,
     User,
     UserRole,
-    WrongBookItem,
 )
 
 
@@ -197,23 +182,12 @@ def seed_demo_data(session) -> None:
         status="active",
         last_login_at=datetime.utcnow(),
     )
-    learner_user = User(
-        tenant_id=tenant.id,
-        username="learner_demo",
-        password_hash=hash_password("learner123456"),
-        display_name="演示学员",
-        mobile="13900000000",
-        email="learner@example.com",
-        user_type="student",
-        status="active",
-    )
-    session.add_all([admin, learner_user])
+    session.add(admin)
     session.flush()
 
     session.add_all(
         [
             UserRole(tenant_id=tenant.id, user_id=admin.id, role_id=roles[0].id),
-            UserRole(tenant_id=tenant.id, user_id=learner_user.id, role_id=roles[-1].id),
         ]
     )
 
@@ -405,389 +379,45 @@ def seed_demo_data(session) -> None:
     session.add_all([section_choice, section_case])
     session.flush()
 
-    questions = [
-        ExamQuestion(
-            tenant_id=tenant.id,
-            paper_id=paper.id,
-            subject_id=primary_subject.id,
-            section_id=section_choice.id,
-            question_no="1",
-            question_uid="CPA2025-1",
-            question_type="single_choice",
-            stem_text="企业识别履约义务时，以下哪项最符合收入准则要求？",
-            options_json=["按合同逐条拆分", "按可明确区分的承诺拆分", "按收款节点拆分", "按交付批次拆分"],
-            answer_text="B",
-            analysis_text="履约义务应当基于可单独区分的承诺识别。",
-            source_page_from=2,
-            source_page_to=2,
-            score=2,
-            difficulty_level=2,
-            quality_score=0.93,
-            is_duplicate=False,
-            duplicate_group_id=None,
-            parse_status="parsed",
-            review_status="approved",
-            reviewed_by=admin.id,
-            reviewed_at=datetime.utcnow(),
-            created_by=admin.id,
-            updated_by=admin.id,
-        ),
-        ExamQuestion(
-            tenant_id=tenant.id,
-            paper_id=paper.id,
-            subject_id=primary_subject.id,
-            section_id=section_choice.id,
-            question_no="2",
-            question_uid="CPA2025-2",
-            question_type="single_choice",
-            stem_text="关于控制权转移时点的判断，下列说法正确的是哪一项？",
-            options_json=["只看收款时间", "只看发票时间", "结合法定所有权与实物占有等指标", "只看风险报酬"],
-            answer_text="C",
-            analysis_text="控制权转移判断需要综合多项证据，而非单一指标。",
-            source_page_from=2,
-            source_page_to=2,
-            score=2,
-            difficulty_level=3,
-            quality_score=0.9,
-            is_duplicate=False,
-            duplicate_group_id=None,
-            parse_status="parsed",
-            review_status="approved",
-            reviewed_by=admin.id,
-            reviewed_at=datetime.utcnow(),
-            created_by=admin.id,
-            updated_by=admin.id,
-        ),
-        ExamQuestion(
-            tenant_id=tenant.id,
-            paper_id=paper.id,
-            subject_id=primary_subject.id,
-            section_id=section_case.id,
-            question_no="3",
-            question_uid="CPA2025-3",
-            question_type="case_analysis",
-            stem_text="甲公司销售设备并提供安装服务，请判断收入确认时点并说明依据。",
-            options_json=[],
-            answer_text="应分别判断设备与安装服务的履约义务，并依据控制权转移时点确认收入。",
-            analysis_text="本题同时考查履约义务拆分与控制权转移判断。",
-            source_page_from=4,
-            source_page_to=5,
-            score=3,
-            difficulty_level=4,
-            quality_score=0.95,
-            is_duplicate=False,
-            duplicate_group_id=None,
-            parse_status="parsed",
-            review_status="approved",
-            reviewed_by=admin.id,
-            reviewed_at=datetime.utcnow(),
-            created_by=admin.id,
-            updated_by=admin.id,
-        ),
-        ExamQuestion(
-            tenant_id=tenant.id,
-            paper_id=paper.id,
-            subject_id=primary_subject.id,
-            section_id=section_case.id,
-            question_no="4",
-            question_uid="CPA2025-4",
-            question_type="case_analysis",
-            stem_text="分析委托加工材料形成存货时的初始计量口径。",
-            options_json=[],
-            answer_text="应计入采购成本、加工成本及达到当前场所和状态所发生的其他成本。",
-            analysis_text="本题聚焦存货初始计量的成本构成。",
-            source_page_from=6,
-            source_page_to=6,
-            score=3,
-            difficulty_level=3,
-            quality_score=0.88,
-            is_duplicate=False,
-            duplicate_group_id=None,
-            parse_status="parsed",
-            review_status="approved",
-            reviewed_by=admin.id,
-            reviewed_at=datetime.utcnow(),
-            created_by=admin.id,
-            updated_by=admin.id,
-        ),
-    ]
-    session.add_all(questions)
-    session.flush()
-
-    bank_items = [
-        QuestionBankItem(
-            tenant_id=tenant.id,
-            subject_id=primary_subject.id,
-            canonical_stem=question.stem_text,
-            canonical_options_json=question.options_json,
-            canonical_answer=question.answer_text,
-            canonical_analysis=question.analysis_text,
-            question_type=question.question_type,
-            difficulty_level=question.difficulty_level,
-            quality_score=question.quality_score,
-            source_count=1,
-            status="published",
-            created_by=admin.id,
-            updated_by=admin.id,
-        )
-        for question in questions
-    ]
-    session.add_all(bank_items)
-    session.flush()
-
-    for question, item in zip(questions, bank_items, strict=True):
-        session.add(
-            QuestionSourceLink(
-                tenant_id=tenant.id,
-                bank_question_id=item.id,
-                exam_question_id=question.id,
-                paper_id=paper.id,
-                source_year=paper.exam_year,
-                source_region=paper.exam_region,
-                created_by=admin.id,
-                updated_by=admin.id,
-            )
-        )
-
-    knowledge_mapping = [
-        (questions[0], kp_revenue, True),
-        (questions[1], kp_control, True),
-        (questions[2], kp_revenue, True),
-        (questions[2], kp_control, False),
-        (questions[3], kp_inventory, True),
-    ]
-    for question, point, is_primary in knowledge_mapping:
-        session.add(
-            QuestionKnowledgeLink(
-                tenant_id=tenant.id,
-                question_id=question.id,
-                question_layer="raw",
-                knowledge_point_id=point.id,
-                link_type="manual_reviewed",
-                confidence_score=0.92 if is_primary else 0.74,
-                evidence_text=question.stem_text[:64],
-                tag_source="seed",
-                is_primary=is_primary,
-                review_status="approved",
-                reviewed_by=admin.id,
-                reviewed_at=datetime.utcnow(),
-                created_by=admin.id,
-                updated_by=admin.id,
-            )
-        )
-
-    report = AnalysisReport(
-        tenant_id=tenant.id,
-        subject_id=primary_subject.id,
-        report_type="hot_knowledge",
-        report_name="2025 会计高频考点报告",
-        scope_config_json={"paper_ids": [paper.id]},
-        filters_json={"exam_year": 2025},
-        snapshot_date=date.today(),
-        version_no=1,
-        status="ready",
-        report_json={
-            "summary": "当前高频考点集中在收入确认与控制权转移。",
-            "top_points": ["收入确认五步法", "控制权转移判断"],
-        },
-        created_by=admin.id,
-        updated_by=admin.id,
-    )
     job = AnalysisJob(
         tenant_id=tenant.id,
-        job_type="generate_report",
+        job_type="paper_parse",
         subject_id=primary_subject.id,
         scope_type="paper",
-        scope_config_json={"paper_ids": [paper.id]},
+        scope_config_json={
+            "paper_id": paper.id,
+            "stage": "completed",
+            "detail": {
+                "paper_id": paper.id,
+                "question_count": paper.total_question_count,
+                "section_count": 2,
+                "tagged_count": 0,
+                "provider": "seed_data",
+                "warnings": [],
+            },
+        },
         status="completed",
         progress=100,
-        result_summary_json={"report_name": report.report_name},
+        result_summary_json={
+            "paper_id": paper.id,
+            "asset_id": asset.id,
+            "parse_status": "parsed",
+            "paper_status": "reviewed",
+            "question_count": paper.total_question_count,
+            "section_count": 2,
+            "tagged_count": 0,
+            "provider": "seed_data",
+            "parse_mode": "rules",
+            "output_format": "markdown",
+            "warnings": [],
+            "parse_options": {},
+        },
         error_message=None,
         created_by=admin.id,
-        started_at=datetime.utcnow() - timedelta(minutes=8),
-        finished_at=datetime.utcnow() - timedelta(minutes=2),
+        started_at=datetime.utcnow(),
+        finished_at=datetime.utcnow(),
         updated_by=admin.id,
     )
-    session.add_all([report, job])
-    session.flush()
-
-    practice_set = PracticeSet(
-        tenant_id=tenant.id,
-        subject_id=primary_subject.id,
-        set_type="high_frequency",
-        title="收入确认冲刺题包",
-        description="围绕收入确认五步法与控制权转移判断的组合训练。",
-        source_report_id=report.id,
-        difficulty_policy="recent_hot_first",
-        question_count=3,
-        status="published",
-        created_by=admin.id,
-        updated_by=admin.id,
-    )
-    mock_exam = MockExam(
-        tenant_id=tenant.id,
-        subject_id=primary_subject.id,
-        title="会计冲刺模考 A 卷",
-        exam_mode="timed",
-        duration_minutes=45,
-        total_score=10,
-        status="published",
-        created_by=admin.id,
-        updated_by=admin.id,
-    )
-    session.add_all([practice_set, mock_exam])
-    session.flush()
-
-    for order, item in enumerate(bank_items[:3], start=1):
-        session.add(
-            PracticeSetQuestion(
-                tenant_id=tenant.id,
-                practice_set_id=practice_set.id,
-                bank_question_id=item.id,
-                sort_order=order,
-                score=2 if order < 3 else 3,
-                created_by=admin.id,
-                updated_by=admin.id,
-            )
-        )
-    for order, item in enumerate(bank_items, start=1):
-        session.add(
-            MockExamQuestion(
-                tenant_id=tenant.id,
-                mock_exam_id=mock_exam.id,
-                bank_question_id=item.id,
-                sort_order=order,
-                score=2 if order < 3 else 3,
-                created_by=admin.id,
-                updated_by=admin.id,
-            )
-        )
-
-    learner = LearnerProfile(
-        tenant_id=tenant.id,
-        user_id=learner_user.id,
-        target_exam="注册会计师",
-        target_year=2026,
-        level="冲刺",
-        preferred_subjects_json=[primary_subject.name],
-        created_by=learner_user.id,
-        updated_by=learner_user.id,
-    )
-    session.add(learner)
-    session.flush()
-
-    session_record = PracticeSession(
-        tenant_id=tenant.id,
-        learner_id=learner.id,
-        session_type="practice_set",
-        subject_id=primary_subject.id,
-        practice_set_id=practice_set.id,
-        mock_exam_id=None,
-        status="submitted",
-        started_at=datetime.utcnow() - timedelta(days=1),
-        submitted_at=datetime.utcnow() - timedelta(days=1, minutes=-35),
-        score=5,
-        accuracy_rate=0.67,
-        duration_seconds=1980,
-        created_by=learner_user.id,
-        updated_by=learner_user.id,
-    )
-    session.add(session_record)
-    session.flush()
-
-    session.add_all(
-        [
-            PracticeAnswer(
-                tenant_id=tenant.id,
-                session_id=session_record.id,
-                bank_question_id=bank_items[0].id,
-                learner_answer="B",
-                is_correct=True,
-                score=2,
-                spent_seconds=260,
-                knowledge_snapshot_json={"primary": kp_revenue.name},
-                created_by=learner_user.id,
-                updated_by=learner_user.id,
-            ),
-            PracticeAnswer(
-                tenant_id=tenant.id,
-                session_id=session_record.id,
-                bank_question_id=bank_items[1].id,
-                learner_answer="A",
-                is_correct=False,
-                score=0,
-                spent_seconds=310,
-                knowledge_snapshot_json={"primary": kp_control.name},
-                created_by=learner_user.id,
-                updated_by=learner_user.id,
-            ),
-        ]
-    )
-
-    session.add(
-        WrongBookItem(
-            tenant_id=tenant.id,
-            learner_id=learner.id,
-            bank_question_id=bank_items[1].id,
-            source_session_id=session_record.id,
-            wrong_count=2,
-            last_wrong_at=datetime.utcnow() - timedelta(days=1),
-            mastered=False,
-            created_by=learner_user.id,
-            updated_by=learner_user.id,
-        )
-    )
-    session.add(
-        Favorite(
-            tenant_id=tenant.id,
-            learner_id=learner.id,
-            bank_question_id=bank_items[2].id,
-            created_by=learner_user.id,
-            updated_by=learner_user.id,
-        )
-    )
-    session.add_all(
-        [
-            MasterySnapshot(
-                tenant_id=tenant.id,
-                learner_id=learner.id,
-                subject_id=primary_subject.id,
-                knowledge_point_id=kp_revenue.id,
-                mastery_score=0.81,
-                answered_count=12,
-                correct_count=10,
-                snapshot_date=date.today(),
-                created_by=learner_user.id,
-                updated_by=learner_user.id,
-            ),
-            MasterySnapshot(
-                tenant_id=tenant.id,
-                learner_id=learner.id,
-                subject_id=primary_subject.id,
-                knowledge_point_id=kp_control.id,
-                mastery_score=0.58,
-                answered_count=9,
-                correct_count=5,
-                snapshot_date=date.today(),
-                created_by=learner_user.id,
-                updated_by=learner_user.id,
-            ),
-        ]
-    )
-
-    session.add(
-        ReviewTask(
-            tenant_id=tenant.id,
-            task_type="question_review",
-            target_type="exam_question",
-            target_id=str(questions[2].id),
-            status="pending",
-            assigned_to=admin.id,
-            priority="high",
-            review_note="补充次考点解释与证据片段。",
-            created_by=admin.id,
-            updated_by=admin.id,
-        )
-    )
+    session.add(job)
 
     session.commit()

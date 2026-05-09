@@ -13,6 +13,7 @@ from typing import Any
 
 from library.parse_options import DocumentParseOptions
 from library.pdf_ocr_pipeline import (
+    CHECKPOINT_NAMESPACE_FILENAME,
     OCRPipelineOptions,
     PADDLE_OCR_LOCK,
     _count_completed_chunks,
@@ -27,10 +28,12 @@ from library.pdf_ocr_pipeline import (
     release_paddle_ocr_resources,
     run_pdf_ocr_pipeline,
 )
+from library.ocr_cleaner import clean_parsed_document
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 TEXT_CHAR_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
+FORMULA_IMAGE_REF_PATTERN = re.compile(r"img_in_formula_box_[^\s\"')>]+", re.IGNORECASE)
 PDF_TEXT_CHAR_THRESHOLD = 24
 PDF_OCR_PREVIEW_MAX_PAGES = 2
 ParseProgressCallback = Callable[[str, int, dict[str, object] | None], None]
@@ -44,10 +47,24 @@ class ParsedTable:
 
 
 @dataclass
+class ParsedBlock:
+    page_number: int
+    block_id: str
+    text: str = ""
+    bbox: list[float] = field(default_factory=list)
+    score: float | None = None
+    block_type: str = "text"
+    latex: str | None = None
+
+
+@dataclass
 class ParsedPage:
     page_number: int
+    width: float = 0.0
+    height: float = 0.0
     text: str = ""
     markdown: str = ""
+    blocks: list[ParsedBlock] = field(default_factory=list)
 
 
 @dataclass
@@ -59,9 +76,56 @@ class ParsedDocument:
     pages: list[ParsedPage] = field(default_factory=list)
     tables: list[ParsedTable] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    cleanup_report: dict[str, Any] = field(default_factory=dict)
+    cleanup_score: float | None = None
+    raw_text: str = ""
+    raw_markdown: str = ""
+    markdown_image_roots: list[str] = field(default_factory=list)
+    markdown_images: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "text": self.text,
+            "markdown": self.markdown,
+            "provider": self.provider,
+            "used_ocr": self.used_ocr,
+            "pages": [
+                {
+                    "page_number": page.page_number,
+                    "width": page.width,
+                    "height": page.height,
+                    "text": page.text,
+                    "markdown": page.markdown,
+                    "blocks": [
+                        {
+                            "page_number": block.page_number,
+                            "block_id": block.block_id,
+                            "text": block.text,
+                            "bbox": list(block.bbox),
+                            "score": block.score,
+                            "block_type": block.block_type,
+                            "latex": block.latex,
+                        }
+                        for block in page.blocks
+                    ],
+                }
+                for page in self.pages
+            ],
+            "tables": [
+                {
+                    "page": table.page,
+                    "markdown": table.markdown,
+                    "html": table.html,
+                }
+                for table in self.tables
+            ],
+            "warnings": list(self.warnings),
+            "cleanup_report": dict(self.cleanup_report or {}),
+            "cleanup_score": self.cleanup_score,
+            "raw_text": self.raw_text,
+            "raw_markdown": self.raw_markdown,
+            "markdown_image_roots": list(self.markdown_image_roots or []),
+        }
 
 
 def parse_bytes(
@@ -81,20 +145,31 @@ def parse_document(
     mime: str,
     options: DocumentParseOptions | None = None,
     progress_callback: ParseProgressCallback | None = None,
+    cache_namespace: str | None = None,
 ) -> ParsedDocument:
     try:
         options = options or DocumentParseOptions()
         suffix = Path(filename).suffix.lower()
 
         if options.should_use_pdf_ocr(filename, mime):
-            return _parse_pdf_with_options(data, filename, options, progress_callback=progress_callback)
+            return clean_parsed_document(
+                _parse_pdf_with_options(
+                    data,
+                    filename,
+                    options,
+                    progress_callback=progress_callback,
+                    cache_namespace=cache_namespace,
+                )
+            )
         if suffix == ".pdf" or mime == "application/pdf":
-            return _parse_pdf(data, filename, progress_callback=progress_callback)
+            return clean_parsed_document(
+                _parse_pdf(data, filename, progress_callback=progress_callback, cache_namespace=cache_namespace)
+            )
         if suffix in {".docx", ".doc"}:
-            return _parse_docx(data)
+            return clean_parsed_document(_parse_docx(data))
         if suffix in IMAGE_SUFFIXES or mime.startswith("image/"):
-            return _parse_image(data, suffix or ".png")
-        return _parse_text_document(data)
+            return clean_parsed_document(_parse_image(data, suffix or ".png"))
+        return clean_parsed_document(_parse_text_document(data))
     finally:
         release_paddle_parser_resources()
 
@@ -114,7 +189,7 @@ def parse_preview_document(
             if direct is not None and _document_has_meaningful_text(direct):
                 direct.provider = "pymupdf_text"
                 direct.used_ocr = False
-                return direct
+                return clean_parsed_document(direct)
 
             warning = (
                 "未检测到可直接提取的 PDF 文本。该文件可能是扫描件；"
@@ -124,13 +199,17 @@ def parse_preview_document(
                 direct.provider = "pymupdf_text_preview"
                 direct.used_ocr = False
                 direct.warnings.append(warning)
-                return direct
-            return ParsedDocument(text="", markdown="", provider="pymupdf_text_preview", warnings=[warning])
+                return clean_parsed_document(direct)
+            return clean_parsed_document(
+                ParsedDocument(text="", markdown="", provider="pymupdf_text_preview", warnings=[warning])
+            )
 
         if is_pdf and options.should_use_pdf_ocr(filename, mime):
-            return _parse_pdf_with_options(data, filename, options, max_pages=PDF_OCR_PREVIEW_MAX_PAGES)
+            return clean_parsed_document(
+                _parse_pdf_with_options(data, filename, options, max_pages=PDF_OCR_PREVIEW_MAX_PAGES)
+            )
 
-        return _parse_document_inner(data, filename, mime, options=options)
+        return clean_parsed_document(_parse_document_inner(data, filename, mime, options=options))
     finally:
         release_paddle_parser_resources()
 
@@ -141,14 +220,21 @@ def _parse_document_inner(
     mime: str,
     options: DocumentParseOptions | None = None,
     progress_callback: ParseProgressCallback | None = None,
+    cache_namespace: str | None = None,
 ) -> ParsedDocument:
     options = options or DocumentParseOptions()
     suffix = Path(filename).suffix.lower()
 
     if options.should_use_pdf_ocr(filename, mime):
-        return _parse_pdf_with_options(data, filename, options, progress_callback=progress_callback)
+        return _parse_pdf_with_options(
+            data,
+            filename,
+            options,
+            progress_callback=progress_callback,
+            cache_namespace=cache_namespace,
+        )
     if suffix == ".pdf" or mime == "application/pdf":
-        return _parse_pdf(data, filename, progress_callback=progress_callback)
+        return _parse_pdf(data, filename, progress_callback=progress_callback, cache_namespace=cache_namespace)
     if suffix in {".docx", ".doc"}:
         return _parse_docx(data)
     if suffix in IMAGE_SUFFIXES or mime.startswith("image/"):
@@ -172,8 +258,27 @@ def deserialize_parsed_document(payload: str) -> ParsedDocument | None:
     pages = [
         ParsedPage(
             page_number=int(item.get("page_number", index + 1)),
+            width=float(item.get("width") or 0.0),
+            height=float(item.get("height") or 0.0),
             text=str(item.get("text") or ""),
             markdown=str(item.get("markdown") or ""),
+            blocks=[
+                ParsedBlock(
+                    page_number=int(block.get("page_number") or item.get("page_number") or index + 1),
+                    block_id=str(block.get("block_id") or f"p{index + 1}-b{block_index}"),
+                    text=str(block.get("text") or ""),
+                    bbox=[
+                        float(value)
+                        for value in (block.get("bbox") or [])
+                        if isinstance(value, (int, float))
+                    ],
+                    score=float(block.get("score")) if isinstance(block.get("score"), (int, float)) else None,
+                    block_type=str(block.get("block_type") or "text"),
+                    latex=str(block.get("latex")) if block.get("latex") is not None else None,
+                )
+                for block_index, block in enumerate(item.get("blocks") or [], start=1)
+                if isinstance(block, dict)
+            ],
         )
         for index, item in enumerate(raw.get("pages") or [])
         if isinstance(item, dict)
@@ -195,6 +300,11 @@ def deserialize_parsed_document(payload: str) -> ParsedDocument | None:
         pages=pages,
         tables=tables,
         warnings=[str(item) for item in raw.get("warnings") or [] if str(item).strip()],
+        cleanup_report=dict(raw.get("cleanup_report") or {}),
+        cleanup_score=float(raw.get("cleanup_score")) if isinstance(raw.get("cleanup_score"), (int, float)) else None,
+        raw_text=str(raw.get("raw_text") or raw.get("text") or ""),
+        raw_markdown=str(raw.get("raw_markdown") or raw.get("markdown") or raw.get("text") or ""),
+        markdown_image_roots=[str(item) for item in raw.get("markdown_image_roots") or [] if str(item).strip()],
     )
 
 
@@ -204,23 +314,35 @@ def _parse_pdf_with_options(
     options: DocumentParseOptions,
     max_pages: int | None = None,
     progress_callback: ParseProgressCallback | None = None,
+    cache_namespace: str | None = None,
 ) -> ParsedDocument:
     with PADDLE_OCR_LOCK:
         pipeline_options = options.to_pipeline_options()
+        pipeline_options.cache_namespace = cache_namespace
         if max_pages is not None:
             pipeline_options.max_pages = max_pages
         layout_result: ParsedDocument | None = None
         layout_score = 0.0
         if options.should_use_layout_pipeline():
-            layout_result = _parse_pdf_with_pp_structure(data, filename, pipeline_options, progress_callback)
+            layout_result = _parse_pdf_with_pp_structure(
+                data,
+                filename,
+                pipeline_options,
+                progress_callback,
+            )
             if layout_result is not None and _document_has_meaningful_text(layout_result):
                 layout_result.warnings.insert(0, f"parse_preset={options.preset}")
-                layout_score = _document_quality_score(layout_result)
-                if layout_score >= 6.5:
-                    return layout_result
-                layout_result.warnings.append(
-                    f"PP-StructureV3 quality score {layout_score:.2f} below gate; trying PP-OCRv5 fallback."
-                )
+                if _document_has_unresolved_formula_images(layout_result):
+                    layout_result.warnings.append(
+                        "PP-StructureV3 left formula images unresolved; trying PP-OCRv5 fallback."
+                    )
+                else:
+                    layout_score = _document_quality_score(layout_result)
+                    if layout_score >= 6.5:
+                        return layout_result
+                    layout_result.warnings.append(
+                        f"PP-StructureV3 quality score {layout_score:.2f} below gate; trying PP-OCRv5 fallback."
+                    )
 
         result = run_pdf_ocr_pipeline(
             data,
@@ -235,6 +357,12 @@ def _parse_pdf_with_options(
         )
         ocr_document = _document_from_ocr_result(result, warnings_prefix=[f"parse_preset={options.preset}"])
         if layout_result is not None and _document_has_meaningful_text(layout_result):
+            if _document_has_unresolved_formula_images(layout_result):
+                ocr_document.warnings.insert(
+                    1,
+                    "PP-OCRv5 fallback selected because PP-StructureV3 left formula images unresolved.",
+                )
+                return ocr_document
             ocr_score = _document_quality_score(ocr_document)
             if ocr_score >= layout_score:
                 ocr_document.warnings.insert(
@@ -251,7 +379,25 @@ def _parse_pdf_with_options(
 
 def _document_from_ocr_result(result: Any, warnings_prefix: list[str] | None = None) -> ParsedDocument:
     pages = [
-        ParsedPage(page_number=page.page_number, text=page.text, markdown=page.markdown)
+        ParsedPage(
+            page_number=page.page_number,
+            width=float(page.width or 0.0),
+            height=float(page.height or 0.0),
+            text=page.text,
+            markdown=page.markdown,
+            blocks=[
+                ParsedBlock(
+                    page_number=block.page_number,
+                    block_id=block.block_id,
+                    text=block.text,
+                    bbox=[float(value) for value in block.bbox],
+                    score=block.score,
+                    block_type=block.block_type,
+                    latex=block.latex,
+                )
+                for block in page.blocks
+            ],
+        )
         for page in result.pages
     ]
     warnings = [*(warnings_prefix or []), *result.warnings]
@@ -272,6 +418,7 @@ def _parse_pdf(
     data: bytes,
     filename: str,
     progress_callback: ParseProgressCallback | None = None,
+    cache_namespace: str | None = None,
 ) -> ParsedDocument:
     direct = _extract_selectable_pdf_text(data)
     if direct is not None and _document_has_meaningful_text(direct):
@@ -286,6 +433,7 @@ def _parse_pdf(
             options=OCRPipelineOptions(
                 force_ocr=True,
                 render_dpi=240,
+                cache_namespace=cache_namespace,
                 trim_margins=True,
                 remove_repeated_lines=True,
                 watermark_detection=False,
@@ -475,6 +623,12 @@ def _parse_pdf_with_pp_structure(
     tables = [table for doc in page_docs for table in doc.tables]
     text = "\n\n".join(doc.text for doc in page_docs if doc.text.strip())
     markdown = "\n\n".join(doc.markdown for doc in page_docs if doc.markdown.strip())
+    markdown_image_roots = [
+        root
+        for doc in page_docs
+        for root in (getattr(doc, "markdown_image_roots", []) or [])
+        if str(root).strip()
+    ]
     if options.max_pages is not None and total_page_count > target_page_count:
         warnings.append(f"Layout analysis limited to first {target_page_count} of {total_page_count} pages.")
     return ParsedDocument(
@@ -485,6 +639,7 @@ def _parse_pdf_with_pp_structure(
         pages=pages_out,
         tables=tables,
         warnings=warnings,
+        markdown_image_roots=markdown_image_roots,
     )
 
 
@@ -549,6 +704,7 @@ def _process_pdf_layout_page_range(
                 continue
             if page_doc.warnings:
                 warnings.extend(f"page {page_number}: {warning}" for warning in page_doc.warnings)
+            _save_pdf_layout_checkpoint_assets(checkpoint_dir, page_number, page_doc)
             for parsed_page in page_doc.pages:
                 parsed_page.page_number = page_number
             for table in page_doc.tables:
@@ -570,6 +726,7 @@ def _get_pdf_layout_checkpoint_dir(data: bytes, options: OCRPipelineOptions) -> 
             "provider": "pp_structure_v3",
             "sha256": hashlib.sha256(data).hexdigest(),
             "options": options_payload,
+            "cache_namespace": options.cache_namespace,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -577,6 +734,11 @@ def _get_pdf_layout_checkpoint_dir(data: bytes, options: OCRPipelineOptions) -> 
     digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     checkpoint_dir = _get_pdf_ocr_checkpoint_root() / "layout" / digest[:2] / digest
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "source.sha256").write_text(hashlib.sha256(data).hexdigest(), encoding="utf-8")
+    if options.cache_namespace:
+        namespace_path = checkpoint_dir / CHECKPOINT_NAMESPACE_FILENAME
+        if not namespace_path.exists():
+            namespace_path.write_text(options.cache_namespace, encoding="utf-8")
     return checkpoint_dir
 
 
@@ -586,6 +748,8 @@ def _load_pdf_layout_checkpoint_page(checkpoint_dir: Path, page_number: int) -> 
         return None
     parsed = deserialize_parsed_document(path.read_text(encoding="utf-8"))
     if parsed is None:
+        return None
+    if _document_has_image_refs_but_no_assets(parsed):
         return None
     return parsed
 
@@ -597,6 +761,16 @@ def _save_pdf_layout_checkpoint_page(checkpoint_dir: Path, page_number: int, doc
     tmp_path = path.with_suffix(".json.tmp")
     tmp_path.write_text(serialize_parsed_document(document), encoding="utf-8")
     tmp_path.replace(path)
+
+
+def _save_pdf_layout_checkpoint_assets(checkpoint_dir: Path, page_number: int, document: ParsedDocument) -> None:
+    markdown_images = dict(getattr(document, "markdown_images", {}) or {})
+    if not markdown_images:
+        return
+    assets_root = checkpoint_dir / f"page_{page_number:05d}_assets"
+    roots = _persist_markdown_images(markdown_images, assets_root)
+    document.markdown_image_roots.extend(root for root in roots if root not in document.markdown_image_roots)
+    document.markdown_images = {}
 
 
 def _parse_text_document(data: bytes) -> ParsedDocument:
@@ -631,7 +805,39 @@ def _extract_selectable_pdf_text(data: bytes) -> ParsedDocument | None:
     try:
         for index, page in enumerate(doc, start=1):
             text = page.get_text("text").strip()
-            pages.append(ParsedPage(page_number=index, text=text, markdown=text))
+            raw_blocks = page.get_text("blocks") or []
+            blocks: list[ParsedBlock] = []
+            for block_index, raw_block in enumerate(raw_blocks, start=1):
+                if not isinstance(raw_block, (list, tuple)) or len(raw_block) < 5:
+                    continue
+                block_text = str(raw_block[4] or "").strip()
+                if not block_text:
+                    continue
+                blocks.append(
+                    ParsedBlock(
+                        page_number=index,
+                        block_id=f"p{index}-b{block_index}",
+                        text=block_text,
+                        bbox=[
+                            float(raw_block[0]),
+                            float(raw_block[1]),
+                            float(raw_block[2]),
+                            float(raw_block[3]),
+                        ],
+                    )
+                )
+            if not blocks and text:
+                blocks = _synthetic_blocks_from_text(text, index)
+            pages.append(
+                ParsedPage(
+                    page_number=index,
+                    width=float(page.rect.width),
+                    height=float(page.rect.height),
+                    text=text,
+                    markdown=text,
+                    blocks=blocks,
+                )
+            )
             if text:
                 page_texts.append(text)
     finally:
@@ -674,6 +880,22 @@ def _document_quality_score(document: ParsedDocument) -> float:
     score += min(1.0, analysis_hits * 0.5)
     score -= min(2.0, short_line_ratio * 2.0)
     return max(0.0, round(score, 2))
+
+
+def _document_has_unresolved_formula_images(document: ParsedDocument | None) -> bool:
+    if document is None:
+        return False
+    payload_parts = [
+        str(part or "")
+        for part in (document.raw_markdown, document.markdown, document.raw_text, document.text)
+        if str(part or "").strip()
+    ]
+    payload_parts.extend(
+        str(getattr(page, "markdown", "") or getattr(page, "text", "") or "")
+        for page in (document.pages or [])
+    )
+    payload = "\n".join(part for part in payload_parts if part.strip())
+    return bool(FORMULA_IMAGE_REF_PATTERN.search(payload))
 
 
 def _parse_with_pp_structure(
@@ -733,15 +955,29 @@ def _document_from_pp_results(results: list[Any], provider: str) -> ParsedDocume
     warnings: list[str] = []
     text_parts: list[str] = []
     markdown_parts: list[str] = []
+    markdown_images: dict[str, Any] = {}
 
     for page_index, result in enumerate(results, start=1):
         text = _extract_pp_text(result).strip()
-        markdown = _extract_pp_markdown(result).strip()
+        markdown, page_markdown_images = _extract_pp_markdown_bundle(result)
+        markdown = markdown.strip()
+        if page_markdown_images:
+            prefixed_images, path_mapping = _prefix_markdown_image_paths(page_markdown_images, page_number=page_index)
+            markdown_images.update(prefixed_images)
+            text = _replace_markdown_image_paths(text, path_mapping)
+            markdown = _replace_markdown_image_paths(markdown, path_mapping)
         page_tables = _extract_pp_tables(result, page_index)
         tables.extend(page_tables)
         text = _dedupe_table_markup(text, page_tables)
         markdown = _dedupe_table_markup(markdown, page_tables)
-        pages.append(ParsedPage(page_number=page_index, text=text, markdown=markdown or text))
+        pages.append(
+            ParsedPage(
+                page_number=page_index,
+                text=text,
+                markdown=markdown or text,
+                blocks=_synthetic_blocks_from_text(text, page_index),
+            )
+        )
         if text:
             text_parts.append(text)
         if markdown:
@@ -762,6 +998,8 @@ def _document_from_pp_results(results: list[Any], provider: str) -> ParsedDocume
         pages=pages,
         tables=tables,
         warnings=warnings,
+        markdown_image_roots=[],
+        markdown_images=markdown_images,
     )
 
 
@@ -787,18 +1025,37 @@ def _extract_pp_text(result: Any) -> str:
 
 
 def _extract_pp_markdown(result: Any) -> str:
-    markdown = _extract_markdown_payload(getattr(result, "markdown", None))
-    if markdown.strip():
-        return markdown
+    markdown, _ = _extract_pp_markdown_bundle(result)
+    return markdown
+
+
+def _extract_pp_markdown_bundle(result: Any) -> tuple[str, dict[str, Any]]:
+    markdown_value = getattr(result, "markdown", None)
+    if isinstance(markdown_value, dict):
+        markdown = _extract_markdown_payload(markdown_value)
+        markdown_images = _extract_markdown_image_payload(markdown_value.get("markdown_images"))
+        if markdown.strip() or markdown_images:
+            return markdown, markdown_images
+    else:
+        markdown = _extract_markdown_payload(markdown_value)
+        if markdown.strip():
+            return markdown, {}
 
     payload = _result_to_dict(result)
     for key in ("markdown", "md"):
-        markdown = _extract_markdown_payload(payload.get(key))
-        if markdown.strip():
-            return markdown
+        candidate = payload.get(key)
+        if isinstance(candidate, dict):
+            markdown = _extract_markdown_payload(candidate)
+            markdown_images = _extract_markdown_image_payload(candidate.get("markdown_images"))
+            if markdown.strip() or markdown_images:
+                return markdown, markdown_images
+        else:
+            markdown = _extract_markdown_payload(candidate)
+            if markdown.strip():
+                return markdown, {}
 
     outputs = payload.get("parsing_res_list") or payload.get("layout_parsing_result") or payload.get("results")
-    return _collect_markdown_from_blocks(outputs)
+    return _collect_markdown_from_blocks(outputs), {}
 
 
 def _extract_pp_tables(result: Any, page_number: int) -> list[ParsedTable]:
@@ -894,6 +1151,22 @@ def _normalize_text_candidate(value: Any) -> str:
     return str(value).strip()
 
 
+def _synthetic_blocks_from_text(text: str, page_number: int) -> list[ParsedBlock]:
+    blocks: list[ParsedBlock] = []
+    for index, line in enumerate(text.splitlines(), start=1):
+        normalized = line.strip()
+        if not normalized:
+            continue
+        blocks.append(
+            ParsedBlock(
+                page_number=page_number,
+                block_id=f"p{page_number}-synthetic-{index}",
+                text=normalized,
+            )
+        )
+    return blocks
+
+
 def _markdown_to_text(markdown: str) -> str:
     if not markdown:
         return ""
@@ -911,6 +1184,61 @@ def _extract_markdown_payload(value: Any) -> str:
     if isinstance(value, dict):
         return _normalize_text_candidate(value.get("markdown_texts") or value.get("text") or value)
     return _normalize_text_candidate(value)
+
+
+def _extract_markdown_image_payload(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(path).replace("\\", "/"): image
+        for path, image in value.items()
+        if str(path).strip() and image is not None
+    }
+
+
+def _prefix_markdown_image_paths(markdown_images: dict[str, Any], *, page_number: int) -> tuple[dict[str, Any], dict[str, str]]:
+    prefixed: dict[str, Any] = {}
+    path_mapping: dict[str, str] = {}
+    for original_path, image in markdown_images.items():
+        normalized_path = str(original_path).replace("\\", "/").strip()
+        if not normalized_path:
+            continue
+        prefixed_path = f"imgs/page_{page_number:04d}/{Path(normalized_path).name}"
+        prefixed[prefixed_path] = image
+        path_mapping[normalized_path] = prefixed_path
+    return prefixed, path_mapping
+
+
+def _replace_markdown_image_paths(content: str, path_mapping: dict[str, str]) -> str:
+    if not content or not path_mapping:
+        return content
+    updated = content
+    for original_path, next_path in sorted(path_mapping.items(), key=lambda item: len(item[0]), reverse=True):
+        updated = updated.replace(original_path, next_path)
+    return updated
+
+
+def _persist_markdown_images(markdown_images: dict[str, Any], output_root: Path) -> list[str]:
+    if not markdown_images:
+        return []
+    output_root.mkdir(parents=True, exist_ok=True)
+    for relative_path, image in markdown_images.items():
+        target_path = output_root / Path(relative_path.replace("\\", "/"))
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if hasattr(image, "save"):
+            image.save(target_path)
+    return [str(output_root)]
+
+
+def _document_has_image_refs_but_no_assets(document: ParsedDocument | None) -> bool:
+    if document is None:
+        return False
+    payload = "\n".join(
+        str(part or "")
+        for part in (document.raw_markdown, document.markdown, document.raw_text, document.text)
+        if str(part or "").strip()
+    )
+    return ('src="imgs/' in payload or "src='imgs/" in payload) and not (document.markdown_image_roots or [])
 
 
 def _dedupe_table_markup(content: str, tables: list[ParsedTable]) -> str:

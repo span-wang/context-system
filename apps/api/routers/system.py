@@ -12,7 +12,14 @@ from pydantic import BaseModel, Field
 from deps import get_db
 from llm.providers import get_llm_provider
 from rag.ragflow import RAGFlowAPIError, RAGFlowProvider
-from settings import PROJECT_ROOT, LLMEndpointConfig, LLMTarget, get_settings, list_subject_configs, resolve_llm_api_key
+from settings import (
+    PROJECT_ROOT,
+    LLMEndpointConfig,
+    LLMTarget,
+    get_settings,
+    list_subject_configs,
+    resolve_llm_api_key,
+)
 
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -112,6 +119,7 @@ def update_config(request: SystemConfigUpdate) -> dict:
 
     llm_raw["generator"] = _merge_llm_endpoint(generator_raw, request.llm.generator)
     llm_raw["reviewer"] = _merge_llm_endpoint(reviewer_raw, request.llm.reviewer)
+    llm_raw.pop("parser", None)
     raw["llm"] = llm_raw
     _write_config_file(raw)
     get_settings.cache_clear()
@@ -268,7 +276,7 @@ async def test_llm(request: LLMTestRequest | None = None) -> dict:
             "ok": True,
             "provider": endpoint.provider,
             "model": endpoint.model,
-            "message": "OpenAI-compatible credentials are configured",
+            "message": "在线模型凭据已配置",
         }
 
     if endpoint.provider == "anthropic":

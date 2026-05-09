@@ -2,7 +2,7 @@ import { resolvePublicBase } from "./public-base";
 
 export const API_BASE = resolvePublicBase(process.env.NEXT_PUBLIC_API_BASE, "");
 export const LAYOUT_API_BASE = resolvePublicBase(process.env.NEXT_PUBLIC_LAYOUT_API_BASE, "/layout");
-export const LAYOUT_PUBLIC_URL = process.env.NEXT_PUBLIC_LAYOUT_PUBLIC_URL || "https://xhs.panspan.cloud";
+export const LAYOUT_PUBLIC_URL = process.env.NEXT_PUBLIC_LAYOUT_PUBLIC_URL || "https://context.panspan.cloud";
 
 export type ContentType =
   | "mnemonic"
@@ -59,6 +59,8 @@ export type LibraryFilePreview = {
   filename: string;
   token_count: number;
   provider: string;
+  raw_text: string;
+  raw_markdown: string;
   text: string;
   markdown: string;
   content: string;
@@ -68,6 +70,8 @@ export type LibraryFilePreview = {
   warnings: string[];
   truncated: boolean;
   parse_options: Record<string, unknown>;
+  cleanup_report: Record<string, unknown>;
+  cleanup_score?: number | null;
 };
 
 export type LibraryParseResultSummary = {

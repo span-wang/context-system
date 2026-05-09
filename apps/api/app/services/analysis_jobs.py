@@ -81,21 +81,14 @@ def update_job_record(
                 )
             return True
         except OperationalError as exc:
-            if not is_sqlite_lock_error(exc):
+            if attempt == max_attempts:
                 raise
             if best_effort:
                 logger.debug(
-                    "Skipped transient progress update for job %s at stage %s because SQLite was locked.",
+                    "Skipped transient progress update for job %s at stage %s because the database was temporarily unavailable.",
                     job_id,
                     stage,
                 )
                 return False
-            if attempt == max_attempts:
-                raise
             time.sleep(0.2 * attempt)
     return False
-
-
-def is_sqlite_lock_error(exc: OperationalError) -> bool:
-    message = str(exc).lower()
-    return "sqlite" in message and "database is locked" in message

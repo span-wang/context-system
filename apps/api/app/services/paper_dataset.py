@@ -4,16 +4,29 @@ import json
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from app.core.config import get_settings
+from library.parser import ParsedDocument, ParsedPage
 
 
 PAPER_DATASET_AUTO_EXPORT_ENV = "PAPER_DATASET_AUTO_EXPORT"
 PAPER_DATASET_ROOT_ENV = "PAPER_DATASET_ROOT"
 PAPER_DATASET_AUTO_INIT_GOLD_ENV = "PAPER_DATASET_AUTO_INIT_GOLD"
 PAPER_DATASET_INCLUDE_SOURCE_ENV = "PAPER_DATASET_INCLUDE_SOURCE"
+_PENDING_LABEL_STATUSES = {"", "draft", "pending", "todo"}
+
+
+@dataclass(slots=True)
+class PaperDatasetSyncSource:
+    sample_dir: Path
+    source_file: str
+    label_status: str | None
+    meta: dict[str, Any]
+    document: dict[str, Any]
+    used_gold: bool
 
 
 def should_auto_export_paper_dataset() -> bool:
@@ -52,11 +65,22 @@ def safe_name(value: str, fallback: str) -> str:
     return normalized or fallback
 
 
+def is_pending_label_status(status: str | None) -> bool:
+    normalized = str(status or "").strip().lower()
+    return normalized in _PENDING_LABEL_STATUSES
+
+
 def build_paper_parser_prediction(text: str) -> dict[str, Any]:
     from app.services.papers import _parse_question_block, _split_paper_sections
 
     normalized = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    sections = _split_paper_sections(normalized)
+    document = ParsedDocument(
+        text=normalized,
+        markdown=normalized,
+        provider="dataset_source_text",
+        pages=[ParsedPage(page_number=1, text=normalized, markdown=normalized)],
+    )
+    sections = _split_paper_sections(document, normalized)
     payload_sections: list[dict[str, Any]] = []
     total_question_count = 0
 
@@ -137,6 +161,7 @@ def export_paper_parser_sample(
     paper_id: int,
     paper_name: str,
     source_text: str,
+    markdown_image_roots: list[str] | None = None,
     paper_status: str | None = None,
     paper_review_status: str | None = None,
     exam_year: int | None = None,
@@ -162,7 +187,7 @@ def export_paper_parser_sample(
     include_source: bool | None = None,
 ) -> Path:
     dataset_root = output_root or resolve_paper_dataset_root()
-    sample_dir = dataset_root / f"paper_{paper_id:06d}_{safe_name(paper_name or '', 'paper')}"
+    sample_dir = resolve_paper_dataset_sample_dir(paper_id, paper_name, output_root=dataset_root)
     sample_dir.mkdir(parents=True, exist_ok=True)
 
     prediction = build_paper_parser_prediction(source_text)
@@ -223,7 +248,85 @@ def export_paper_parser_sample(
             raw_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_path, raw_dir / asset_filename)
 
+    _copy_markdown_images(sample_dir, markdown_image_roots)
+
     return sample_dir
+
+
+def find_paper_dataset_sample_dir(
+    paper_id: int,
+    paper_name: str | None = None,
+    *,
+    output_root: Path | None = None,
+) -> Path | None:
+    dataset_root = output_root or resolve_paper_dataset_root()
+    preferred = resolve_paper_dataset_sample_dir(paper_id, paper_name or "", output_root=dataset_root)
+    if preferred.exists():
+        return preferred
+
+    candidates = sorted(
+        [path for path in dataset_root.glob(f"paper_{paper_id:06d}_*") if path.is_dir()],
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def load_paper_dataset_sync_source(
+    paper_id: int,
+    paper_name: str | None = None,
+    *,
+    output_root: Path | None = None,
+) -> PaperDatasetSyncSource:
+    sample_dir = find_paper_dataset_sample_dir(paper_id, paper_name, output_root=output_root)
+    if sample_dir is None:
+        raise FileNotFoundError(f"未找到试卷 {paper_id} 对应的训练样本目录")
+
+    meta = _read_json_object(sample_dir / "meta.json")
+    gold = _read_json_object(sample_dir / "gold.json")
+    prediction = _read_json_object(sample_dir / "prediction.json")
+    gold_sections = _extract_sections(gold)
+    prediction_sections = _extract_sections(prediction)
+    label_status = str(gold.get("label_status") or "").strip() or None
+
+    if gold_sections and not is_pending_label_status(label_status):
+        return PaperDatasetSyncSource(
+            sample_dir=sample_dir,
+            source_file="gold.json",
+            label_status=label_status,
+            meta=meta,
+            document=gold,
+            used_gold=True,
+        )
+    if prediction_sections:
+        return PaperDatasetSyncSource(
+            sample_dir=sample_dir,
+            source_file="prediction.json",
+            label_status=label_status,
+            meta=meta,
+            document=prediction,
+            used_gold=False,
+        )
+    if gold_sections:
+        return PaperDatasetSyncSource(
+            sample_dir=sample_dir,
+            source_file="gold.json",
+            label_status=label_status,
+            meta=meta,
+            document=gold,
+            used_gold=True,
+        )
+    raise ValueError(f"训练样本目录 {sample_dir} 中没有可同步的题目数据")
+
+
+def resolve_paper_dataset_sample_dir(
+    paper_id: int,
+    paper_name: str,
+    *,
+    output_root: Path | None = None,
+) -> Path:
+    dataset_root = output_root or resolve_paper_dataset_root()
+    return dataset_root / f"paper_{paper_id:06d}_{safe_name(paper_name or '', 'paper')}"
 
 
 def _resolve_storage_path(storage_path: str) -> Path:
@@ -238,3 +341,45 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None or not value.strip():
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _copy_markdown_images(sample_dir: Path, markdown_image_roots: list[str] | None) -> None:
+    roots = [Path(item) for item in (markdown_image_roots or []) if str(item).strip()]
+    if not roots:
+        return
+    imgs_dir = sample_dir / "imgs"
+    copied: set[Path] = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        source_root = root / "imgs" if (root / "imgs").exists() else root
+        for image_path in source_root.rglob("*"):
+            if not image_path.is_file():
+                continue
+            try:
+                relative_path = image_path.relative_to(source_root)
+            except ValueError:
+                continue
+            target_path = imgs_dir / relative_path
+            if target_path in copied:
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(image_path, target_path)
+            copied.add(target_path)
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _extract_sections(document: dict[str, Any]) -> list[dict[str, Any]]:
+    sections = document.get("sections")
+    if not isinstance(sections, list):
+        return []
+    return [section for section in sections if isinstance(section, dict)]

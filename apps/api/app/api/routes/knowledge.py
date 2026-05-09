@@ -3,8 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_session, require_roles
-from app.schemas.auth import CurrentUserResponse
+from app.api.deps import get_session
 from app.schemas.knowledge import (
     BatchDeleteRequest,
     ChapterDeleteResponse,
@@ -44,11 +43,10 @@ def list_subjects(session: Session = Depends(get_session)) -> list[SubjectRespon
 def create_subject(
     payload: SubjectUpsertRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> SubjectResponse:
-    result = KnowledgeTreeService(session).create_subject(payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).create_subject(payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="create_subject",
         target_type="subject",
@@ -63,11 +61,10 @@ def update_subject(
     subject_id: int,
     payload: SubjectUpsertRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> SubjectResponse:
-    result = KnowledgeTreeService(session).update_subject(subject_id, payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).update_subject(subject_id, payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="update_subject",
         target_type="subject",
@@ -81,11 +78,10 @@ def update_subject(
 def delete_subject(
     subject_id: int,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> SubjectDeleteResponse:
     result = KnowledgeTreeService(session).delete_subject(subject_id)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="delete_subject",
         target_type="subject",
@@ -99,11 +95,10 @@ def delete_subject(
 def batch_delete_subjects(
     payload: BatchDeleteRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> SubjectBatchDeleteResponse:
     result = KnowledgeTreeService(session).batch_delete_subjects(payload)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="batch_delete_subjects",
         target_type="subject",
@@ -129,11 +124,10 @@ def list_categories(
 def create_category(
     payload: SubjectCategoryUpsertRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> SubjectCategoryResponse:
-    result = KnowledgeTreeService(session).create_category(payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).create_category(payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="create_category",
         target_type="subject_category",
@@ -148,11 +142,10 @@ def update_category(
     category_id: int,
     payload: SubjectCategoryUpsertRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> SubjectCategoryResponse:
-    result = KnowledgeTreeService(session).update_category(category_id, payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).update_category(category_id, payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="update_category",
         target_type="subject_category",
@@ -175,11 +168,10 @@ def list_chapters(
 def create_chapter(
     payload: ChapterUpsertRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> ChapterResponse:
-    result = KnowledgeTreeService(session).create_chapter(payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).create_chapter(payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="create_chapter",
         target_type="chapter",
@@ -193,11 +185,10 @@ def create_chapter(
 def import_chapters_from_markdown(
     payload: ChapterMarkdownImportRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> ChapterMarkdownImportResponse:
-    result = KnowledgeTreeService(session).import_chapters_from_markdown(payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).import_chapters_from_markdown(payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="import_chapters_markdown",
         target_type="subject",
@@ -216,11 +207,10 @@ def update_chapter(
     chapter_id: int,
     payload: ChapterUpsertRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> ChapterResponse:
-    result = KnowledgeTreeService(session).update_chapter(chapter_id, payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).update_chapter(chapter_id, payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="update_chapter",
         target_type="chapter",
@@ -234,11 +224,10 @@ def update_chapter(
 def delete_chapter(
     chapter_id: int,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> ChapterDeleteResponse:
     result = KnowledgeTreeService(session).delete_chapter(chapter_id)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="delete_chapter",
         target_type="chapter",
@@ -256,11 +245,10 @@ def delete_chapter(
 def batch_delete_chapters(
     payload: BatchDeleteRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> ChapterBatchDeleteResponse:
     result = KnowledgeTreeService(session).batch_delete_chapters(payload)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="batch_delete_chapters",
         target_type="chapter",
@@ -287,11 +275,10 @@ def list_points(
 def create_point(
     payload: KnowledgePointUpsertRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> KnowledgePointResponse:
-    result = KnowledgeTreeService(session).create_point(payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).create_point(payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="create_point",
         target_type="knowledge_point",
@@ -305,11 +292,10 @@ def create_point(
 def import_points_from_markdown(
     payload: KnowledgePointMarkdownImportRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> KnowledgePointMarkdownImportResponse:
-    result = KnowledgeTreeService(session).import_points_from_markdown(payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).import_points_from_markdown(payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="import_points_markdown",
         target_type="subject",
@@ -329,11 +315,10 @@ def update_point(
     point_id: int,
     payload: KnowledgePointUpsertRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> KnowledgePointResponse:
-    result = KnowledgeTreeService(session).update_point(point_id, payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).update_point(point_id, payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="update_point",
         target_type="knowledge_point",
@@ -355,11 +340,10 @@ def list_textbooks(
 def create_textbook(
     payload: TextbookUpsertRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> TextbookResponse:
-    result = KnowledgeTreeService(session).create_textbook(payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).create_textbook(payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="create_textbook",
         target_type="textbook",
@@ -374,11 +358,10 @@ def update_textbook(
     textbook_id: int,
     payload: TextbookUpsertRequest,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> TextbookResponse:
-    result = KnowledgeTreeService(session).update_textbook(textbook_id, payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).update_textbook(textbook_id, payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="update_textbook",
         target_type="textbook",
@@ -393,12 +376,11 @@ def auto_build_textbook_outline(
     textbook_id: int,
     payload: TextbookAutoBuildRequest | None = None,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> TextbookAutoBuildResponse:
     effective_payload = payload or TextbookAutoBuildRequest()
-    result = KnowledgeTreeService(session).auto_build_textbook_outline(textbook_id, effective_payload, operator_id=current_user.id)
+    result = KnowledgeTreeService(session).auto_build_textbook_outline(textbook_id, effective_payload, operator_id=None)
     AuditService(session).log(
-        current_user,
+        None,
         module="knowledge",
         action="auto_build_textbook_outline",
         target_type="textbook",

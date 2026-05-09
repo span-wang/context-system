@@ -1,6 +1,6 @@
 param(
-  [int]$Port = 3307,
-  [string]$Database = "exam_kit_local",
+  [int]$Port = 3309,
+  [string]$Database = "exam_kit_migrate_20260509",
   [string]$User = "examkit",
   [string]$Password = "examkit123",
   [string]$RootPassword = "root123456",
@@ -23,11 +23,42 @@ $MySqlDExe = (Get-Command mysqld.exe -ErrorAction Stop).Source
 $MySqlExe = (Get-Command mysql.exe -ErrorAction Stop).Source
 $MySqlAdminExe = (Get-Command mysqladmin.exe -ErrorAction Stop).Source
 
+Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+public static class ShortPathNative {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint GetShortPathName(string longPath, StringBuilder shortPath, uint shortPathBuffer);
+}
+"@
+
 function To-MySqlPath([string]$PathValue) {
   return $PathValue.Replace("\", "/")
 }
 
+function Get-ShortPath([string]$PathValue) {
+  if (-not (Test-Path -LiteralPath $PathValue)) {
+    return $PathValue
+  }
+  $builder = New-Object System.Text.StringBuilder 4096
+  $result = [ShortPathNative]::GetShortPathName($PathValue, $builder, [uint32]$builder.Capacity)
+  if ($result -gt 0) {
+    return $builder.ToString()
+  }
+  return $PathValue
+}
+
 New-Item -ItemType Directory -Force -Path $RunDir, $MysqlRoot, $MysqlLogDir, $MysqlTmpDir | Out-Null
+
+$MysqlRootShort = Get-ShortPath $MysqlRoot
+$MysqlDataDirShort = Get-ShortPath $MysqlDataDir
+$MysqlLogDirShort = Get-ShortPath $MysqlLogDir
+$MysqlTmpDirShort = Get-ShortPath $MysqlTmpDir
+$InitSqlPathShort = Get-ShortPath $InitSqlPath
+$ConfigPathShort = Get-ShortPath $ConfigPath
+$MySqlBaseDirShort = Get-ShortPath ([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($MySqlDExe)))
 
 function Write-Step([string]$Message) {
   Write-Host "==> $Message" -ForegroundColor Cyan
@@ -141,17 +172,18 @@ $config = @"
 port=$Port
 bind-address=127.0.0.1
 mysqlx=0
-basedir=$(To-MySqlPath ([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($MySqlDExe))))
-datadir=$(To-MySqlPath $MysqlDataDir)
-tmpdir=$(To-MySqlPath $MysqlTmpDir)
-log-error=$(To-MySqlPath (Join-Path $MysqlLogDir "mysqld.err.log"))
-pid-file=$(To-MySqlPath (Join-Path $MysqlRoot "mysqld.pid"))
+basedir=$(To-MySqlPath $MySqlBaseDirShort)
+datadir=$(To-MySqlPath $MysqlDataDirShort)
+tmpdir=$(To-MySqlPath $MysqlTmpDirShort)
+log-error=$(To-MySqlPath (Get-ShortPath (Join-Path $MysqlLogDir "mysqld.err.log")))
+pid-file=$(To-MySqlPath (Get-ShortPath (Join-Path $MysqlRoot "mysqld.pid")))
 secure-file-priv=
 character-set-server=utf8mb4
 collation-server=utf8mb4_unicode_ci
 default-time-zone=+08:00
 "@
 Set-Content -LiteralPath $ConfigPath -Value $config -Encoding ascii
+$ConfigPathShort = Get-ShortPath $ConfigPath
 
 if (-not (Test-Path -LiteralPath $MysqlDataDir)) {
   Write-Step "Initialize local MySQL data directory"
@@ -164,8 +196,9 @@ GRANT ALL PRIVILEGES ON $Database.* TO '$User'@'127.0.0.1';
 GRANT ALL PRIVILEGES ON $Database.* TO '$User'@'localhost';
 FLUSH PRIVILEGES;
 "@ | Set-Content -LiteralPath $InitSqlPath -Encoding ascii
+  $InitSqlPathShort = Get-ShortPath $InitSqlPath
 
-  & $MySqlDExe --defaults-file=$ConfigPath --initialize-insecure --init-file=$InitSqlPath
+  & $MySqlDExe --defaults-file=$ConfigPathShort --initialize-insecure --init-file=$InitSqlPathShort
   if ($LASTEXITCODE -ne 0) {
     throw "mysqld --initialize-insecure failed."
   }
@@ -175,8 +208,8 @@ Write-Step "Start local MySQL instance on port $Port"
 $mysqlOut = Join-Path $MysqlLogDir "mysqld.out.log"
 $mysqlErr = Join-Path $MysqlLogDir "mysqld.start.err.log"
 $mysqlProc = Start-Process -FilePath $MySqlDExe `
-  -ArgumentList @("--defaults-file=$ConfigPath", "--console") `
-  -WorkingDirectory $MysqlRoot `
+  -ArgumentList @("--defaults-file=$ConfigPathShort", "--console") `
+  -WorkingDirectory $MysqlRootShort `
   -WindowStyle Hidden `
   -RedirectStandardOutput $mysqlOut `
   -RedirectStandardError $mysqlErr `

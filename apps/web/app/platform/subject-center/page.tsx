@@ -66,6 +66,7 @@ export default function SubjectCenterPage() {
   const [pointImportOpen, setPointImportOpen] = useState(false);
   const [pointDetailImportMarkdown, setPointDetailImportMarkdown] = useState("");
   const [pointDetailImportOpen, setPointDetailImportOpen] = useState(false);
+  const [overviewExpandedKeys, setOverviewExpandedKeys] = useState<string[]>([]);
   const [selectedChapterCategoryId, setSelectedChapterCategoryId] = useState<number | null>(null);
   const [selectedChapterRootId, setSelectedChapterRootId] = useState<number | null>(null);
   const [selectedSubjectIds, setSelectedSubjectIds] = useState<number[]>([]);
@@ -174,6 +175,9 @@ export default function SubjectCenterPage() {
     () => chapterCategories.find((category) => category.id === activeChapterCategoryId) || null,
     [activeChapterCategoryId, chapterCategories],
   );
+  useEffect(() => {
+    setOverviewExpandedKeys([]);
+  }, [selectedSubjectId, activeChapterCategoryId]);
   const scopedChaptersForCategory = useMemo(
     () => scopedChapters.filter((chapter) => (activeChapterCategoryId === 0 ? !chapter.category_id : chapter.category_id === activeChapterCategoryId)),
     [activeChapterCategoryId, scopedChapters],
@@ -757,7 +761,7 @@ export default function SubjectCenterPage() {
       <header className="pageHeader">
         <div>
           <h1>学科中心</h1>
-          <p>统一维护学科、类目、章、节和知识点，后续原始题的考点映射会以这里的知识资产为准。</p>
+          <p>统一维护学科、类目、章、节和知识点，后续试卷题目的考点映射会以这里的知识资产为准。</p>
         </div>
         <div className="buttonRow">
           <button className="button" type="button" onClick={() => beginCreate("subject")}>
@@ -782,7 +786,7 @@ export default function SubjectCenterPage() {
         emptyLabel="暂无学科数据"
       />
 
-      {!loading && !error && (
+      {!error && (
         <section className="subjectCenterGrid">
           <aside className="panel">
             <div className="panelHeader">
@@ -1158,7 +1162,7 @@ export default function SubjectCenterPage() {
           <div className="directoryStageHeader">
             <div className="directoryStageTitle">
               <h2>{activeChapterCategory?.name || "目录主视图"}</h2>
-              <p>按“学科 → 类目 → 章 → 节 → 知识点 → 知识点详情”浏览，调整操作保留到后面的页签里。</p>
+              <p>默认全部折叠，按“章 → 节 → 知识点 → 详情”逐层展开浏览。</p>
               <div className="directoryStageMeta">
                 <StatusBadge value={`${rootChapters.length} 个章入口`} tone="info" />
                 <StatusBadge value={`${scopedChaptersForCategory.length} 个章/节节点`} tone="info" />
@@ -1500,39 +1504,42 @@ export default function SubjectCenterPage() {
     const childSections = childChaptersByParent.get(chapter.id) || [];
     const pointsInChapter = rootPointsByChapter.get(chapter.id) || [];
     const detailCount = pointsInChapter.reduce((total, point) => total + (detailCountByPoint.get(point.id) || 0), 0);
-    const expanded = isRoot ? (selectedChapterRoot ? selectedChapterRoot.id === chapter.id : true) : true;
+    const expanded = isOverviewNodeExpanded(`chapter-${chapter.id}`);
+    const hasChildren = childSections.length > 0 || pointsInChapter.length > 0;
     const summary = isRoot
       ? `${childSections.length} 个节 · ${pointCountByChapterTree.get(chapter.id) || 0} 个知识点相关节点`
       : `${pointsInChapter.length} 个知识点 · ${detailCount} 个详情`;
 
     return (
-      <article key={chapter.id} className={isRoot ? "directoryNode root" : "directoryNode section"}>
-        <div className="directoryNodeHeader">
-          <div className="directoryNodeTitle">
+      <article key={chapter.id} className={isRoot ? "directoryTreeBranch root" : "directoryTreeBranch section"}>
+        <button
+          className={expanded ? "directoryTreeRow expanded" : "directoryTreeRow"}
+          type="button"
+          onClick={() => hasChildren && toggleOverviewNode(`chapter-${chapter.id}`)}
+        >
+          <div className="directoryTreeLabel">
+            <span className={hasChildren ? (expanded ? "directoryTreeCaret expanded" : "directoryTreeCaret") : "directoryTreeCaret placeholder"} aria-hidden="true">
+              &gt;
+            </span>
             <span className="chapterLevelPill section">{isRoot ? "章" : "节"}</span>
-            <div>
+            <div className="directoryTreeCopy">
               <strong>{chapter.name}</strong>
               <small>{summary}</small>
             </div>
           </div>
-          <div className="directoryNodeTools">
+          <div className="directoryTreeMeta">
             {!isRoot && <StatusBadge value={`${detailCount} 个详情`} tone={detailCount ? "good" : "info"} />}
-            {isRoot && (
-              <button className="button small" type="button" onClick={() => setSelectedChapterRootId(expanded ? null : chapter.id)}>
-                {expanded ? "收起" : "展开"}
-              </button>
-            )}
           </div>
-        </div>
+        </button>
         {expanded && (
-          <div className="directoryNodeBody">
+          <div className="directoryTreeChildren">
             {!!childSections.length && (
-              <div className="directorySectionStack">
+              <div className="directoryTreeStack">
                 {childSections.map((child) => renderOverviewChapterTree(child, false))}
               </div>
             )}
             {!!pointsInChapter.length && (
-              <div className="directoryPointGrid">
+              <div className="directoryTreeStack">
                 {pointsInChapter.map((point) => renderOverviewPointCard(point))}
               </div>
             )}
@@ -1546,27 +1553,59 @@ export default function SubjectCenterPage() {
   function renderOverviewPointCard(point: KnowledgePointResponse) {
     const details = pointDetailsByParent.get(point.id) || [];
     const preview = point.description || keywordPreview(point.keywords_json) || "暂无知识点说明";
+    const expanded = isOverviewNodeExpanded(`point-${point.id}`);
+    const hasChildren = details.length > 0;
     return (
-      <article key={point.id} className="directoryPointCard">
-        <div className="directoryPointHeader">
-          <span className="chapterLevelPill point">知识点</span>
-          <StatusBadge value={`${details.length} 个详情`} tone={details.length ? "good" : "info"} />
-        </div>
-        <strong className="directoryPointName">{point.name}</strong>
-        <p className="directoryPointMeta">{preview}</p>
+      <article key={point.id} className="directoryTreeBranch point">
+        <button
+          className={expanded ? "directoryTreeRow expanded" : "directoryTreeRow"}
+          type="button"
+          onClick={() => hasChildren && toggleOverviewNode(`point-${point.id}`)}
+        >
+          <div className="directoryTreeLabel">
+            <span className={hasChildren ? (expanded ? "directoryTreeCaret expanded" : "directoryTreeCaret") : "directoryTreeCaret placeholder"} aria-hidden="true">
+              &gt;
+            </span>
+            <span className="chapterLevelPill point">知识点</span>
+            <div className="directoryTreeCopy">
+              <strong>{point.name}</strong>
+              <small>{preview}</small>
+            </div>
+          </div>
+          <div className="directoryTreeMeta">
+            <StatusBadge value={`${details.length} 个详情`} tone={details.length ? "good" : "info"} />
+          </div>
+        </button>
         {!!details.length && (
-          <div className="directoryDetailList">
+          <div className={expanded ? "directoryTreeChildren" : "directoryTreeChildren hidden"}>
             {details.map((detail) => (
-              <div key={detail.id} className="directoryDetailItem">
-                <span className="directoryDetailLabel">详情</span>
-                <strong>{detail.name}</strong>
-                <small>{detail.description || keywordPreview(detail.keywords_json) || "暂无详情说明"}</small>
+              <div key={detail.id} className="directoryTreeLeaf detail">
+                <div className="directoryTreeLabel">
+                  <span className="directoryTreeCaret placeholder" aria-hidden="true">
+                    &gt;
+                  </span>
+                  <span className="chapterLevelPill detail">详情</span>
+                  <div className="directoryTreeCopy">
+                    <strong>{detail.name}</strong>
+                    <small>{detail.description || keywordPreview(detail.keywords_json) || "暂无详情说明"}</small>
+                  </div>
+                </div>
               </div>
             ))}
           </div>
         )}
       </article>
     );
+  }
+
+  function isOverviewNodeExpanded(key: string) {
+    return overviewExpandedKeys.includes(key);
+  }
+
+  function toggleOverviewNode(key: string) {
+    setOverviewExpandedKeys((current) => (
+      current.includes(key) ? current.filter((item) => item !== key) : [...current, key]
+    ));
   }
 
   function renderSectionTree(

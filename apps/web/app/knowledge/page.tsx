@@ -1,5 +1,1 @@
-import { redirect } from "next/navigation";
-
-export default function KnowledgeRedirectPage() {
-  redirect("/platform/subject-center");
-}
+export { default } from "../platform/subject-center/page";

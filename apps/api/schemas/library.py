@@ -52,6 +52,8 @@ class LibraryFilePreview(BaseModel):
     filename: str
     token_count: int
     provider: str = "unknown"
+    raw_text: str = ""
+    raw_markdown: str = ""
     text: str
     markdown: str
     content: str
@@ -61,6 +63,8 @@ class LibraryFilePreview(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     truncated: bool
     parse_options: dict[str, object] = Field(default_factory=dict)
+    cleanup_report: dict[str, object] = Field(default_factory=dict)
+    cleanup_score: float | None = None
 
 
 class LibraryParseResultSummary(BaseModel):

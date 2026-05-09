@@ -1,6 +1,7 @@
 "use client";
 
-import { Gauge, LayoutTemplate, ScanText, Sigma, Trash2, Zap, type LucideIcon } from "lucide-react";
+import Link from "next/link";
+import { LayoutTemplate, Sigma, Trash2, type LucideIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { apiFetch as legacyApiFetch } from "../../../../lib/api";
 import type { SubjectConfig, SystemConfig } from "../../../../lib/api";
@@ -13,7 +14,6 @@ import {
   PaperDeleteResponse,
   PaperDetailResponse,
   PaperParseJobResponse,
-  PaperParseResponse,
   PaperSummary,
   PaperUploadResponse,
   ParsePreset,
@@ -35,19 +35,16 @@ const parsePresetOptions: Array<{
   dpi: string;
   icon: LucideIcon;
 }> = [
-  { value: "auto", label: "自动", engine: "文本优先", dpi: "240", icon: ScanText },
-  { value: "fast", label: "快速 OCR", engine: "PP-OCRv5", dpi: "150", icon: Zap },
-  { value: "balanced", label: "均衡 OCR", engine: "PP-OCRv5", dpi: "220", icon: Gauge },
-  { value: "accurate", label: "高精度版面", engine: "PP-StructureV3", dpi: "280", icon: LayoutTemplate },
-  { value: "formula", label: "公式增强", engine: "PP-StructureV3", dpi: "280", icon: Sigma },
+  { value: "accurate", label: "高精度", engine: "PP-StructureV3", dpi: "320", icon: LayoutTemplate },
+  { value: "formula", label: "公式加强", engine: "PP-StructureV3", dpi: "340", icon: Sigma },
 ];
 
 const presetDefaultDpi: Record<ParsePreset, string> = {
   auto: "240",
   fast: "150",
   balanced: "220",
-  accurate: "280",
-  formula: "280",
+  accurate: "320",
+  formula: "340",
 };
 
 const parseOutputFormatOptions: Array<{ value: ParseOutputFormat; label: string }> = [
@@ -55,12 +52,68 @@ const parseOutputFormatOptions: Array<{ value: ParseOutputFormat; label: string 
   { value: "text", label: "TXT" },
 ];
 
+const uploadRegionOptions = [
+  "全国",
+  "北京",
+  "天津",
+  "上海",
+  "重庆",
+  "河北",
+  "山西",
+  "内蒙古",
+  "辽宁",
+  "吉林",
+  "黑龙江",
+  "江苏",
+  "浙江",
+  "安徽",
+  "福建",
+  "江西",
+  "山东",
+  "河南",
+  "湖北",
+  "湖南",
+  "广东",
+  "广西",
+  "海南",
+  "四川",
+  "贵州",
+  "云南",
+  "西藏",
+  "陕西",
+  "甘肃",
+  "青海",
+  "宁夏",
+  "新疆",
+  "香港",
+  "澳门",
+  "台湾",
+] as const;
+
+type PaperWorkspaceTab = "detail" | "upload";
+
+type PaperListFilters = {
+  subjectId: string;
+  category: string;
+  year: string;
+};
+
+type PaperSubjectMeta = {
+  code: string;
+  name: string;
+  categories: string[];
+};
+
 export default function PapersPage() {
   const [papers, setPapers] = useState<PaperSummary[]>([]);
   const [subjects, setSubjects] = useState<SubjectConfig[]>([]);
   const [selected, setSelected] = useState<PaperDetailResponse | null>(null);
   const [selectedSubjectId, setSelectedSubjectId] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
+  const [filterSubjectId, setFilterSubjectId] = useState("");
+  const [filterCategory, setFilterCategory] = useState("");
+  const [filterYear, setFilterYear] = useState("");
+  const [workspaceTab, setWorkspaceTab] = useState<PaperWorkspaceTab>("detail");
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [parsingId, setParsingId] = useState<number | null>(null);
@@ -75,17 +128,29 @@ export default function PapersPage() {
   const [parseJob, setParseJob] = useState<AnalysisJobResponse | null>(null);
   const [ocrCapability, setOcrCapability] = useState<OCRCapabilityResponse | null>(null);
   const [ocrCapabilityError, setOcrCapabilityError] = useState("");
-  const [parsePreset, setParsePreset] = useState<ParsePreset>("auto");
+  const [parsePreset, setParsePreset] = useState<ParsePreset>("accurate");
   const [outputFormat, setOutputFormat] = useState<ParseOutputFormat>("markdown");
   const [forceOcr, setForceOcr] = useState(false);
-  const [renderDpi, setRenderDpi] = useState(presetDefaultDpi.auto);
+  const [renderDpi, setRenderDpi] = useState(presetDefaultDpi.accurate);
   const [pageChunkSize, setPageChunkSize] = useState("4");
-  const [headerRatio, setHeaderRatio] = useState("0.00");
-  const [footerRatio, setFooterRatio] = useState("0.00");
   const pageRequestGate = useLatestRequestGate();
   const detailRequestIdRef = useRef(0);
   const activeSubject = subjects.find((subject) => subject.id === selectedSubjectId) || null;
   const visibleParseJob = selected && parseJob && Number(parseJob.scope_config_json?.paper_id || 0) === selected.id ? parseJob : null;
+  const listFilters: PaperListFilters = {
+    subjectId: filterSubjectId,
+    category: filterCategory,
+    year: filterYear,
+  };
+  const subjectLookup = buildPaperSubjectLookup(subjects);
+  const filteredPapers = filterPaperList(papers, listFilters, subjectLookup);
+  const categoryOptions = buildPaperCategoryOptions(papers, subjects, subjectLookup, filterSubjectId);
+  const yearOptions = buildPaperYearOptions(papers);
+  const uploadYearOptions = buildUploadYearOptions(yearOptions);
+  const filteredPaperCount = filteredPapers.length;
+  const parsedPaperCount = papers.filter((paper) => paper.status === "parsed").length;
+  const activeFilterCount = Number(Boolean(filterSubjectId)) + Number(Boolean(filterCategory)) + Number(Boolean(filterYear));
+  const selectedSubjectMeta = selected?.subject_id != null ? subjectLookup.get(selected.subject_id) || null : null;
 
   function clearParseStateForPaper(paperId?: number | null) {
     if (paperId == null) {
@@ -162,8 +227,7 @@ export default function PapersPage() {
       }
       if (nextSubjects.status === "fulfilled") {
         const configSubjects = nextSubjects.value.subjects;
-        const nextSubject =
-          configSubjects.find((item) => item.id === selectedSubjectId) || configSubjects[0];
+        const nextSubject = configSubjects.find((item) => item.id === selectedSubjectId) || configSubjects[0];
         setSubjects(configSubjects);
         setSelectedSubjectId(nextSubject?.id || "");
         setSelectedCategory((category) => {
@@ -205,11 +269,35 @@ export default function PapersPage() {
 
   useEffect(() => {
     if (!parseJob || !["pending", "running"].includes(parseJob.status)) return;
+    const intervalMs = 1200;
     const timer = window.setInterval(() => {
       loadParseJob(parseJob.id).catch((err) => setError(toErrorMessage(err, "刷新解析进度失败")));
-    }, 1200);
+    }, intervalMs);
     return () => window.clearInterval(timer);
   }, [parseJob?.id, parseJob?.status]);
+
+  useEffect(() => {
+    if (loading) return;
+    const nextFiltered = filterPaperList(
+      papers,
+      { subjectId: filterSubjectId, category: filterCategory, year: filterYear },
+      buildPaperSubjectLookup(subjects),
+    );
+    const currentSelectedId = selected?.id || null;
+    const currentSelectedVisible = currentSelectedId != null && nextFiltered.some((paper) => paper.id === currentSelectedId);
+    if (!nextFiltered.length) {
+      if (currentSelectedId != null) {
+        setSelected(null);
+        setDetailError("");
+        clearParseStateForPaper(currentSelectedId);
+      }
+      return;
+    }
+    if (!currentSelectedVisible) {
+      setParseMessage("");
+      void loadPaperDetail(nextFiltered[0].id, "加载试卷详情失败");
+    }
+  }, [loading, papers, subjects, filterSubjectId, filterCategory, filterYear, selected?.id]);
 
   async function refreshPapers(selectedId?: number | null) {
     await loadPage(selectedId);
@@ -227,19 +315,17 @@ export default function PapersPage() {
   }
 
   async function loadParseJob(jobId: number) {
-    const job = await apiFetch<AnalysisJobResponse>(`/api/analysis/jobs/${jobId}`);
+    const job = await apiFetch<AnalysisJobResponse>(`/api/papers/parse-jobs/${jobId}`);
     setParseJob(job);
     if (job.status === "completed") {
       const summary = job.result_summary_json || {};
-      const parseOptions = (summary.parse_options && typeof summary.parse_options === "object")
-        ? (summary.parse_options as Record<string, unknown>)
-        : null;
       const warnings = Array.isArray(summary.warnings) ? summary.warnings.map(String).filter(Boolean) : [];
       const datasetSamplePath = typeof summary.dataset_sample_path === "string" ? summary.dataset_sample_path : "";
+      const datasetExportError = typeof summary.dataset_export_error === "string" ? summary.dataset_export_error : "";
       await refreshPapers(selected?.id || null);
       setParsingId(null);
       setParseMessage(
-        `解析完成：${Number(summary.question_count || 0)} 道题已进入题目中心，规则命中 ${Number(summary.tagged_count || 0)} 条候选考点。后续 AI 补全、AI 标注、AI 复核请到 /platform/analysis/questions?paper_id=${selected?.id || 0} 执行${warnings.length ? `；当前有 ${warnings.length} 条待复核提示` : ""}${datasetSamplePath ? `；样本已自动导入 ${datasetSamplePath}` : ""}。`,
+        `解析完成：已生成 ${Number(summary.question_count || 0)} 道题，规则命中 ${Number(summary.tagged_count || 0)} 条候选考点${warnings.length ? `；当前有 ${warnings.length} 条待复核提示` : ""}${datasetSamplePath ? `；样本已自动导入 ${datasetSamplePath}` : ""}${datasetExportError ? `；训练样本自动导入失败：${datasetExportError}` : ""}。`,
       );
     }
     if (job.status === "failed") {
@@ -253,6 +339,8 @@ export default function PapersPage() {
     setError("");
     setDetailError("");
     setListMessage("");
+    setParseMessage("");
+    setWorkspaceTab("detail");
     await loadPaperDetail(id, "加载试卷详情失败");
   }
 
@@ -305,9 +393,14 @@ export default function PapersPage() {
     setListMessage("");
     try {
       const uploaded = await apiFormFetch<PaperUploadResponse>("/api/papers/upload", data);
+      const uploadedYear = String(data.get("exam_year") || "").trim();
       await refreshPapers(uploaded.id);
       form.reset();
       setSelectedSubjectId(activeSubject.id);
+      setFilterSubjectId(activeSubject.id);
+      setFilterCategory(selectedCategory);
+      setFilterYear(uploadedYear);
+      setWorkspaceTab("detail");
       setUploadMessage(`已上传：${uploaded.paper_name}`);
     } catch (err) {
       setUploadError(toErrorMessage(err, "上传试卷失败"));
@@ -329,20 +422,19 @@ export default function PapersPage() {
       if (forceOcr) form.append("force_ocr", "true");
       if (Number(renderDpi) > 0) form.append("render_dpi", String(Number(renderDpi)));
       if (Number(pageChunkSize) > 0) form.append("pdf_page_chunk_size", String(Number(pageChunkSize)));
-      if (Number(headerRatio) > 0) form.append("crop_header_ratio", String(Number(headerRatio)));
-      if (Number(footerRatio) > 0) form.append("crop_footer_ratio", String(Number(footerRatio)));
+      form.append("parse_mode", "rules");
       if (parsePreset === "formula") form.append("enable_formula_recognition", "true");
       const result = await apiFormFetch<PaperParseJobResponse>(`/api/papers/${id}/parse-jobs`, form);
       setParseJob({
         id: result.job_id,
         job_type: "paper_parse",
         scope_type: "paper",
-        scope_config_json: { paper_id: id, stage: "queued" },
+        scope_config_json: { paper_id: id, stage: "queued", parse_mode: "rules" },
         status: result.status,
         progress: result.progress,
         created_at: new Date().toISOString(),
       });
-      setParseMessage(`解析任务已启动：#${result.job_id}。完成后会直接进入题目中心，AI 操作不再自动执行。`);
+      setParseMessage(`解析任务已启动：#${result.job_id}。当前模式：规则切题。`);
       await loadParseJob(result.job_id);
     } catch (err) {
       setError(toErrorMessage(err, "解析试卷失败"));
@@ -353,7 +445,7 @@ export default function PapersPage() {
   }
 
   async function deletePaper(paper: PaperSummary) {
-    const confirmed = window.confirm(`确定删除试卷“${paper.paper_name}”？已解析的分区、原始题和来源链接也会一并删除。`);
+    const confirmed = window.confirm(`确定删除试卷“${paper.paper_name}”？已解析的分区、题目数据和来源链接也会一并删除。`);
     if (!confirmed) return;
     setDeletingId(paper.id);
     setError("");
@@ -366,7 +458,9 @@ export default function PapersPage() {
         ? papers.find((item) => item.id !== paper.id)?.id
         : selected?.id;
       await refreshPapers(nextSelectedId || null);
-      setListMessage(`已删除：${result.paper_name}`);
+      setListMessage(
+        `已删除：${result.paper_name}；源文件${result.removed_storage_file ? "已删除" : "未删除"}；已清理解析缓存 ${Number(result.removed_parsed_cache_files || 0)} 个；已清理 OCR 缓存目录 ${Number(result.removed_pdf_checkpoint_dirs || 0)} 个${result.cleanup_warnings?.length ? `；清理告警：${result.cleanup_warnings.join("；")}` : ""}`,
+      );
     } catch (err) {
       await refreshPapers(selected?.id || null);
       setError(toErrorMessage(err, "删除试卷失败"));
@@ -381,340 +475,654 @@ export default function PapersPage() {
   }
 
   return (
-    <>
-      <header className="pageHeader">
-        <div>
-          <h1>试卷中心</h1>
-          <p>试卷列表、学科和详情加载已做竞态保护，避免旧响应覆盖当前选择。</p>
+    <div className="paperCenterPage">
+      <section className="paperCenterHero">
+        <div className="paperCenterHeroTop">
+          <div className="paperCenterHeroTitle">
+            <span className="paperCenterEyebrow">Paper Workspace</span>
+            <h1>试卷中心</h1>
+          </div>
+          <div className="paperCenterHeroActions">
+            <div className="paperCenterInlineFilters">
+              <select
+                className="paperCenterFilterSelect"
+                aria-label="按学科筛选"
+                value={filterSubjectId}
+                onChange={(event) => {
+                  setFilterSubjectId(event.target.value);
+                  setFilterCategory("");
+                }}
+              >
+                <option value="">全部学科</option>
+                {subjects.map((subject) => (
+                  <option key={subject.id} value={subject.id}>
+                    {subject.name}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="paperCenterFilterSelect"
+                aria-label="按类目筛选"
+                value={filterCategory}
+                onChange={(event) => setFilterCategory(event.target.value)}
+              >
+                <option value="">全部类目</option>
+                {categoryOptions.map((category) => (
+                  <option key={category} value={category}>
+                    {category}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="paperCenterFilterSelect"
+                aria-label="按年份筛选"
+                value={filterYear}
+                onChange={(event) => setFilterYear(event.target.value)}
+              >
+                <option value="">全部年份</option>
+                {yearOptions.map((year) => (
+                  <option key={year} value={year}>
+                    {year}
+                  </option>
+                ))}
+              </select>
+              <button
+                className="button small"
+                type="button"
+                disabled={!activeFilterCount}
+                onClick={() => {
+                  setFilterSubjectId("");
+                  setFilterCategory("");
+                  setFilterYear("");
+                }}
+              >
+                重置
+              </button>
+            </div>
+            <div className="paperCenterHeroMetrics">
+              <div className="paperCenterHeroMetric">
+                <span>已入库</span>
+                <strong>{papers.length}</strong>
+              </div>
+              <div className="paperCenterHeroMetric">
+                <span>当前筛选</span>
+                <strong>{filteredPaperCount}</strong>
+              </div>
+              <div className="paperCenterHeroMetric">
+                <span>已解析</span>
+                <strong>{parsedPaperCount}</strong>
+              </div>
+            </div>
+            <div className="buttonRow">
+              <button className="button primary" type="button" onClick={() => setWorkspaceTab("upload")}>
+                上传新试卷
+              </button>
+              <Link className="button" href={selected?.id ? `/analysis/questions?paperId=${selected.id}` : "/analysis/questions"}>
+                进入题目解析
+              </Link>
+            </div>
+          </div>
         </div>
-      </header>
+      </section>
       {loadWarning && <div className="calloutBox">{loadWarning}</div>}
 
-      <section className="dashboardGrid twoCol">
-        <div className="panel">
-          <div className="panelHeader">
-            <h2>试卷列表</h2>
-            <p>已接入的真题与试卷资产。</p>
+      <section className="dashboardGrid twoCol questionWorkspace paperCenterWorkspace">
+        <div className="panel questionPanel questionQueuePanel paperCenterListPanel">
+          <div className="panelHeader panelHeaderActions">
+            <div>
+              <h2>试卷列表</h2>
+              <p>支持按学科、类目、年份快速收敛范围。</p>
+            </div>
+            <StatusBadge value={`${filteredPaperCount} / ${papers.length}`} tone="info" />
           </div>
-          <div className="panelBody">
-            <LoadState loading={loading} error={error} empty={!papers.length} emptyLabel="暂无试卷数据" />
+          <div className="panelBody questionQueueBody">
             {listMessage && <p className="muted">{listMessage}</p>}
-            {!!papers.length && (
-              <div className="stackList">
-                {papers.map((paper) => (
-                  <div key={paper.id} className="paperListItem">
-                    <button className="paperPickButton" type="button" onClick={() => pickPaper(paper.id)}>
-                      <div>
-                        <strong>{paper.paper_name}</strong>
-                        <span className="muted">
-                          {paper.exam_year || "-"} · {paper.category || "未分类"} · {paper.exam_region || "未知地区"} · {paper.total_question_count} 题 · {paperStatusLabel(paper.status)}
-                        </span>
-                      </div>
-                      <StatusBadge value={paper.review_status} tone={paper.review_status === "approved" ? "good" : "warn"} />
-                    </button>
-                    <div className="paperListActions">
+            <LoadState
+              loading={loading}
+              error={error}
+              empty={!filteredPaperCount}
+              emptyLabel={papers.length ? "当前筛选条件下暂无试卷" : "暂无试卷数据"}
+            />
+            {!!filteredPaperCount && (
+              <div className="stackList paperCenterListScroll">
+                {filteredPapers.map((paper) => {
+                  const subjectMeta = paper.subject_id != null ? subjectLookup.get(paper.subject_id) || null : null;
+                  return (
+                    <div key={paper.id} className="paperListItem">
                       <button
-                        className="button danger small iconButton"
+                        className={`paperPickButton${selected?.id === paper.id ? " active" : ""}`}
                         type="button"
-                        title="删除试卷"
-                        aria-label={`删除试卷 ${paper.paper_name}`}
-                        disabled={deletingId === paper.id}
-                        onClick={() => deletePaper(paper)}
+                        onClick={() => pickPaper(paper.id)}
                       >
-                        <Trash2 size={16} aria-hidden="true" />
-                        <span>{deletingId === paper.id ? "删除中" : "删除"}</span>
+                        <div className="paperCenterCardMain">
+                          <div className="paperCenterCardHeader">
+                            <span className="paperCenterCardEyebrow">{subjectMeta?.name || "未绑定学科"}</span>
+                            <strong>{paper.paper_name}</strong>
+                          </div>
+                          <div className="paperCenterCardMeta">
+                            <span>{paper.category || "未分类"}</span>
+                            <span>{paper.exam_year || "-"} 年</span>
+                            <span>{paper.exam_region || "未知地区"}</span>
+                            <span>{paper.total_question_count} 题</span>
+                          </div>
+                        </div>
+                        <div className="paperCenterListBadgeStack">
+                          <StatusBadge value={paper.review_status} tone={paper.review_status === "approved" ? "good" : "warn"} />
+                          <span className="paperCenterInlineStatus">{paperStatusLabel(paper.status)}</span>
+                        </div>
                       </button>
+                      <div className="paperListActions">
+                        <button
+                          className="button danger small iconButton"
+                          type="button"
+                          title="删除试卷"
+                          aria-label={`删除试卷 ${paper.paper_name}`}
+                          disabled={deletingId === paper.id}
+                          onClick={() => deletePaper(paper)}
+                        >
+                          <Trash2 size={16} aria-hidden="true" />
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
         </div>
 
-        <div className="panel">
-          <div className="panelHeader">
-            <h2>上传试卷</h2>
-            <p>先完成文件与试卷元数据入库，后续解析任务会接管 OCR、切题和考点识别。</p>
+        <div className="panel questionPanel questionDetailPanel paperCenterWorkspacePanel">
+          <div className="panelHeader paperCenterWorkspaceHeader">
+            <div>
+              <h2>{workspaceTab === "detail" ? "试卷详情" : "上传试卷"}</h2>
+              <p>
+                {workspaceTab === "detail"
+                  ? "查看解析状态、分区结果与 OCR 参数。"
+                  : "完成文件入库与元数据补充，不需要离开当前页面。"}
+              </p>
+            </div>
+            <div className="paperCenterTabs" role="tablist" aria-label="试卷工作区">
+              <button
+                className={`paperCenterTab${workspaceTab === "detail" ? " active" : ""}`}
+                type="button"
+                aria-selected={workspaceTab === "detail"}
+                onClick={() => setWorkspaceTab("detail")}
+              >
+                详情
+              </button>
+              <button
+                className={`paperCenterTab${workspaceTab === "upload" ? " active" : ""}`}
+                type="button"
+                aria-selected={workspaceTab === "upload"}
+                onClick={() => setWorkspaceTab("upload")}
+              >
+                上传
+              </button>
+            </div>
           </div>
-          <div className="panelBody">
-            <form className="formGrid" onSubmit={uploadPaper}>
-              <label className="field">
-                <span>试卷文件</span>
-                <input name="file" type="file" accept=".pdf,.png,.jpg,.jpeg,.docx,.md,.txt" disabled={uploading} />
-              </label>
-              <label className="field">
-                <span>试卷名称</span>
-                <input name="paper_name" placeholder="例如：2026 注册会计师《会计》真题" disabled={uploading} />
-              </label>
-              <div className="row">
-                <label className="field">
-                  <span>学科</span>
-                  <select
-                    disabled={uploading}
-                    value={selectedSubjectId}
-                    onChange={(event) => {
-                      const subject = subjects.find((item) => item.id === event.target.value) || null;
-                      setSelectedSubjectId(subject?.id || "");
-                      setSelectedCategory(subject?.categories[0] || "");
-                    }}
-                  >
-                    {!subjects.length && <option value="">请先在学科中心添加学科</option>}
-                    {subjects.map((subject) => (
-                      <option key={subject.id} value={subject.id}>
-                        {subject.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field">
-                  <span>类目</span>
-                  <select
-                    disabled={uploading || !activeSubject}
-                    value={selectedCategory}
-                    onChange={(event) => setSelectedCategory(event.target.value)}
-                  >
-                    <option value="">未分类</option>
-                    {activeSubject?.categories.map((category) => (
-                      <option key={category} value={category}>
-                        {category}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <div className="row">
-                <label className="field">
-                  <span>年份</span>
-                  <input name="exam_year" type="number" min="1990" max="2100" placeholder="2026" disabled={uploading} />
-                </label>
-                <label className="field">
-                  <span>月份</span>
-                  <input name="exam_month" type="number" min="1" max="12" placeholder="8" disabled={uploading} />
-                </label>
-              </div>
-              <div className="row">
-                <label className="field">
-                  <span>地区</span>
-                  <input name="exam_region" placeholder="全国" disabled={uploading} />
-                </label>
-                <label className="field">
-                  <span>考试类型</span>
-                  <input name="exam_type" placeholder="资格考试" disabled={uploading} />
-                </label>
-              </div>
-              <div className="row">
-                <label className="field">
-                  <span>试卷类型</span>
-                  <input name="paper_type" placeholder="真题" disabled={uploading} />
-                </label>
-                <label className="field">
-                  <span>试卷编号</span>
-                  <input name="paper_code" placeholder="可选，例如 CPA-ACC-2026" disabled={uploading} />
-                </label>
-              </div>
-              <div className="buttonRow">
-                <button className="button primary" type="submit" disabled={uploading}>
-                  {uploading ? "上传中..." : "上传并入库"}
-                </button>
-                {uploadMessage && <span className="muted">{uploadMessage}</span>}
-                {uploadError && <span className="errorText">{uploadError}</span>}
-              </div>
-            </form>
-          </div>
-        </div>
+          <div className="panelBody questionDetailBody">
+            {workspaceTab === "detail" ? (
+              <>
+                <LoadState
+                  loading={loading}
+                  error={detailError}
+                  empty={!selected}
+                  emptyLabel={filteredPaperCount ? "请选择一份试卷" : papers.length ? "当前筛选条件下暂无试卷" : "暂无试卷数据"}
+                />
+                {selected && (
+                  <div className="paperCenterDetailScroll">
+                    <section className="paperCenterSelectedHero">
+                      <div className="paperCenterSelectedSummary">
+                        <h3>{selected.paper_name}</h3>
+                        <p>
+                          {selected.category || "未分类"} · {selected.exam_year || "-"} 年 · {selected.exam_region || "未知地区"} · {selected.total_question_count} 题
+                        </p>
+                      </div>
+                      <div className="paperCenterSelectedBadges">
+                        <div className="paperCenterStatusLights" aria-label="试卷状态摘要">
+                          <span
+                            className="paperCenterStatusItem"
+                            title={`解析状态：${
+                              selected.active_parse_stage
+                                ? parseStageLabel(selected.active_parse_stage)
+                                : parseRuntimeStatusLabel(selected.asset_parse_status)
+                            }`}
+                            aria-label={`解析状态：${
+                              selected.active_parse_stage
+                                ? parseStageLabel(selected.active_parse_stage)
+                                : parseRuntimeStatusLabel(selected.asset_parse_status)
+                            }`}
+                          >
+                            <span>解析</span>
+                            <span
+                              className={`paperCenterStatusLight ${statusLightTone(
+                                selected.active_parse_stage ? selected.active_parse_stage : selected.asset_parse_status,
+                                "parse",
+                              )}`}
+                            />
+                          </span>
+                          <span
+                            className="paperCenterStatusItem"
+                            title={`试卷状态：${
+                              selected.active_parse_stage
+                                ? parseStageLabel(selected.active_parse_stage)
+                                : paperStatusLabel(selected.status)
+                            }`}
+                            aria-label={`试卷状态：${
+                              selected.active_parse_stage
+                                ? parseStageLabel(selected.active_parse_stage)
+                                : paperStatusLabel(selected.status)
+                            }`}
+                          >
+                            <span>试卷</span>
+                            <span
+                              className={`paperCenterStatusLight ${statusLightTone(
+                                selected.active_parse_stage ? selected.active_parse_stage : selected.status,
+                                "paper",
+                              )}`}
+                            />
+                          </span>
+                          <span
+                            className="paperCenterStatusItem"
+                            title={`审核状态：${reviewStatusLabel(selected.review_status)}`}
+                            aria-label={`审核状态：${reviewStatusLabel(selected.review_status)}`}
+                          >
+                            <span>审核</span>
+                            <span className={`paperCenterStatusLight ${statusLightTone(selected.review_status, "review")}`} />
+                          </span>
+                        </div>
+                        <span className="paperCenterEyebrow paperCenterSelectedSubjectBadge">
+                          {selectedSubjectMeta?.name || selected.subject_name || "未绑定学科"}
+                        </span>
+                      </div>
+                    </section>
 
-        <div className="panel">
-          <div className="panelHeader">
-            <h2>试卷详情</h2>
-            <p>展示已解析资产、分区和当前状态。</p>
-          </div>
-          <div className="panelBody">
-            <LoadState loading={loading} error={detailError} empty={!selected} emptyLabel="请选择一份试卷" />
-            {selected && (
-              <div className="stackList">
-                <div className="detailRow">
-                  <span>学科</span>
-                  <strong>{selected.subject_name || "-"}</strong>
-                </div>
-                <div className="detailRow">
-                  <span>类目</span>
-                  <strong>{selected.category || "-"}</strong>
-                </div>
-                <div className="detailRow">
-                  <span>素材文件</span>
-                  <strong>{selected.asset_filename || "-"}</strong>
-                </div>
-                <div className="detailRow">
-                  <span>解析状态</span>
-                  <StatusBadge
-                    value={selected.active_parse_stage ? parseStageLabel(selected.active_parse_stage) : parseRuntimeStatusLabel(selected.asset_parse_status)}
-                    tone={selected.asset_parse_status === "parsed" ? "good" : selected.asset_parse_status === "failed" ? "danger" : "info"}
-                  />
-                </div>
-                <div className="detailRow">
-                  <span>试卷状态</span>
-                  <StatusBadge
-                    value={selected.active_parse_stage ? parseStageLabel(selected.active_parse_stage) : paperStatusLabel(selected.status)}
-                    tone={selected.status === "parsed" ? "good" : selected.status === "parse_failed" ? "danger" : "info"}
-                  />
-                </div>
-                <div className="detailRow">
-                  <span>审核状态</span>
-                  <StatusBadge value={selected.review_status} tone="good" />
-                </div>
-                <div className="calloutBox">
-                  <strong>OCR 设备能力</strong>
-                  {ocrCapability ? (
-                    <>
-                      <p>
-                        {ocrCapability.summary} · {ocrCapability.device_name || "未检测到 GPU"} ·
-                        {" "}空闲显存 {formatMemory(ocrCapability.gpu_memory_free_mb)} / {formatMemory(ocrCapability.gpu_memory_total_mb)}
-                      </p>
-                      <p className="muted">
-                        当前模型：{String(ocrCapability.current_settings.text_detection_model_name || "-")} /{" "}
-                        {String(ocrCapability.current_settings.text_recognition_model_name || "-")} · CUDA{" "}
-                        {ocrCapability.cuda_available ? "可用" : "不可用"} · Paddle {ocrCapability.paddle_version || "-"}
-                      </p>
-                      <p className="muted">推荐主流程：{ocrCapability.recommended_pipeline}</p>
-                      {!!ocrCapability.warnings.length && <p className="errorText">{ocrCapability.warnings.join(" | ")}</p>}
-                    </>
-                  ) : (
-                    <p className={ocrCapabilityError ? "errorText" : "muted"}>{ocrCapabilityError || "正在检测 OCR 设备能力..."}</p>
-                  )}
-                  <button className="button small" type="button" onClick={loadOcrCapability}>
-                    刷新检测
-                  </button>
-                </div>
-                <div className="ocrControlPanel">
-                  <div className="ocrControlHeader">
-                    <strong>OCR 模式</strong>
-                    <span>{parsePresetSummary(parsePreset)}</span>
-                  </div>
-                  <div className="ocrModeGrid">
-                    {parsePresetOptions.map((option) => {
-                      const Icon = option.icon;
-                      const active = parsePreset === option.value;
-                      return (
-                        <button
-                          key={option.value}
-                          className={`ocrModeButton${active ? " active" : ""}`}
-                          type="button"
-                          aria-pressed={active}
-                          onClick={() => chooseParsePreset(option.value)}
-                        >
-                          <Icon size={17} aria-hidden />
-                          <strong>{option.label}</strong>
-                          <span>{option.engine} · {option.dpi} DPI</span>
+                    <div className="buttonRow">
+                      <button className="button primary" type="button" disabled={parsingId === selected.id} onClick={() => parsePaper(selected.id)}>
+                        {parsingId === selected.id ? "解析中..." : "解析并切题"}
+                      </button>
+                      <Link className="button" href={`/analysis/papers/preview?file_id=${selected.asset_id}`}>
+                        解析预览
+                      </Link>
+                      <Link className="button" href={`/analysis/questions?paperId=${selected.id}`}>
+                        进入题目解析
+                      </Link>
+                      {parseMessage && <span className="muted">{parseMessage}</span>}
+                    </div>
+
+                    {visibleParseJob && (
+                      <div className="calloutBox">
+                        <div className="detailRow">
+                          <span>解析任务 #{visibleParseJob.id}</span>
+                          <strong>{parseStageLabel(visibleParseJob.scope_config_json?.stage)} · {visibleParseJob.progress}%</strong>
+                        </div>
+                        <div className="progressTrack" aria-label="解析进度">
+                          <div className="progressFill" style={{ width: `${Math.max(3, Math.min(100, visibleParseJob.progress))}%` }} />
+                        </div>
+                        <p className={visibleParseJob.status === "failed" ? "errorText" : "muted"}>
+                          {visibleParseJob.status === "failed"
+                            ? visibleParseJob.error_message || "解析失败"
+                            : parseJobDetailText(visibleParseJob)}
+                        </p>
+                        {visibleParseJob.status !== "failed" && parseJobChunkDetailText(visibleParseJob) && (
+                          <p className="muted">{parseJobChunkDetailText(visibleParseJob)}</p>
+                        )}
+                        {visibleParseJob.status !== "failed" && parseJobResumeDetailText(visibleParseJob) && (
+                          <p className="muted">{parseJobResumeDetailText(visibleParseJob)}</p>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="paperCenterDetailSplit">
+                      <div className="calloutBox">
+                        <strong>OCR 设备能力</strong>
+                        {ocrCapability ? (
+                          <>
+                            <div className="ocrCapabilityCompact">
+                              <div className="ocrCapabilityRow">
+                                <span className="ocrCapabilityLabel">设备</span>
+                                <strong>{ocrCapability.device_name || "未检测到 GPU"}</strong>
+                              </div>
+                              <div className="ocrCapabilityRow">
+                                <span className="ocrCapabilityLabel">显存</span>
+                                <strong>{formatMemory(ocrCapability.gpu_memory_free_mb)}</strong>
+                                <span className="muted">空闲</span>
+                                <strong>
+                                  {formatMemory(ocrCapability.gpu_memory_free_mb)} / {formatMemory(ocrCapability.gpu_memory_total_mb)}
+                                </strong>
+                              </div>
+                              <div className="ocrCapabilityRow">
+                                <span className="ocrCapabilityLabel">模型</span>
+                                <span className="ocrModelChip active">
+                                  {String(ocrCapability.current_settings.text_detection_model_name || "-")}
+                                </span>
+                                <span className="ocrModelChip active">
+                                  {String(ocrCapability.current_settings.text_recognition_model_name || "-")}
+                                </span>
+                              </div>
+                            </div>
+                            {!!ocrCapability.warnings.length && <p className="errorText">{ocrCapability.warnings.join(" | ")}</p>}
+                          </>
+                        ) : (
+                          <p className={ocrCapabilityError ? "errorText" : "muted"}>{ocrCapabilityError || "正在检测 OCR 设备能力..."}</p>
+                        )}
+                        <button className="button small" type="button" onClick={loadOcrCapability}>
+                          刷新检测
                         </button>
-                      );
-                    })}
+                      </div>
+
+                      <div className="stackList">
+                        <div className="ocrControlPanel">
+                          <div className="ocrControlHeader">
+                            <strong>解析模式</strong>
+                            <span>规则切题</span>
+                          </div>
+                          <div className="ocrControlHeader" style={{ marginTop: 12 }}>
+                            <strong>OCR 模式</strong>
+                            <span>{parsePresetSummary(parsePreset)}</span>
+                          </div>
+                          <div className="ocrModeGrid">
+                            {parsePresetOptions.map((option) => {
+                              const Icon = option.icon;
+                              const active = parsePreset === option.value;
+                              return (
+                                <button
+                                  key={option.value}
+                                  className={`ocrModeButton${active ? " active" : ""}`}
+                                  type="button"
+                                  aria-pressed={active}
+                                  onClick={() => chooseParsePreset(option.value)}
+                                >
+                                  <Icon size={17} aria-hidden />
+                                  <strong>{option.label}</strong>
+                                  <span>{option.engine} · {option.dpi} DPI</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <div className="row">
+                            <label className="field">
+                              <span>渲染 DPI</span>
+                              <input
+                                min="96"
+                                max="360"
+                                step="10"
+                                type="number"
+                                value={renderDpi}
+                                onChange={(e) => setRenderDpi(e.target.value)}
+                              />
+                            </label>
+                            <label className="field">
+                              <span>每批页数</span>
+                              <input
+                                min="1"
+                                max="50"
+                                step="1"
+                                type="number"
+                                value={pageChunkSize}
+                                onChange={(e) => setPageChunkSize(e.target.value)}
+                              />
+                            </label>
+                          </div>
+                          <div className="row">
+                            <label className="field">
+                              <span>强制 OCR</span>
+                              <select value={forceOcr ? "true" : "false"} onChange={(e) => setForceOcr(e.target.value === "true")}>
+                                <option value="false">否</option>
+                                <option value="true">是</option>
+                              </select>
+                            </label>
+                            <label className="field">
+                              <span>输出格式</span>
+                              <select value={outputFormat} onChange={(e) => setOutputFormat(e.target.value as ParseOutputFormat)}>
+                                {parseOutputFormatOptions.map((option) => (
+                                  <option key={option.value} value={option.value}>
+                                    {option.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="subsection">
+                      <div className="paperCenterSectionHeader">
+                        <strong>试卷分区</strong>
+                        <span className="muted">{selected.sections.length} 个分区</span>
+                      </div>
+                      {selected.sections.length ? (
+                        <div className="tableWrap paperCenterSectionTableWrap">
+                          <table className="paperCenterSectionTable">
+                            <thead>
+                              <tr>
+                                <th>分区</th>
+                                <th>题型</th>
+                                <th>数量</th>
+                                <th>题号范围</th>
+                                <th>分值</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {selected.sections.map((section) => (
+                                <tr key={section.id}>
+                                  <td>{section.section_name}</td>
+                                  <td>{section.question_type || "-"}</td>
+                                  <td>{paperSectionQuestionCount(section.start_no, section.end_no)}</td>
+                                  <td>{paperSectionRangeLabel(section.start_no, section.end_no)}</td>
+                                  <td>{section.score != null ? `${section.score} 分` : "-"}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <div className="empty compact">暂无试卷分区</div>
+                      )}
+                    </div>
                   </div>
+                )}
+              </>
+            ) : (
+              <div className="paperCenterUploadBody">
+                <div className="calloutBox">
+                  <strong>上传建议</strong>
+                  <p>支持 PDF、图片、DOCX、Markdown 与 TXT。先入库基础元数据，后续解析任务会自动接管 OCR、切题和考点识别。</p>
+                </div>
+                <form className="formGrid" onSubmit={uploadPaper}>
+                  <label className="field">
+                    <span>试卷文件</span>
+                    <input name="file" type="file" accept=".pdf,.png,.jpg,.jpeg,.docx,.md,.txt" disabled={uploading} />
+                  </label>
+                  <label className="field">
+                    <span>试卷名称</span>
+                    <input name="paper_name" placeholder="例如：2026 注册会计师《会计》真题" disabled={uploading} />
+                  </label>
                   <div className="row">
                     <label className="field">
-                      <span>渲染 DPI</span>
-                      <input
-                        min="96"
-                        max="300"
-                        step="10"
-                        type="number"
-                        value={renderDpi}
-                        onChange={(e) => setRenderDpi(e.target.value)}
-                      />
-                    </label>
-                    <label className="field">
-                      <span>每批页数</span>
-                      <input
-                        min="1"
-                        max="50"
-                        step="1"
-                        type="number"
-                        value={pageChunkSize}
-                        onChange={(e) => setPageChunkSize(e.target.value)}
-                      />
-                    </label>
-                  </div>
-                  <div className="row">
-                    <label className="field">
-                      <span>强制 OCR</span>
-                      <select value={forceOcr ? "true" : "false"} onChange={(e) => setForceOcr(e.target.value === "true")}>
-                        <option value="false">否</option>
-                        <option value="true">是</option>
+                      <span>学科</span>
+                      <select
+                        disabled={uploading}
+                        value={selectedSubjectId}
+                        onChange={(event) => {
+                          const subject = subjects.find((item) => item.id === event.target.value) || null;
+                          setSelectedSubjectId(subject?.id || "");
+                          setSelectedCategory(subject?.categories[0] || "");
+                        }}
+                      >
+                        {!subjects.length && <option value="">请先在学科中心添加学科</option>}
+                        {subjects.map((subject) => (
+                          <option key={subject.id} value={subject.id}>
+                            {subject.name}
+                          </option>
+                        ))}
                       </select>
                     </label>
                     <label className="field">
-                      <span>输出格式</span>
-                      <select value={outputFormat} onChange={(e) => setOutputFormat(e.target.value as ParseOutputFormat)}>
-                        {parseOutputFormatOptions.map((option) => (
-                          <option key={option.value} value={option.value}>
-                            {option.label}
+                      <span>类目</span>
+                      <select
+                        disabled={uploading || !activeSubject}
+                        value={selectedCategory}
+                        onChange={(event) => setSelectedCategory(event.target.value)}
+                      >
+                        <option value="">未分类</option>
+                        {activeSubject?.categories.map((category) => (
+                          <option key={category} value={category}>
+                            {category}
                           </option>
                         ))}
                       </select>
                     </label>
                   </div>
-                </div>
-                <div className="row">
-                  <label className="field">
-                    <span>页眉裁切</span>
-                    <input value={headerRatio} onChange={(e) => setHeaderRatio(e.target.value)} placeholder="0.04" />
-                  </label>
-                  <label className="field">
-                    <span>页脚裁切</span>
-                    <input value={footerRatio} onChange={(e) => setFooterRatio(e.target.value)} placeholder="0.05" />
-                  </label>
-                </div>
-                <div className="buttonRow">
-                  <button className="button primary" type="button" disabled={parsingId === selected.id} onClick={() => parsePaper(selected.id)}>
-                    {parsingId === selected.id ? "解析中..." : "解析并切题"}
-                  </button>
-                  {parseMessage && <span className="muted">{parseMessage}</span>}
-                </div>
-                {visibleParseJob && (
-                  <div className="calloutBox">
-                    <div className="detailRow">
-                      <span>解析任务 #{visibleParseJob.id}</span>
-                      <strong>{parseStageLabel(visibleParseJob.scope_config_json?.stage)} · {visibleParseJob.progress}%</strong>
-                    </div>
-                    <div className="progressTrack" aria-label="解析进度">
-                      <div className="progressFill" style={{ width: `${Math.max(3, Math.min(100, visibleParseJob.progress))}%` }} />
-                    </div>
-                    <p className={visibleParseJob.status === "failed" ? "errorText" : "muted"}>
-                      {visibleParseJob.status === "failed"
-                        ? visibleParseJob.error_message || "解析失败"
-                        : parseJobDetailText(visibleParseJob)}
-                    </p>
-                    {visibleParseJob.status !== "failed" && parseJobChunkDetailText(visibleParseJob) && (
-                      <p className="muted">{parseJobChunkDetailText(visibleParseJob)}</p>
-                    )}
-                    {visibleParseJob.status !== "failed" && parseJobResumeDetailText(visibleParseJob) && (
-                      <p className="muted">{parseJobResumeDetailText(visibleParseJob)}</p>
-                    )}
+                  <div className="row">
+                    <label className="field">
+                      <span>年份</span>
+                      <select name="exam_year" defaultValue="" disabled={uploading}>
+                        <option value="">未填写</option>
+                        {uploadYearOptions.map((year) => (
+                          <option key={year} value={year}>
+                            {year}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>月份</span>
+                      <input name="exam_month" type="number" min="1" max="12" placeholder="8" disabled={uploading} />
+                    </label>
                   </div>
-                )}
-                <div className="subsection">
-                  <strong>试卷分区</strong>
-                  <div className="metricTable">
-                    {selected.sections.map((section) => (
-                      <div key={section.id} className="metricRow">
-                        <div>
-                          <strong>{section.section_name}</strong>
-                          <span className="muted">
-                            {section.question_type} · {section.start_no} - {section.end_no}
-                          </span>
-                        </div>
-                        <StatusBadge value={`${section.score || 0} 分`} tone="info" />
-                      </div>
-                    ))}
+                  <div className="row">
+                    <label className="field">
+                      <span>地区</span>
+                      <input
+                        name="exam_region"
+                        list="paperUploadRegions"
+                        defaultValue="全国"
+                        placeholder="搜索或输入地区"
+                        autoComplete="off"
+                        disabled={uploading}
+                      />
+                      <datalist id="paperUploadRegions">
+                        {uploadRegionOptions.map((region) => (
+                          <option key={region} value={region} />
+                        ))}
+                      </datalist>
+                    </label>
+                    <label className="field">
+                      <span>考试类型</span>
+                      <input name="exam_type" placeholder="资格考试" disabled={uploading} />
+                    </label>
                   </div>
-                </div>
+                  <div className="row">
+                    <label className="field">
+                      <span>试卷类型</span>
+                      <input name="paper_type" placeholder="真题" disabled={uploading} />
+                    </label>
+                    <label className="field">
+                      <span>试卷编号</span>
+                      <input name="paper_code" placeholder="可选，例如 CPA-ACC-2026" disabled={uploading} />
+                    </label>
+                  </div>
+                  <div className="buttonRow">
+                    <button className="button primary" type="submit" disabled={uploading}>
+                      {uploading ? "上传中..." : "上传并入库"}
+                    </button>
+                    {uploadMessage && <span className="muted">{uploadMessage}</span>}
+                    {uploadError && <span className="errorText">{uploadError}</span>}
+                  </div>
+                </form>
               </div>
             )}
           </div>
         </div>
       </section>
-    </>
+    </div>
   );
+}
+
+function buildPaperSubjectLookup(subjects: SubjectConfig[]) {
+  const lookup = new Map<number, PaperSubjectMeta>();
+  subjects.forEach((subject) => {
+    if (subject.platform_id == null) return;
+    lookup.set(subject.platform_id, {
+      code: subject.id,
+      name: subject.name,
+      categories: subject.categories,
+    });
+  });
+  return lookup;
+}
+
+function filterPaperList(
+  papers: PaperSummary[],
+  filters: PaperListFilters,
+  subjectLookup: Map<number, PaperSubjectMeta>,
+) {
+  return papers.filter((paper) => {
+    const subjectMeta = paper.subject_id != null ? subjectLookup.get(paper.subject_id) || null : null;
+    const matchesSubject = !filters.subjectId || subjectMeta?.code === filters.subjectId;
+    const matchesCategory = !filters.category || String(paper.category || "") === filters.category;
+    const matchesYear = !filters.year || String(paper.exam_year || "") === filters.year;
+    return matchesSubject && matchesCategory && matchesYear;
+  });
+}
+
+function buildPaperCategoryOptions(
+  papers: PaperSummary[],
+  subjects: SubjectConfig[],
+  subjectLookup: Map<number, PaperSubjectMeta>,
+  subjectId: string,
+) {
+  const categories = new Set<string>();
+  if (subjectId) {
+    const subject = subjects.find((item) => item.id === subjectId) || null;
+    subject?.categories.forEach((category) => {
+      const normalized = String(category || "").trim();
+      if (normalized) categories.add(normalized);
+    });
+    papers.forEach((paper) => {
+      const subjectMeta = paper.subject_id != null ? subjectLookup.get(paper.subject_id) || null : null;
+      const normalized = String(paper.category || "").trim();
+      if (subjectMeta?.code === subjectId && normalized) categories.add(normalized);
+    });
+  } else {
+    papers.forEach((paper) => {
+      const normalized = String(paper.category || "").trim();
+      if (normalized) categories.add(normalized);
+    });
+  }
+  return Array.from(categories).sort((left, right) => left.localeCompare(right, "zh-CN"));
+}
+
+function buildPaperYearOptions(papers: PaperSummary[]) {
+  return Array.from(
+    new Set(
+      papers
+        .map((paper) => String(paper.exam_year || "").trim())
+        .filter(Boolean),
+    ),
+  ).sort((left, right) => Number(right) - Number(left));
+}
+
+function buildUploadYearOptions(existingYears: string[]) {
+  const values = new Set(existingYears.filter(Boolean));
+  const currentYear = new Date().getFullYear();
+  for (let year = currentYear + 1; year >= 1990; year -= 1) {
+    values.add(String(year));
+  }
+  return Array.from(values).sort((left, right) => Number(right) - Number(left));
+}
+
+function paperSectionQuestionCount(startNo?: number | null, endNo?: number | null) {
+  if (startNo == null || endNo == null) return "-";
+  if (endNo < startNo) return "-";
+  return String(endNo - startNo + 1);
+}
+
+function paperSectionRangeLabel(startNo?: number | null, endNo?: number | null) {
+  if (startNo == null || endNo == null) return "-";
+  return `${startNo} - ${endNo}`;
 }
 
 function formatMemory(value?: number | null) {
@@ -727,8 +1135,8 @@ function parsePresetSummary(preset: ParsePreset) {
     auto: "可选文本优先，扫描件自动 OCR",
     fast: "速度优先，适合快速预览",
     balanced: "PP-OCRv5 server，速度和精度折中",
-    accurate: "PP-StructureV3 版面优先，低质时自动 PP-OCRv5 兜底",
-    formula: "版面分析 + 表格/公式识别，适合公式较多试卷",
+    accurate: "PP-StructureV3 高精度版面解析，默认模式",
+    formula: "高精度版面解析 + 公式识别，适合公式较多试卷",
   };
   return summaries[preset];
 }
@@ -770,6 +1178,28 @@ function parseRuntimeStatusLabel(status?: string | null) {
     empty: "解析为空",
   };
   return labels[status || ""] || status || "-";
+}
+
+function reviewStatusLabel(status?: string | null) {
+  const labels: Record<string, string> = {
+    pending: "待审核",
+    approved: "已通过",
+    needs_revision: "待修订",
+    rejected: "已驳回",
+  };
+  return labels[status || ""] || status || "-";
+}
+
+function statusLightTone(status: string | null | undefined, scope: "parse" | "paper" | "review") {
+  const normalized = String(status || "");
+  if (scope === "review") {
+    if (normalized === "approved") return "good";
+    if (normalized === "rejected") return "danger";
+    return "warn";
+  }
+  if (normalized === "parsed" || normalized === "completed") return "good";
+  if (normalized === "failed" || normalized === "parse_failed" || normalized === "empty") return "danger";
+  return "warn";
 }
 
 function parseStageLabel(stage?: string) {

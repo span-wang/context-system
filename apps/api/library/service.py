@@ -8,7 +8,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile
+from sqlalchemy import select
 
+from app.db.session import SessionLocal
+from app.models import Asset, ExamPaper
+from app.services.papers import PaperService
+from library.ocr_cleaner import clean_parsed_document
+from library.ocr_cleaner import raw_document_snapshot
 from library.parse_options import DocumentParseOptions
 from library.parser import (
     ParseProgressCallback,
@@ -123,6 +129,7 @@ class LibraryService:
         file = self.db.delete_library_file(file_id)
         if not file:
             raise HTTPException(status_code=404, detail="library file not found")
+        self._delete_bound_exam_papers_by_sha(file.sha256)
         await self.storage.delete(file.storage_path)
         for pattern in (f"{file.sha256}.txt", f"{file.sha256}.json", f"{file.sha256}__*.txt", f"{file.sha256}__*.json"):
             for cache_path in self.cache_root.glob(pattern):
@@ -144,6 +151,7 @@ class LibraryService:
         if not force_reparse and structured_cache_path.exists():
             parsed = deserialize_parsed_document(structured_cache_path.read_text(encoding="utf-8"))
             if parsed is not None:
+                parsed = clean_parsed_document(parsed, force=True)
                 if _is_stale_parse_cache(parsed):
                     structured_cache_path.unlink(missing_ok=True)
                     text_cache_path.unlink(missing_ok=True)
@@ -157,7 +165,7 @@ class LibraryService:
 
         if not force_reparse and text_cache_path.exists():
             text = text_cache_path.read_text(encoding="utf-8")
-            parsed = ParsedDocument(text=text, markdown=text, provider="legacy_cache")
+            parsed = clean_parsed_document(ParsedDocument(text=text, markdown=text, provider="legacy_cache"), force=True)
             structured_cache_path.write_text(serialize_parsed_document(parsed), encoding="utf-8")
             self._remember_parse_result(file.id, parsed, options=options, preview=preview)
             if progress_callback is not None:
@@ -178,6 +186,7 @@ class LibraryService:
             )
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"文件解析失败：{exc}") from exc
+        parsed = clean_parsed_document(parsed)
         text_cache_path.write_text(parsed.text, encoding="utf-8")
         structured_cache_path.write_text(serialize_parsed_document(parsed), encoding="utf-8")
         self._remember_parse_result(file.id, parsed, options=options, preview=preview)
@@ -222,6 +231,7 @@ class LibraryService:
             )
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"文件解析失败：{exc}") from exc
+        parsed = clean_parsed_document(parsed)
         source_title = self._display_source_title(metadata.source_title, filename)
         label = f"本次上传:{source_title}"
         if metadata.chapter:
@@ -240,12 +250,16 @@ class LibraryService:
         file_id: str,
         max_chars: int = DEFAULT_PREVIEW_CHARS,
         options: DocumentParseOptions | None = None,
+        *,
+        compare: bool = False,
         progress_callback: ParseProgressCallback | None = None,
     ) -> dict:
         file = self.get_file(file_id)
         options = options or DocumentParseOptions()
         stored_result = self.db.get_latest_library_parse_result(file.id)
-        if stored_result is not None:
+        if not compare and stored_result is not None and (
+            stored_result.get("raw_text") is not None or stored_result.get("cleanup_report") is not None
+        ):
             preview_markdown = str(stored_result.get("markdown") or stored_result.get("parsed_text") or "")
             preview_text = str(stored_result.get("parsed_text") or preview_markdown)
             preview_content = options.select_output(text=preview_text, markdown=preview_markdown)
@@ -259,6 +273,8 @@ class LibraryService:
                 "filename": file.filename,
                 "token_count": token_count,
                 "provider": str(stored_result.get("provider") or "stored_parse"),
+                "raw_text": str(stored_result.get("raw_text") or stored_result.get("parsed_text") or ""),
+                "raw_markdown": str(stored_result.get("raw_markdown") or stored_result.get("markdown") or preview_markdown),
                 "text": preview_text[:max_chars],
                 "markdown": preview_markdown[:max_chars],
                 "content": preview_content[:max_chars],
@@ -268,16 +284,31 @@ class LibraryService:
                 "warnings": warnings[:5],
                 "truncated": len(preview_content) > max_chars,
                 "parse_options": stored_result.get("parse_options") or {},
+                "cleanup_report": stored_result.get("cleanup_report") or {},
+                "cleanup_score": stored_result.get("cleanup_score"),
             }
 
-        parsed = await self.parse_and_cache(
-            file,
-            options=options,
-            preview=False,
-            progress_callback=progress_callback,
-        )
+        if compare:
+            raw = await self.storage.get(file.storage_path)
+            parsed = await asyncio.to_thread(
+                parse_document,
+                raw,
+                file.filename,
+                file.mime,
+                options,
+                progress_callback,
+            )
+        else:
+            parsed = await self.parse_and_cache(
+                file,
+                options=options,
+                preview=False,
+                progress_callback=progress_callback,
+            )
+
         selected_output = _selected_output(parsed, options)
         preview_text, preview_markdown, preview_content = _preview_payload(parsed, options)
+        raw_snapshot = raw_document_snapshot(parsed)
         persisted_markdown = parsed.markdown or parsed.text
         token_count = estimate_tokens(persisted_markdown)
         max_chars = max(1, min(max_chars, MAX_PREVIEW_CHARS))
@@ -286,6 +317,8 @@ class LibraryService:
             "filename": file.filename,
             "token_count": token_count,
             "provider": parsed.provider,
+            "raw_text": raw_snapshot["raw_text"],
+            "raw_markdown": raw_snapshot["raw_markdown"],
             "text": preview_text[:max_chars],
             "markdown": preview_markdown[:max_chars],
             "content": preview_content[:max_chars],
@@ -295,6 +328,8 @@ class LibraryService:
             "warnings": parsed.warnings[:5],
             "truncated": len(selected_output) > max_chars,
             "parse_options": options.normalized_dump(),
+            "cleanup_report": parsed.cleanup_report,
+            "cleanup_score": parsed.cleanup_score,
         }
 
     async def reparse(
@@ -315,6 +350,7 @@ class LibraryService:
         )
         selected_output = _selected_output(parsed, options)
         preview_text, preview_markdown, preview_content = _preview_payload(parsed, options)
+        raw_snapshot = raw_document_snapshot(parsed)
         persisted_markdown = parsed.markdown or parsed.text
         token_count = estimate_tokens(persisted_markdown)
         result_id, sequence_number, kept = self.db.store_library_parse_result(
@@ -332,6 +368,8 @@ class LibraryService:
             "filename": file.filename,
             "token_count": token_count,
             "provider": parsed.provider,
+            "raw_text": raw_snapshot["raw_text"],
+            "raw_markdown": raw_snapshot["raw_markdown"],
             "text": preview_text[:max_chars],
             "markdown": preview_markdown[:max_chars],
             "content": preview_content[:max_chars],
@@ -341,6 +379,8 @@ class LibraryService:
             "warnings": parsed.warnings[:5],
             "truncated": len(selected_output) > max_chars,
             "parse_options": options.normalized_dump(),
+            "cleanup_report": parsed.cleanup_report,
+            "cleanup_score": parsed.cleanup_score,
             "stored_result_id": result_id,
             "stored_sequence_number": sequence_number,
             "kept_results": [item.model_dump(mode="json") for item in kept],
@@ -408,6 +448,18 @@ class LibraryService:
             return file
         return file.model_copy(update={"source_title": source_title})
 
+    def _delete_bound_exam_papers_by_sha(self, sha256: str) -> None:
+        with SessionLocal() as session:
+            asset_ids = list(session.scalars(select(Asset.id).where(Asset.sha256 == sha256)))
+            if not asset_ids:
+                return
+            paper_ids = list(session.scalars(select(ExamPaper.id).where(ExamPaper.asset_id.in_(asset_ids))))
+            if not paper_ids:
+                return
+            service = PaperService(session)
+            for paper_id in paper_ids:
+                service.delete_paper(paper_id)
+
 
 def _preview_payload(parsed: ParsedDocument, options: DocumentParseOptions) -> tuple[str, str, str]:
     preview_markdown = parsed.markdown or parsed.text
@@ -429,4 +481,13 @@ def _selected_output(parsed: ParsedDocument, options: DocumentParseOptions) -> s
 
 def _is_stale_parse_cache(parsed: ParsedDocument) -> bool:
     provider = parsed.provider.lower()
-    return provider.startswith("pdf_ocr_pipeline/rapid") or provider == "rapidocr_onnxruntime"
+    if provider.startswith("pdf_ocr_pipeline/rapid") or provider == "rapidocr_onnxruntime":
+        return True
+    payload = "\n".join(
+        str(part or "")
+        for part in (parsed.raw_markdown, parsed.markdown, parsed.raw_text, parsed.text)
+        if str(part or "").strip()
+    )
+    if ('src="imgs/' in payload or "src='imgs/" in payload) and not (parsed.markdown_image_roots or []):
+        return True
+    return False

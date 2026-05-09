@@ -17,7 +17,7 @@ class AuditService:
 
     def log(
         self,
-        user: CurrentUserResponse,
+        user: CurrentUserResponse | None,
         module: str,
         action: str,
         target_type: str | None = None,
@@ -28,15 +28,15 @@ class AuditService:
         log = self.repository.create_log(
             AuditLog(
                 tenant_id=1,
-                user_id=user.id,
+                user_id=user.id if user else None,
                 module=module,
                 action=action,
                 target_type=target_type,
                 target_id=str(target_id) if target_id is not None else None,
                 request_id=None,
                 payload_json=_safe_payload(payload),
-                created_by=user.id,
-                updated_by=user.id,
+                created_by=user.id if user else None,
+                updated_by=user.id if user else None,
             )
         )
         if commit:

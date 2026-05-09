@@ -14,6 +14,7 @@
 ### 一键启动
 
 Windows 下直接双击根目录的 `一键启动.bat`。脚本会自动检查依赖、启动后端和前端，并打开浏览器。
+当前默认会先带起项目本地 MySQL，再启动 API 和前端。
 
 停止服务时双击 `一键停止.bat`。
 
@@ -29,18 +30,6 @@ Windows 下直接双击根目录的 `一键启动.bat`。脚本会自动检查�
 
 如需远程访问前端，推荐配置 `deploy\cloudflare\config.yml` 后直接运行 `scripts\start.ps1`。
 启动脚本会自动识别 tunnel hostname，把它注入 Next.js 的远程 origin 白名单，并在控制台与平台设置页显示公网地址。
-
-如果你当前公网二级域名已经在用，不想动它，可以单独给“数据训练/远程标注”挂一个新的二级域名：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\cloudflare\configure_dataset_tunnel.ps1 `
-  -TunnelId YOUR_TUNNEL_UUID `
-  -Hostname training.example.com
-
-.\数据训练远程启动.bat
-```
-
-这条链路会使用 `deploy\cloudflare\config.dataset.yml`，不会改动你当前的 `deploy\cloudflare\config.yml`。
 
 ### 后端
 
@@ -65,6 +54,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\db-migrate.ps1 -UseLocalMySql
 
 # 只查看迁移状态，不重复执行 upgrade
 powershell -ExecutionPolicy Bypass -File .\scripts\db-migrate.ps1 -UseLocalMySql -SkipMigrate
+
+# 把旧 SQLite 数据导入本地 MySQL
+powershell -ExecutionPolicy Bypass -File .\scripts\migrate-sqlite-to-mysql.ps1 -TruncateTarget
 ```
 
 迁移相关环境变量：
@@ -88,6 +80,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\db-migrate.ps1 -UseLocalMySql
 - `PDF_OCR_ENGINE` 保留为兼容配置项，默认值为 `paddle`。
 - 大 PDF 会按页段解析，默认每批 `4` 页；试卷中心和素材库前端可调每批页数，也可通过 `PDF_PARSE_PAGE_CHUNK_SIZE` 设置默认值。
 - OCR/版面解析会按页写入 `data/cache/pdf_ocr_checkpoints`，任务中断后再次用相同解析参数会复用已完成页继续解析。
+- API 启动后会后台定时巡检 `data/cache/pdf_ocr_checkpoints`，自动删除已经失联的 OCR/版面缓存目录；巡检日志会写入 API 日志输出，可在 `data/logs/api.out.log` / `data/logs/api.err.log` 中查看。
+- 可通过 `OCR_CACHE_SWEEP_ENABLED`、`OCR_CACHE_SWEEP_INTERVAL_SECONDS`、`OCR_CACHE_SWEEP_RUN_ON_STARTUP` 调整巡检开关、间隔和启动即执行行为。
 - 如果机器性能不足，可在环境变量中把 `PDF_OCR_DETECTION_MODEL` / `PDF_OCR_RECOGNITION_MODEL` 改回 `PP-OCRv5_mobile_det` / `PP-OCRv5_mobile_rec`，或关闭 `PDF_OCR_USE_TEXTLINE_ORIENTATION`。
 - 如果扫描件预览仍为空，通常是图片清晰度过低，或 OCR 依赖没有安装成功。
 
@@ -109,11 +103,14 @@ npm run dev
 - `/history`：查看生成历史、小红书发布包和审查报告。
 - `/settings`：在前端配置生成模型和审查模型。
 
+如果你已经不再保留 SQLite 作为运行库，后续只需要维护 MySQL；`data/app.db` 仅作为一次性历史数据源。
+
 ## 数据位置
 
 - 文件：`data/library/{yyyymm}/{sha256}.{ext}`
 - 解析缓存：`data/cache/parsed/{sha256}.txt`
-- SQLite：`data/app.db`
+- 本地 MySQL：`data/mysql-local-3309/`
+- 旧 SQLite 导入源：`data/app.db`
 
 ## API
 

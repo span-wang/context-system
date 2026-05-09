@@ -59,10 +59,11 @@ async def delete_file(file_id: str) -> dict:
 async def preview_file(
     file_id: str,
     max_chars: int = Query(4000, ge=1, le=500_000),
+    compare: bool = Query(False),
     preset: ParsePreset = Query("auto"),
     output_format: ParseOutputFormat = Query("markdown"),
     force_ocr: bool | None = Query(None),
-    render_dpi: int | None = Query(None, ge=96, le=300),
+    render_dpi: int | None = Query(None, ge=96, le=360),
     crop_header_ratio: float | None = Query(None, ge=0.0, le=0.2),
     crop_footer_ratio: float | None = Query(None, ge=0.0, le=0.2),
     trim_margins: bool | None = Query(None),
@@ -85,7 +86,7 @@ async def preview_file(
         pdf_page_chunk_size=pdf_page_chunk_size,
     )
     try:
-        return await get_library_service().preview(file_id, max_chars=max_chars, options=options)
+        return await get_library_service().preview(file_id, max_chars=max_chars, options=options, compare=compare)
     except HTTPException:
         raise
     except Exception as exc:
@@ -100,7 +101,7 @@ def start_parse_file_job(
     preset: ParsePreset = Query("auto"),
     output_format: ParseOutputFormat = Query("markdown"),
     force_ocr: bool | None = Query(None),
-    render_dpi: int | None = Query(None, ge=96, le=300),
+    render_dpi: int | None = Query(None, ge=96, le=360),
     crop_header_ratio: float | None = Query(None, ge=0.0, le=0.2),
     crop_footer_ratio: float | None = Query(None, ge=0.0, le=0.2),
     trim_margins: bool | None = Query(None),
@@ -144,7 +145,7 @@ async def reparse_file(
     preset: ParsePreset = Query("auto"),
     output_format: ParseOutputFormat = Query("markdown"),
     force_ocr: bool | None = Query(None),
-    render_dpi: int | None = Query(None, ge=96, le=300),
+    render_dpi: int | None = Query(None, ge=96, le=360),
     crop_header_ratio: float | None = Query(None, ge=0.0, le=0.2),
     crop_footer_ratio: float | None = Query(None, ge=0.0, le=0.2),
     trim_margins: bool | None = Query(None),

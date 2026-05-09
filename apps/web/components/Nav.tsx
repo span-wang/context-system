@@ -8,9 +8,10 @@ const links = [
   { href: "/workflow", label: "工作流", icon: CalendarDays },
   { href: "/library", label: "素材库", icon: Library },
   { href: "/generate", label: "生成中心", icon: Wand2 },
-  { href: "/platform/analysis/papers", label: "试卷中心", icon: FileText },
-  { href: "/platform/subject-center", label: "学科中心", icon: BookOpen },
-  { href: "/platform/question-bank", label: "题库中心", icon: ClipboardList },
+  { href: "/analysis/papers", label: "试卷中心", icon: FileText },
+  { href: "/analysis/questions", label: "题目解析", icon: ClipboardList },
+  { href: "/knowledge", label: "学科中心", icon: BookOpen },
+  { href: "/training", label: "模型训练", icon: ClipboardList },
   { href: "/history", label: "历史审查", icon: History },
   { href: "/settings", label: "模型配置", icon: Settings },
 ];

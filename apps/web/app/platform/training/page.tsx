@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { LoadState } from "../../../components/shared/LoadState";
 import { StatusBadge } from "../../../components/shared/StatusBadge";
+import { renderDocumentPreviewHtml } from "../../../lib/document-preview";
 
 type TrainingSampleSummary = {
   id: string;
@@ -42,6 +43,11 @@ type TrainingSampleDetail = {
   gold_text: string;
 };
 
+type TrainingSampleDeleteResult = {
+  id: string;
+  paper_name: string;
+};
+
 type TrainingQuestion = {
   question_no: string;
   question_type: string;
@@ -70,6 +76,8 @@ type TrainingSectionTab = {
   question_count: number;
 };
 
+type TrainingWorkbenchView = "fields" | "json";
+
 export default function TrainingPage() {
   const [summary, setSummary] = useState<TrainingDatasetSummary | null>(null);
   const [selectedId, setSelectedId] = useState("");
@@ -80,9 +88,13 @@ export default function TrainingPage() {
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
   const [detailError, setDetailError] = useState("");
   const [message, setMessage] = useState("");
+  const [workbenchView, setWorkbenchView] = useState<TrainingWorkbenchView>("fields");
+  const [goldJsonText, setGoldJsonText] = useState("");
+  const [goldJsonError, setGoldJsonError] = useState("");
 
   useEffect(() => {
     void loadSummary();
@@ -93,6 +105,8 @@ export default function TrainingPage() {
       setDetail(null);
       setGoldDoc(null);
       setActiveSectionIndex(0);
+      setGoldJsonText("");
+      setGoldJsonError("");
       return;
     }
     void loadDetail(selectedId);
@@ -134,7 +148,7 @@ export default function TrainingPage() {
   const activePredictionSection = predictionDoc.sections[activeSectionIndex] || null;
   const activeGoldSection = editableDoc.sections[activeSectionIndex] || null;
   const activeSection = sectionTabs[activeSectionIndex] || null;
-  const unlabeledCount = Math.max(0, (summary?.sample_count || 0) - (summary?.gold_count || 0));
+  const unlabeledCount = (summary?.samples || []).filter((sample) => isPendingLabelStatus(sample.label_status)).length;
 
   async function loadSummary() {
     setLoading(true);
@@ -145,8 +159,14 @@ export default function TrainingPage() {
       if (!response.ok) {
         throw new Error(String(payload.detail || "读取训练样本列表失败"));
       }
-      setSummary(payload as TrainingDatasetSummary);
-      setSelectedId((current) => current || payload.samples?.[0]?.id || "");
+      const nextSummary = payload as TrainingDatasetSummary;
+      setSummary(nextSummary);
+      setSelectedId((current) => {
+        if (current && nextSummary.samples.some((sample) => sample.id === current)) {
+          return current;
+        }
+        return nextSummary.samples[0]?.id || "";
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "读取训练样本列表失败");
     } finally {
@@ -168,6 +188,8 @@ export default function TrainingPage() {
       const nextTemplate = parseTrainingDocument(nextDetail.gold_template_text || "", nextPrediction);
       setDetail(nextDetail);
       setGoldDoc(parseTrainingDocument(nextDetail.gold_text || "", nextTemplate));
+      setGoldJsonText(nextDetail.gold_text || serializeTrainingDocument(nextTemplate));
+      setGoldJsonError("");
       setActiveSectionIndex(0);
     } catch (err) {
       setDetailError(err instanceof Error ? err.message : "读取训练样本详情失败");
@@ -177,15 +199,29 @@ export default function TrainingPage() {
   }
 
   async function saveGold() {
-    if (!selectedId || !goldDoc) return;
+    if (!selectedId) return;
     setSaving(true);
     setMessage("");
     setDetailError("");
     try {
+      let goldText = "";
+      if (workbenchView === "json") {
+        const validationError = validateTrainingJsonText(goldJsonText);
+        if (validationError) {
+          setGoldJsonError(validationError);
+          return;
+        }
+        goldText = goldJsonText;
+      } else {
+        if (!goldDoc) return;
+        goldText = serializeTrainingDocument(goldDoc);
+        setGoldJsonText(goldText);
+        setGoldJsonError("");
+      }
       const response = await fetch(`/api/training/samples?sample_id=${encodeURIComponent(selectedId)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ gold_text: serializeTrainingDocument(goldDoc) }),
+        body: JSON.stringify({ gold_text: goldText }),
       });
       const payload = await response.json();
       if (!response.ok) {
@@ -196,6 +232,8 @@ export default function TrainingPage() {
       const nextTemplate = parseTrainingDocument(nextDetail.gold_template_text || "", nextPrediction);
       setDetail(nextDetail);
       setGoldDoc(parseTrainingDocument(nextDetail.gold_text || "", nextTemplate));
+      setGoldJsonText(nextDetail.gold_text || serializeTrainingDocument(nextTemplate));
+      setGoldJsonError("");
       setMessage(`已保存 ${nextDetail.sample.paper_name} 的 gold.json`);
       await loadSummary();
       setSelectedId(nextDetail.sample.id);
@@ -206,14 +244,67 @@ export default function TrainingPage() {
     }
   }
 
+  async function deleteSelectedSample() {
+    if (!detail) return;
+    const confirmed = window.confirm(`确定删除样本“${detail.sample.paper_name}”吗？会连同当前样本目录下的 source、prediction、gold 文件一起删除。`);
+    if (!confirmed) return;
+    setDeleting(true);
+    setMessage("");
+    setDetailError("");
+    try {
+      const sampleId = detail.sample.id;
+      const response = await fetch(`/api/training/samples?sample_id=${encodeURIComponent(sampleId)}`, {
+        method: "DELETE",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(String(payload.detail || "删除训练样本失败"));
+      }
+      const result = payload as TrainingSampleDeleteResult;
+      setSelectedId("");
+      await loadSummary();
+      setMessage(`已删除样本：${result.paper_name}`);
+    } catch (err) {
+      setDetailError(err instanceof Error ? err.message : "删除训练样本失败");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   function replaceEditorWithTemplate() {
-    setGoldDoc(cloneTrainingDocument(templateDoc));
+    const nextDoc = cloneTrainingDocument(templateDoc);
+    setGoldDoc(nextDoc);
+    setGoldJsonText(serializeTrainingDocument(nextDoc));
+    setGoldJsonError("");
     setMessage("已把标注填写区切回 gold.template.json");
   }
 
   function replaceEditorWithPrediction() {
-    setGoldDoc(parseTrainingDocument(detail?.prediction_text || "", predictionDoc));
+    const nextDoc = parseTrainingDocument(detail?.prediction_text || "", predictionDoc);
+    setGoldDoc(nextDoc);
+    setGoldJsonText(serializeTrainingDocument(nextDoc));
+    setGoldJsonError("");
     setMessage("已把标注填写区切成当前 prediction.json，适合从预测结果开始修。");
+  }
+
+  function switchWorkbenchView(nextView: TrainingWorkbenchView) {
+    if (nextView === workbenchView) {
+      return;
+    }
+    if (nextView === "json") {
+      setGoldJsonText(goldDoc ? serializeTrainingDocument(goldDoc) : detail?.gold_text || serializeTrainingDocument(editableDoc));
+      setGoldJsonError("");
+      setWorkbenchView("json");
+      return;
+    }
+    const validationError = validateTrainingJsonText(goldJsonText);
+    if (validationError) {
+      setGoldJsonError(validationError);
+      return;
+    }
+    setGoldDoc(parseTrainingDocument(goldJsonText, templateDoc));
+    setGoldJsonError("");
+    setWorkbenchView("fields");
   }
 
   function updateGoldMeta(field: "label_status" | "notes", value: string) {
@@ -310,32 +401,6 @@ export default function TrainingPage() {
     });
   }
 
-  function removeGoldOption(sectionIndex: number, questionIndex: number, optionIndex: number) {
-    setGoldDoc((current) => {
-      if (!current) return current;
-      return {
-        ...current,
-        sections: current.sections.map((section, currentSectionIndex) => {
-          if (currentSectionIndex !== sectionIndex) {
-            return section;
-          }
-          return {
-            ...section,
-            questions: section.questions.map((question, currentQuestionIndex) => {
-              if (currentQuestionIndex !== questionIndex) {
-                return question;
-              }
-              return {
-                ...question,
-                options: question.options.filter((_, currentOptionIndex) => currentOptionIndex !== optionIndex),
-              };
-            }),
-          };
-        }),
-      };
-    });
-  }
-
   return (
     <div className="trainingPageRoot">
       <header className="pageHeader">
@@ -354,7 +419,7 @@ export default function TrainingPage() {
             <article className="panel">
               <div className="panelHeader">
                 <h2>远程入口</h2>
-                <p>训练入口和现有业务域名并行，不会替换当前域名。</p>
+                <p>训练标注已并入当前业务入口，与试卷和学科页面共用同一域名。</p>
               </div>
               <div className="panelBody stackList">
                 <div className="detailRow">
@@ -426,7 +491,7 @@ export default function TrainingPage() {
                               <strong className="questionListTitle">{sample.paper_name}</strong>
                               <StatusBadge
                                 value={sample.label_status}
-                                tone={sample.gold_exists ? "good" : "warn"}
+                                tone={isPendingLabelStatus(sample.label_status) ? "warn" : "good"}
                               />
                             </div>
                             <span className="questionListMeta">
@@ -451,8 +516,33 @@ export default function TrainingPage() {
 
             <article className="panel questionPanel questionDetailPanel">
               <div className="panelHeader">
-                <h2>标注工作台</h2>
-                <p>左侧看 `source.txt`，中间看 prediction 切分结果，右侧直接按题型、题干、选项、答案、解析填写 gold。</p>
+                <div>
+                  <h2>标注工作台</h2>
+                  <p>
+                    {workbenchView === "json"
+                      ? "左侧看 source.txt，中间直接查看 prediction.json，右侧直接编辑和保存 gold.json。"
+                      : "左侧看 source.txt，中间看 prediction 切分结果，右侧直接按题型、题干、选项、答案、解析填写 gold。"}
+                  </p>
+                </div>
+                <div className="trainingEditorActions">
+                  <button className="button danger small" type="button" disabled={!detail || deleting || saving} onClick={deleteSelectedSample}>
+                    {deleting ? "删除中..." : "删除样本"}
+                  </button>
+                  <button
+                    className={workbenchView === "fields" ? "button primary small" : "button small"}
+                    type="button"
+                    onClick={() => switchWorkbenchView("fields")}
+                  >
+                    字段视图
+                  </button>
+                  <button
+                    className={workbenchView === "json" ? "button primary small" : "button small"}
+                    type="button"
+                    onClick={() => switchWorkbenchView("json")}
+                  >
+                    JSON 视图
+                  </button>
+                </div>
               </div>
               <div className="panelBody questionDetailBody trainingDetailBody">
                 <LoadState loading={detailLoading} error={detailError} empty={!detail && !detailLoading} emptyLabel="请选择一个样本开始标注" />
@@ -472,12 +562,18 @@ export default function TrainingPage() {
                         <strong>{detail.sample.predicted_question_count}</strong>
                       </div>
                       <div className="detailRow">
-                        <span>当前分区</span>
-                        <strong>{activeSection ? `${activeSection.title || `分区 ${activeSectionIndex + 1}`} · ${activeSection.question_count} 题` : "-"}</strong>
+                        <span>当前视图</span>
+                        <strong>
+                          {workbenchView === "json"
+                            ? "整份 JSON 文档"
+                            : activeSection
+                              ? `${activeSection.title || `分区 ${activeSectionIndex + 1}`} · ${activeSection.question_count} 题`
+                              : "-"}
+                        </strong>
                       </div>
                     </div>
 
-                    {sectionTabs.length ? (
+                    {workbenchView === "fields" && sectionTabs.length ? (
                       <div className="trainingSectionTabs">
                         {sectionTabs.map((section, index) => (
                           <button
@@ -503,21 +599,30 @@ export default function TrainingPage() {
 
                     <div className="trainingEditorSection">
                       <div className="trainingEditorHeader">
-                        <strong>prediction 切分预览</strong>
-                        <span className="muted">按字段只读查看当前 section</span>
+                        <strong>{workbenchView === "json" ? "prediction.json" : "prediction 切分预览"}</strong>
+                        <span className="muted">{workbenchView === "json" ? "整份预测结果，只读查看" : "按字段只读查看当前 section"}</span>
                       </div>
-                      <div className="trainingStructuredPanel trainingStructuredReadonly">
-                        {activePredictionSection ? (
-                          <TrainingReadonlySection section={activePredictionSection} />
-                        ) : (
-                          <div className="empty compact">prediction 中暂无切分结果</div>
-                        )}
-                      </div>
+                      {workbenchView === "json" ? (
+                        <textarea
+                          className="trainingTextarea trainingReadonly trainingEditorTextarea"
+                          value={detail.prediction_text || "{}"}
+                          readOnly
+                          spellCheck={false}
+                        />
+                      ) : (
+                        <div className="trainingStructuredPanel trainingStructuredReadonly">
+                          {activePredictionSection ? (
+                            <TrainingReadonlySection section={activePredictionSection} sampleId={detail.sample.id} />
+                          ) : (
+                            <div className="empty compact">prediction 中暂无切分结果</div>
+                          )}
+                        </div>
+                      )}
                     </div>
 
                     <div className="trainingEditorSection">
                       <div className="trainingEditorHeader">
-                        <strong>gold 标注填写区</strong>
+                        <strong>{workbenchView === "json" ? "gold.json" : "gold 标注填写区"}</strong>
                         <div className="trainingEditorActions">
                           <button className="button small" type="button" onClick={replaceEditorWithTemplate}>
                             载入模板
@@ -530,41 +635,57 @@ export default function TrainingPage() {
                           </button>
                         </div>
                       </div>
-                      <div className="trainingStructuredPanel">
-                        <div className="trainingGoldMetaGrid">
-                          <label className="trainingField">
-                            <span>标注状态</span>
-                            <input
-                              className="input"
-                              value={editableDoc.label_status}
-                              onChange={(event) => updateGoldMeta("label_status", event.target.value)}
-                            />
-                          </label>
-                          <label className="trainingField trainingFieldFull">
-                            <span>备注</span>
-                            <textarea
-                              className="trainingFormTextarea trainingNotesTextarea"
-                              value={editableDoc.notes}
-                              onChange={(event) => updateGoldMeta("notes", event.target.value)}
-                              spellCheck={false}
-                            />
-                          </label>
-                        </div>
-
-                        {activeGoldSection ? (
-                          <TrainingEditableSection
-                            section={activeGoldSection}
-                            sectionIndex={activeSectionIndex}
-                            onSectionFieldChange={updateGoldSectionField}
-                            onQuestionFieldChange={updateGoldQuestionField}
-                            onOptionChange={updateGoldOption}
-                            onAddOption={addGoldOption}
-                            onRemoveOption={removeGoldOption}
+                      {workbenchView === "json" ? (
+                        <div className="trainingStructuredPanel">
+                          {goldJsonError ? <div className="errorPanel">{goldJsonError}</div> : null}
+                          <textarea
+                            className="trainingTextarea trainingEditorTextarea"
+                            value={goldJsonText}
+                            onChange={(event) => {
+                              setGoldJsonText(event.target.value);
+                              if (goldJsonError) {
+                                setGoldJsonError("");
+                              }
+                            }}
+                            spellCheck={false}
                           />
-                        ) : (
-                          <div className="empty compact">gold 中暂无可填写题目</div>
-                        )}
-                      </div>
+                        </div>
+                      ) : (
+                        <div className="trainingStructuredPanel">
+                          <div className="trainingGoldMetaGrid">
+                            <label className="trainingField">
+                              <span>标注状态</span>
+                              <input
+                                className="input"
+                                value={editableDoc.label_status}
+                                onChange={(event) => updateGoldMeta("label_status", event.target.value)}
+                              />
+                            </label>
+                            <label className="trainingField trainingFieldFull">
+                              <span>备注</span>
+                              <textarea
+                                className="trainingFormTextarea trainingNotesTextarea"
+                                value={editableDoc.notes}
+                                onChange={(event) => updateGoldMeta("notes", event.target.value)}
+                                spellCheck={false}
+                              />
+                            </label>
+                          </div>
+
+                          {activeGoldSection ? (
+                            <TrainingEditableSection
+                              section={activeGoldSection}
+                              sectionIndex={activeSectionIndex}
+                              onSectionFieldChange={updateGoldSectionField}
+                              onQuestionFieldChange={updateGoldQuestionField}
+                              onOptionChange={updateGoldOption}
+                              onAddOption={addGoldOption}
+                            />
+                          ) : (
+                            <div className="empty compact">gold 中暂无可填写题目</div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ) : null}
@@ -577,7 +698,7 @@ export default function TrainingPage() {
   );
 }
 
-function TrainingReadonlySection({ section }: { section: TrainingSection }) {
+function TrainingReadonlySection({ section, sampleId }: { section: TrainingSection; sampleId: string }) {
   return (
     <div className="trainingSectionStack">
       <div className="trainingSectionCard">
@@ -598,9 +719,9 @@ function TrainingReadonlySection({ section }: { section: TrainingSection }) {
               <ReadonlyField label="题号" value={question.question_no} />
               <ReadonlyField label="题型" value={question.question_type} />
               <ReadonlyField label="答案" value={question.answer_text} />
-              <ReadonlyField className="trainingFieldFull" label="题干" value={question.stem_text} multiline />
-              <ReadonlyOptions options={question.options} />
-              <ReadonlyField className="trainingFieldFull" label="解析" value={question.analysis_text} multiline />
+              <ReadonlyField className="trainingFieldFull" label="题干" value={question.stem_text} multiline sampleId={sampleId} />
+              <ReadonlyOptions options={question.options} sampleId={sampleId} />
+              <ReadonlyField className="trainingFieldFull" label="解析" value={question.analysis_text} multiline sampleId={sampleId} />
             </div>
           </article>
         ))}
@@ -621,7 +742,6 @@ type TrainingEditableSectionProps = {
   ) => void;
   onOptionChange: (sectionIndex: number, questionIndex: number, optionIndex: number, value: string) => void;
   onAddOption: (sectionIndex: number, questionIndex: number) => void;
-  onRemoveOption: (sectionIndex: number, questionIndex: number, optionIndex: number) => void;
 };
 
 function TrainingEditableSection({
@@ -631,7 +751,6 @@ function TrainingEditableSection({
   onQuestionFieldChange,
   onOptionChange,
   onAddOption,
-  onRemoveOption,
 }: TrainingEditableSectionProps) {
   return (
     <div className="trainingSectionStack">
@@ -717,13 +836,6 @@ function TrainingEditableSection({
                         onChange={(event) => onOptionChange(sectionIndex, questionIndex, optionIndex, event.target.value)}
                         spellCheck={false}
                       />
-                      <button
-                        className="button small"
-                        type="button"
-                        onClick={() => onRemoveOption(sectionIndex, questionIndex, optionIndex)}
-                      >
-                        删除
-                      </button>
                     </div>
                   ))}
                   {!question.options.length ? <div className="empty compact">当前没有选项，点“新增选项”开始填写。</div> : null}
@@ -751,32 +863,41 @@ function ReadonlyField({
   value,
   multiline = false,
   className = "",
+  sampleId = "",
 }: {
   label: string;
   value: string;
   multiline?: boolean;
   className?: string;
+  sampleId?: string;
 }) {
   return (
     <div className={`trainingField ${className}`.trim()}>
       <span>{label}</span>
-      <div className={multiline ? "trainingFieldValue trainingFieldValueMultiline" : "trainingFieldValue"}>
-        {value || "—"}
-      </div>
+      {multiline ? (
+        <div
+          className="trainingFieldValue trainingFieldValueMultiline paperPreviewHtml"
+          dangerouslySetInnerHTML={{ __html: renderDocumentPreviewHtml(value || "—", (src) => resolveTrainingImageSrc(sampleId, src)) }}
+        />
+      ) : (
+        <div className="trainingFieldValue">{value || "—"}</div>
+      )}
     </div>
   );
 }
 
-function ReadonlyOptions({ options }: { options: string[] }) {
+function ReadonlyOptions({ options, sampleId = "" }: { options: string[]; sampleId?: string }) {
   return (
     <div className="trainingField trainingFieldFull">
       <span>选项</span>
       <div className="trainingOptionList">
         {options.length ? (
           options.map((option, index) => (
-            <div key={`readonly-option-${index}`} className="trainingFieldValue trainingFieldValueMultiline">
-              {option}
-            </div>
+            <div
+              key={`readonly-option-${index}`}
+              className="trainingFieldValue trainingFieldValueMultiline paperPreviewHtml"
+              dangerouslySetInnerHTML={{ __html: renderDocumentPreviewHtml(option, (src) => resolveTrainingImageSrc(sampleId, src)) }}
+            />
           ))
         ) : (
           <div className="trainingFieldValue">—</div>
@@ -797,6 +918,16 @@ function buildSectionTabs(primarySections: TrainingSection[], secondarySections:
       question_count: primary?.questions.length || secondary?.questions.length || 0,
     };
   });
+}
+
+function resolveTrainingImageSrc(sampleId: string, src: string) {
+  if (!src.startsWith("imgs/")) {
+    return src;
+  }
+  if (!sampleId) {
+    return src;
+  }
+  return `/api/training/samples?sample_id=${encodeURIComponent(sampleId)}&image_path=${encodeURIComponent(src)}`;
 }
 
 function parseTrainingDocument(text: string, fallback?: TrainingDocument): TrainingDocument {
@@ -934,4 +1065,24 @@ function asEditableString(value: unknown, fallback = ""): string {
 
 function asFiniteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function validateTrainingJsonText(text: string): string {
+  if (!text.trim()) {
+    return "gold.json 不能为空。";
+  }
+  try {
+    const payload = JSON.parse(text);
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return "gold.json 顶层必须是 JSON 对象。";
+    }
+    return "";
+  } catch (error) {
+    return error instanceof Error ? `gold.json 不是合法 JSON：${error.message}` : "gold.json 不是合法 JSON。";
+  }
+}
+
+function isPendingLabelStatus(status: string): boolean {
+  const normalized = status.trim().toLowerCase();
+  return !normalized || normalized === "draft" || normalized === "pending" || normalized === "todo";
 }

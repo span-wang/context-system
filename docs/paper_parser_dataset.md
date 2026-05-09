@@ -15,7 +15,7 @@
 
 当前默认行为：
 
-- 只要试卷切题成功并完成入库
+- 只要试卷解析流程跑完并完成入库，不管切题结果如何
 - 系统就会自动在 `data/paper_parser_dataset/` 下更新对应样本目录
 - 已存在的 `gold.json` 不会被覆盖
 - `gold.template.json / prediction.json / source.txt / meta.json` 会同步刷新

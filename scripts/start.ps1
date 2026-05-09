@@ -1,9 +1,9 @@
 param(
   [int]$ApiPort = 8000,
   [int]$WebPort = 3000,
-  [switch]$UseLocalMySql,
+  [switch]$UseLocalMySql = $true,
   [int]$MySqlPort = 3309,
-  [string]$MySqlDatabase = "exam_kit_local",
+  [string]$MySqlDatabase = "exam_kit_migrate_20260509",
   [switch]$NoInstall,
   [switch]$NoBrowser,
   [switch]$NoTunnel,
@@ -336,10 +336,10 @@ if ((-not $ReuseExistingWeb) -and (-not (Test-Http $WebUrl))) {
   $oldPublicWebUrl = $env:PUBLIC_WEB_URL
   $env:API_PROXY_TARGET = "http://127.0.0.1:$ApiPort"
   if (-not $env:LAYOUT_PROXY_TARGET) {
-    $env:LAYOUT_PROXY_TARGET = "https://xhs.panspan.cloud"
+    $env:LAYOUT_PROXY_TARGET = "https://context.panspan.cloud"
   }
   if (-not $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL) {
-    $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL = "https://xhs.panspan.cloud"
+    $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL = "https://context.panspan.cloud"
   }
   if ($TunnelHosts.Count -gt 0) {
     $env:NEXT_ALLOWED_DEV_ORIGINS = ($TunnelHosts -join ",")

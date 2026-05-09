@@ -3,9 +3,13 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from sqlalchemy import Date, DateTime, Integer, String, Text
+from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
+
+
+LARGE_TEXT = Text().with_variant(mysql.LONGTEXT(), "mysql")
 
 
 LEGACY_TABLE_NAMES = {
@@ -38,7 +42,7 @@ class LegacyLibraryFile(Base):
     source_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tags: Mapped[str] = mapped_column(Text)
-    parsed_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parsed_text: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -52,8 +56,8 @@ class LegacyLibraryParseResult(Base):
     sequence_number: Mapped[int] = mapped_column(Integer, index=True)
     provider: Mapped[str] = mapped_column(String(128))
     token_count: Mapped[int] = mapped_column(Integer)
-    parsed_text: Mapped[str] = mapped_column(Text)
-    markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parsed_text: Mapped[str] = mapped_column(LARGE_TEXT)
+    markdown: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
     parse_options: Mapped[str] = mapped_column(Text)
     warnings: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

@@ -41,7 +41,7 @@ services:
       - "3000:3000"
     environment:
       - API_PROXY_TARGET=http://api:8000
-      - NEXT_PUBLIC_LAYOUT_PUBLIC_URL=https://xhs.panspan.cloud
-      - LAYOUT_PROXY_TARGET=https://xhs.panspan.cloud
+      - NEXT_PUBLIC_LAYOUT_PUBLIC_URL=https://context.panspan.cloud
+      - LAYOUT_PROXY_TARGET=https://context.panspan.cloud
     depends_on:
       - api

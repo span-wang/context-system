@@ -39,12 +39,7 @@ class SystemService:
                 module_status={
                     "auth": "skeleton-ready",
                     "papers": "seed-data-ready",
-                    "questions": "seed-data-ready",
                     "knowledge": "seed-data-ready",
-                    "analysis": "dashboard-ready",
-                    "question_bank": "seed-data-ready",
-                    "learning": "seed-data-ready",
-                    "workflow": "report-link-ready",
                 },
             ),
         )

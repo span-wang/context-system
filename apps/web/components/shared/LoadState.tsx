@@ -7,7 +7,7 @@ type LoadStateProps = {
 
 export function LoadState({ loading, error, empty = false, emptyLabel = "暂无数据" }: LoadStateProps) {
   if (loading) {
-    return <div className="empty compact">正在加载...</div>;
+    return <div className="calloutBox">正在加载...</div>;
   }
   if (error) {
     return <div className="errorPanel">{error}</div>;

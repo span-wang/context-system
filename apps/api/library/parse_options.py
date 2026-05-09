@@ -13,6 +13,7 @@ from library.pdf_ocr_pipeline import OCRPipelineOptions
 
 ParsePreset = Literal["auto", "fast", "balanced", "accurate", "formula"]
 ParseOutputFormat = Literal["markdown", "text"]
+ParseMode = Literal["rules"]
 
 
 class DocumentParseOptions(BaseModel):
@@ -20,8 +21,9 @@ class DocumentParseOptions(BaseModel):
 
     preset: ParsePreset = "auto"
     output_format: ParseOutputFormat = "markdown"
+    parse_mode: ParseMode = "rules"
     force_ocr: bool | None = None
-    render_dpi: int | None = Field(default=None, ge=96, le=300)
+    render_dpi: int | None = Field(default=None, ge=96, le=360)
     crop_header_ratio: float | None = Field(default=None, ge=0.0, le=0.2)
     crop_footer_ratio: float | None = Field(default=None, ge=0.0, le=0.2)
     trim_margins: bool | None = None
@@ -142,7 +144,7 @@ def _preset_defaults(preset: ParsePreset) -> OCRPipelineOptions:
     if preset == "accurate":
         return OCRPipelineOptions(
             force_ocr=True,
-            render_dpi=280,
+            render_dpi=320,
             trim_margins=True,
             remove_repeated_lines=True,
             watermark_detection=True,
@@ -151,7 +153,7 @@ def _preset_defaults(preset: ParsePreset) -> OCRPipelineOptions:
     if preset == "formula":
         return OCRPipelineOptions(
             force_ocr=True,
-            render_dpi=280,
+            render_dpi=340,
             trim_margins=True,
             remove_repeated_lines=True,
             watermark_detection=False,

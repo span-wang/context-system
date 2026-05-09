@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from sqlalchemy import ForeignKey, Integer, JSON, String, Text
+from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, ManagedEntityMixin
+
+
+LARGE_TEXT = Text().with_variant(mysql.LONGTEXT(), "mysql")
 
 
 class Asset(Base, ManagedEntityMixin):
@@ -17,11 +21,11 @@ class Asset(Base, ManagedEntityMixin):
     filename: Mapped[str] = mapped_column(String(255))
     mime_type: Mapped[str] = mapped_column(String(128))
     storage_path: Mapped[str] = mapped_column(String(255))
-    sha256: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    sha256: Mapped[str] = mapped_column(String(128), index=True)
     file_size: Mapped[int] = mapped_column(Integer, default=0)
     parse_status: Mapped[str] = mapped_column(String(32), default="pending")
     ocr_status: Mapped[str] = mapped_column(String(32), default="pending")
-    parsed_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parsed_text: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     region: Mapped[str | None] = mapped_column(String(64), nullable=True)

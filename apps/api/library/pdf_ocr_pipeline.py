@@ -26,9 +26,17 @@ DEFAULT_PADDLE_OCR_RECOGNITION_MODEL = "PP-OCRv5_server_rec"
 PADDLE_OCR_LOCK = RLock()
 DEFAULT_OCR_ENGINE = "paddle"
 DEFAULT_PDF_PARSE_PAGE_BATCH_SIZE = 4
+BLANK_PLACEHOLDER_TEXT = "（ ）"
+BLANK_LINE_DARK_PIXEL_THRESHOLD = 200
+BLANK_LINE_MIN_WIDTH = 36
+BLANK_LINE_MAX_HEIGHT = 10
+BLANK_LINE_MIN_ASPECT_RATIO = 8.0
+BLANK_LINE_MAX_PAGE_WIDTH_RATIO = 0.8
+BLANK_LINE_NEARBY_TEXT_GAP = 24
 OCR_ENGINE_ENV = "PDF_OCR_ENGINE"
 PDF_PARSE_PAGE_BATCH_SIZE_ENV = "PDF_PARSE_PAGE_CHUNK_SIZE"
 PDF_OCR_CHECKPOINT_DIR_ENV = "PDF_OCR_CHECKPOINT_DIR"
+CHECKPOINT_NAMESPACE_FILENAME = "cache.namespace"
 PADDLE_OCR_VERSION_ENV = "PDF_OCR_VERSION"
 PADDLE_OCR_DETECTION_MODEL_ENV = "PDF_OCR_DETECTION_MODEL"
 PADDLE_OCR_RECOGNITION_MODEL_ENV = "PDF_OCR_RECOGNITION_MODEL"
@@ -46,6 +54,7 @@ class OCRPipelineOptions:
     force_ocr: bool = False
     render_dpi: int = DEFAULT_RENDER_DPI
     max_pages: int | None = None
+    cache_namespace: str | None = None
     crop_header_ratio: float = 0.0
     crop_footer_ratio: float = 0.0
     trim_margins: bool = True
@@ -625,18 +634,19 @@ def _process_pdf_ocr_page_range(
         release_paddle_ocr_resources(clear_cached_engines=False, force_clear_cache=True)
 
 
-def _get_pdf_ocr_checkpoint_root() -> Path:
+def _get_pdf_ocr_checkpoint_root(*, ensure_exists: bool = True) -> Path:
     raw = os.getenv(PDF_OCR_CHECKPOINT_DIR_ENV)
     if raw and raw.strip():
         root = Path(raw.strip())
     else:
         try:
-            from settings import get_settings
+            from app.core.config import get_settings
 
             root = get_settings().storage.root_path / "cache" / "pdf_ocr_checkpoints"
         except Exception:
             root = PROJECT_ROOT / "data" / "cache" / "pdf_ocr_checkpoints"
-    root.mkdir(parents=True, exist_ok=True)
+    if ensure_exists:
+        root.mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -654,6 +664,7 @@ def _get_pdf_ocr_checkpoint_dir(
         {
             "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
             "options": options_payload,
+            "cache_namespace": options.cache_namespace,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -661,7 +672,25 @@ def _get_pdf_ocr_checkpoint_dir(
     digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     checkpoint_dir = root / digest[:2] / digest
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _write_checkpoint_source_fingerprint(checkpoint_dir, hashlib.sha256(pdf_bytes).hexdigest())
+    _write_checkpoint_namespace_marker(checkpoint_dir, options.cache_namespace)
     return checkpoint_dir
+
+
+def _write_checkpoint_source_fingerprint(checkpoint_dir: Path, sha256: str) -> None:
+    path = checkpoint_dir / "source.sha256"
+    if path.exists():
+        return
+    path.write_text(sha256, encoding="utf-8")
+
+
+def _write_checkpoint_namespace_marker(checkpoint_dir: Path, cache_namespace: str | None) -> None:
+    if not cache_namespace:
+        return
+    path = checkpoint_dir / CHECKPOINT_NAMESPACE_FILENAME
+    if path.exists():
+        return
+    path.write_text(cache_namespace, encoding="utf-8")
 
 
 def _load_pdf_ocr_checkpoint_page(checkpoint_dir: Path, page_number: int) -> OCRPageResult | None:
@@ -975,6 +1004,7 @@ def _ocr_single_page(
     )
 
     _remove_header_footer_noise(page_result, options)
+    _attach_blank_line_placeholders(page_result, processed_image)
 
     if formula_engine is not None:
         _attach_formula_results(page_result, formula_engine, processed_image, options.formula_confidence_threshold)
@@ -1102,6 +1132,108 @@ def _extract_ocr_blocks(raw_result: Any, page_number: int, image_size: tuple[int
     return blocks
 
 
+def _attach_blank_line_placeholders(page_result: OCRPageResult, pil_image: Any) -> None:
+    blank_blocks = _detect_blank_line_placeholders(page_result, pil_image)
+    if blank_blocks:
+        page_result.blocks.extend(blank_blocks)
+
+
+def _detect_blank_line_placeholders(page_result: OCRPageResult, pil_image: Any) -> list[OCRTextBlock]:
+    try:
+        import numpy as np
+    except Exception:
+        return []
+
+    if pil_image is None:
+        return []
+
+    gray_image = np.asarray(pil_image.convert("L"))
+    if gray_image.ndim != 2:
+        return []
+
+    page_height, page_width = gray_image.shape
+    dark_mask = gray_image < BLANK_LINE_DARK_PIXEL_THRESHOLD
+    segments: list[tuple[int, int, int]] = []
+    for row_index, row in enumerate(dark_mask):
+        dark_columns = np.flatnonzero(row)
+        if dark_columns.size < BLANK_LINE_MIN_WIDTH:
+            continue
+        split_points = np.where(np.diff(dark_columns) > 1)[0] + 1
+        for segment in np.split(dark_columns, split_points):
+            if segment.size < BLANK_LINE_MIN_WIDTH:
+                continue
+            segments.append((row_index, int(segment[0]), int(segment[-1]) + 1))
+
+    if not segments:
+        return []
+
+    groups: list[dict[str, float]] = []
+    for row_index, x1, x2 in segments:
+        merged = False
+        for group in reversed(groups):
+            if row_index - group["y2"] > 2:
+                break
+            if x2 < group["x1"] - 4 or x1 > group["x2"] + 4:
+                continue
+            group["x1"] = min(group["x1"], float(x1))
+            group["x2"] = max(group["x2"], float(x2))
+            group["y1"] = min(group["y1"], float(row_index))
+            group["y2"] = max(group["y2"], float(row_index))
+            group["rows"] += 1
+            merged = True
+            break
+        if not merged:
+            groups.append({"x1": float(x1), "x2": float(x2), "y1": float(row_index), "y2": float(row_index), "rows": 1})
+
+    placeholders: list[OCRTextBlock] = []
+    for index, group in enumerate(groups, start=1):
+        x1 = float(group["x1"])
+        x2 = float(group["x2"])
+        y1 = float(group["y1"])
+        y2 = float(group["y2"])
+        width = x2 - x1
+        height = y2 - y1 + 1.0
+        if width < BLANK_LINE_MIN_WIDTH:
+            continue
+        if width > page_width * BLANK_LINE_MAX_PAGE_WIDTH_RATIO:
+            continue
+        if height > BLANK_LINE_MAX_HEIGHT:
+            continue
+        if width / max(height, 1.0) < BLANK_LINE_MIN_ASPECT_RATIO:
+            continue
+        if not _blank_line_has_nearby_text(page_result.blocks, x1, y1, x2, y2):
+            continue
+
+        placeholders.append(
+            OCRTextBlock(
+                page_number=page_result.page_number,
+                block_id=f"p{page_result.page_number}-blank-{index}",
+                text=BLANK_PLACEHOLDER_TEXT,
+                bbox=[x1, y1, x2, y2],
+                score=1.0,
+                block_type="blank",
+            )
+        )
+    return placeholders
+
+
+def _blank_line_has_nearby_text(blocks: list[OCRTextBlock], x1: float, y1: float, x2: float, y2: float) -> bool:
+    if not blocks:
+        return False
+
+    center_y = (y1 + y2) / 2.0
+    for block in blocks:
+        if block.removed_as_noise or not block.bbox:
+            continue
+        bx1, by1, bx2, by2 = block.bbox
+        block_center_y = (by1 + by2) / 2.0
+        if abs(block_center_y - center_y) > max(18.0, (y2 - y1 + 1.0) * 4.0):
+            continue
+        if bx2 >= x1 - BLANK_LINE_NEARBY_TEXT_GAP and bx1 <= x2 + BLANK_LINE_NEARBY_TEXT_GAP:
+            return True
+    return False
+
+
 def _coerce_prediction_payload(raw_result: Any) -> dict[str, Any]:
     if isinstance(raw_result, list) and raw_result:
         first = raw_result[0]
@@ -1183,6 +1315,8 @@ def _attach_formula_results(
     for block in page_result.blocks:
         if not block.bbox:
             continue
+        if block.block_type != "text":
+            continue
         if not _looks_like_formula_text(block.text):
             continue
         cropped = _crop_block_image(pil_image, block.bbox)
@@ -1245,7 +1379,11 @@ def _extract_formula_prediction(prediction: Any) -> tuple[str, float | None]:
 def _remove_repeated_noise(page_results: list[OCRPageResult], min_pages: int) -> None:
     line_counter: Counter[str] = Counter()
     for page in page_results:
-        unique_lines = {_normalize_noise_line(block.text) for block in page.blocks if block.text.strip()}
+        unique_lines = {
+            _normalize_noise_line(block.text)
+            for block in page.blocks
+            if block.text.strip() and block.block_type != "blank"
+        }
         for line in unique_lines:
             if line:
                 line_counter[line] += 1
@@ -1263,6 +1401,9 @@ def _remove_repeated_noise(page_results: list[OCRPageResult], min_pages: int) ->
     for page in page_results:
         kept: list[OCRTextBlock] = []
         for block in page.blocks:
+            if block.block_type == "blank":
+                kept.append(block)
+                continue
             normalized = _normalize_noise_line(block.text)
             if normalized in repeated:
                 block.removed_as_noise = True

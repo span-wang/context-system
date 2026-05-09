@@ -10,27 +10,25 @@ from app.core.config import get_settings
 
 settings = get_settings()
 database_url = settings.db.resolved_url
-is_sqlite = database_url.startswith("sqlite")
+if not database_url.startswith("mysql"):
+    raise RuntimeError("Only MySQL is supported. Configure DB_URL with a mysql+pymysql URL.")
 
 engine_kwargs = {
     "echo": settings.db.echo,
     "pool_pre_ping": True,
+    "pool_recycle": 3600,
+    "pool_size": settings.db.pool_size,
+    "max_overflow": settings.db.max_overflow,
 }
-if is_sqlite:
-    engine_kwargs["connect_args"] = {"check_same_thread": False}
-else:
-    engine_kwargs["pool_size"] = settings.db.pool_size
-    engine_kwargs["max_overflow"] = settings.db.max_overflow
 
 engine = create_engine(database_url, **engine_kwargs)
 
-if is_sqlite and database_url != "sqlite:///:memory:":
-    @event.listens_for(engine, "connect")
-    def _configure_sqlite_connection(dbapi_connection, connection_record) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA busy_timeout=5000")
-        cursor.close()
+
+@event.listens_for(engine, "connect")
+def _configure_mysql_connection(dbapi_connection, connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute("SET NAMES utf8mb4")
+    cursor.close()
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, class_=Session)
 

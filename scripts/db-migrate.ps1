@@ -2,7 +2,7 @@ param(
   [string]$Revision = "head",
   [switch]$UseLocalMySql,
   [int]$MySqlPort = 3309,
-  [string]$MySqlDatabase = "exam_kit_local",
+  [string]$MySqlDatabase = "exam_kit_migrate_20260509",
   [switch]$SeedData,
   [switch]$SkipMigrate
 )

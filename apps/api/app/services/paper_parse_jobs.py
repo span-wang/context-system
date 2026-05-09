@@ -37,6 +37,7 @@ def start_paper_parse_job(session: Session, paper_id: int, options: DocumentPars
         scope_config_json={
             "paper_id": paper_id,
             "parse_options": options.normalized_dump(),
+            "parse_mode": options.parse_mode,
             "stage": "queued",
         },
         status="pending",
@@ -70,7 +71,7 @@ def _run_paper_parse_job(job_id: int, paper_id: int, options_dump: dict[str, obj
             status="running",
             progress=3,
             stage="device_check",
-            detail={"paper_id": paper_id},
+        detail={"paper_id": paper_id},
             started_at=datetime.utcnow(),
         )
         try:

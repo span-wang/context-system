@@ -1,6 +1,8 @@
 import { promises as fs } from "fs";
 import path from "path";
 
+const CHECKPOINT_NAMESPACE_FILENAME = "cache.namespace";
+
 export type TrainingSampleSummary = {
   id: string;
   paper_id: number | null;
@@ -36,6 +38,11 @@ export type TrainingSampleDetail = {
   prediction_text: string;
   gold_template_text: string;
   gold_text: string;
+};
+
+export type TrainingSampleDeleteResult = {
+  id: string;
+  paper_name: string;
 };
 
 export async function listTrainingSamples(): Promise<TrainingDatasetSummary> {
@@ -88,18 +95,27 @@ export async function listTrainingSamples(): Promise<TrainingDatasetSummary> {
 
 export async function readTrainingSample(sampleId: string): Promise<TrainingSampleDetail> {
   const samplePath = resolveSamplePath(sampleId);
+  await ensureGoldFile(samplePath);
   const sample = await buildSampleSummary(sampleId, samplePath);
-  const [metaText, sourceText, predictionText, goldTemplateText, goldText] = await Promise.all([
+  let [metaText, sourceText, predictionText, goldTemplateText, goldText] = await Promise.all([
     readTextOrDefault(path.join(samplePath, "meta.json"), "{}"),
     readTextOrDefault(path.join(samplePath, "source.txt"), ""),
     readTextOrDefault(path.join(samplePath, "prediction.json"), "{}"),
     readTextOrDefault(path.join(samplePath, "gold.template.json"), "{}"),
     readTextOrDefault(path.join(samplePath, "gold.json"), ""),
   ]);
+  const meta = parseJsonObject(metaText);
+  const imageRoots = await resolveTrainingImageRoots(samplePath, meta);
+  [sourceText, predictionText, goldTemplateText, goldText] = await Promise.all([
+    inlineSampleImages(sourceText, imageRoots),
+    inlineSampleImages(predictionText, imageRoots),
+    inlineSampleImages(goldTemplateText, imageRoots),
+    inlineSampleImages(goldText, imageRoots),
+  ]);
 
   return {
     sample,
-    meta: parseJsonObject(metaText),
+    meta,
     source_text: sourceText,
     prediction_text: predictionText,
     gold_template_text: goldTemplateText,
@@ -112,6 +128,16 @@ export async function saveTrainingSampleGold(sampleId: string, goldText: string)
   const normalized = formatJsonText(goldText);
   await fs.writeFile(path.join(samplePath, "gold.json"), normalized, "utf8");
   return readTrainingSample(sampleId);
+}
+
+export async function deleteTrainingSample(sampleId: string): Promise<TrainingSampleDeleteResult> {
+  const samplePath = resolveSamplePath(sampleId);
+  const sample = await buildSampleSummary(sampleId, samplePath);
+  await fs.rm(samplePath, { recursive: true, force: false });
+  return {
+    id: sample.id,
+    paper_name: sample.paper_name,
+  };
 }
 
 function resolveRepoRoot(): string {
@@ -136,6 +162,7 @@ function resolveSamplePath(sampleId: string): string {
 }
 
 async function buildSampleSummary(sampleId: string, samplePath: string): Promise<TrainingSampleSummary> {
+  await ensureGoldFile(samplePath);
   const meta = parseJsonObject(await readTextOrDefault(path.join(samplePath, "meta.json"), "{}"));
   const goldText = await readTextOrDefault(path.join(samplePath, "gold.json"), "");
   const gold = goldText ? parseJsonObject(goldText) : {};
@@ -150,10 +177,22 @@ async function buildSampleSummary(sampleId: string, samplePath: string): Promise
     predicted_question_count: asNumber(meta.predicted_question_count),
     stored_needs_review_count: asNumber(meta.stored_needs_review_count),
     gold_exists: goldExists,
-    label_status: asNullableString(gold.label_status) || (goldExists ? "draft" : "missing"),
+    label_status: asNullableString(gold.label_status) || "draft",
     source_text_length: asNumber(meta.source_text_length),
     updated_at: stat.mtime.toISOString(),
   };
+}
+
+async function ensureGoldFile(samplePath: string): Promise<void> {
+  const goldPath = path.join(samplePath, "gold.json");
+  if (await fileExists(goldPath)) {
+    return;
+  }
+  const templateText = await readTextOrDefault(path.join(samplePath, "gold.template.json"), "");
+  if (!templateText.trim()) {
+    return;
+  }
+  await fs.writeFile(goldPath, templateText, "utf8");
 }
 
 async function readRuntimeInfo(): Promise<{
@@ -229,4 +268,112 @@ function asNullableNumber(value: unknown): number | null {
 
 function asNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+async function inlineSampleImages(text: string, imageRoots: string[]): Promise<string> {
+  if (!text.includes("imgs/")) {
+    return text;
+  }
+  const htmlMatches = Array.from(text.matchAll(/<img([^>]*?)src=["'](imgs\/[^"']+)["']([^>]*?)>/gi));
+  const markdownMatches = Array.from(text.matchAll(/!\[([^\]]*)\]\((imgs\/[^)\s]+)\)/g));
+  let result = text;
+
+  for (const match of htmlMatches) {
+    const original = match[0];
+    const before = match[1] || "";
+    const imagePath = match[2] || "";
+    const after = match[3] || "";
+    const dataUrl = await sampleImageToDataUrl(imageRoots, imagePath);
+    if (!dataUrl) continue;
+    result = result.replace(original, `<img${before}src="${dataUrl}"${after}>`);
+  }
+
+  for (const match of markdownMatches) {
+    const original = match[0];
+    const alt = match[1] || "";
+    const imagePath = match[2] || "";
+    const dataUrl = await sampleImageToDataUrl(imageRoots, imagePath);
+    if (!dataUrl) continue;
+    result = result.replace(original, `![${alt}](${dataUrl})`);
+  }
+
+  return result;
+}
+
+async function sampleImageToDataUrl(imageRoots: string[], relativePath: string): Promise<string> {
+  const normalized = relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
+  for (const imageRoot of imageRoots) {
+    const primary = path.join(imageRoot, normalized);
+    const fallback = normalized.startsWith("imgs/") ? path.join(imageRoot, normalized.slice(5)) : primary;
+    for (const candidate of primary === fallback ? [primary] : [primary, fallback]) {
+      try {
+        const raw = await fs.readFile(candidate);
+        const mime = imageMimeType(candidate);
+        return `data:${mime};base64,${raw.toString("base64")}`;
+      } catch {
+        // try next
+      }
+    }
+  }
+  return "";
+}
+
+function imageMimeType(filePath: string): string {
+  const suffix = path.extname(filePath).toLowerCase();
+  if (suffix === ".png") return "image/png";
+  if (suffix === ".webp") return "image/webp";
+  if (suffix === ".gif") return "image/gif";
+  if (suffix === ".bmp") return "image/bmp";
+  if (suffix === ".svg") return "image/svg+xml";
+  return "image/jpeg";
+}
+
+async function resolveTrainingImageRoots(samplePath: string, meta: Record<string, unknown>): Promise<string[]> {
+  const roots: string[] = [];
+  const sampleImgs = path.join(samplePath, "imgs");
+  if (await fileExists(sampleImgs)) {
+    roots.push(samplePath);
+  }
+
+  const assetId = asNullableNumber(meta.asset_id);
+  if (!assetId) {
+    return roots;
+  }
+
+  const checkpointRoot = path.resolve(resolveRepoRoot(), "data", "cache", "pdf_ocr_checkpoints", "layout");
+  const namespace = `paper_asset_${assetId}`;
+  const stack = [checkpointRoot];
+  while (stack.length) {
+    const current = stack.pop();
+    if (!current) continue;
+    let entries: import("fs").Dirent[] = [];
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (entry.name !== CHECKPOINT_NAMESPACE_FILENAME) {
+        continue;
+      }
+      const text = (await readTextOrDefault(fullPath, "")).trim();
+      if (text !== namespace) {
+        continue;
+      }
+      const checkpointDir = path.dirname(fullPath);
+      const assetEntries = await fs.readdir(checkpointDir, { withFileTypes: true }).catch(() => []);
+      for (const assetEntry of assetEntries) {
+        if (assetEntry.isDirectory() && /^page_\d+_assets$/i.test(assetEntry.name)) {
+          roots.push(path.join(checkpointDir, assetEntry.name));
+        }
+      }
+    }
+  }
+
+  return [...new Set(roots)];
 }

@@ -22,6 +22,11 @@ PROJECT_ROOT = _find_project_root()
 _DOTENV_FILENAMES = (".env.local", ".env", ".evn")
 _INITIAL_ENV_KEYS = set(os.environ)
 _DOTENV_MANAGED_KEYS: set[str] = set()
+DEFAULT_MYSQL_URL = "mysql+pymysql://examkit:examkit123@127.0.0.1:3309/exam_kit_migrate_20260509?charset=utf8mb4"
+MYSQL_URL_HINT = (
+    "Only MySQL is supported. Set DB_URL to "
+    f"{DEFAULT_MYSQL_URL}"
+)
 
 
 def _parse_dotenv_file(path: Path) -> dict[str, str]:
@@ -81,6 +86,15 @@ def _resolve_path(path: str | Path) -> Path:
     return candidate
 
 
+def _normalize_mysql_url(url: str) -> str:
+    candidate = url.strip()
+    if candidate.startswith("mysql+pymysql://") or candidate.startswith("mysql+"):
+        return candidate
+    if candidate.startswith("mysql://"):
+        return f"mysql+pymysql://{candidate.removeprefix('mysql://')}"
+    raise ValueError(MYSQL_URL_HINT)
+
+
 def _parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
@@ -112,6 +126,9 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
         ("DB_SEED_ON_STARTUP", ("db", "seed_on_startup"), _parse_bool),
         ("DB_MIGRATION_TARGET", ("db", "migration_target"), str),
         ("STORAGE_ROOT", ("storage", "root"), str),
+        ("OCR_CACHE_SWEEP_ENABLED", ("ocr_cache_sweep", "enabled"), _parse_bool),
+        ("OCR_CACHE_SWEEP_INTERVAL_SECONDS", ("ocr_cache_sweep", "interval_seconds"), int),
+        ("OCR_CACHE_SWEEP_RUN_ON_STARTUP", ("ocr_cache_sweep", "run_on_startup"), _parse_bool),
         ("SECURITY_SECRET_KEY", ("security", "secret_key"), str),
         (
             "SECURITY_ACCESS_TOKEN_EXPIRES_MINUTES",
@@ -151,7 +168,7 @@ class AppConfig(BaseModel):
 
 
 class DatabaseConfig(BaseModel):
-    url: str = "sqlite:///./data/app.db"
+    url: str = DEFAULT_MYSQL_URL
     echo: bool = False
     pool_size: int = 10
     max_overflow: int = 20
@@ -161,20 +178,7 @@ class DatabaseConfig(BaseModel):
 
     @property
     def resolved_url(self) -> str:
-        if self.url == "sqlite:///:memory:":
-            return self.url
-        if self.url.startswith("sqlite:///"):
-            return f"sqlite:///{self.sqlite_path.as_posix()}"
-        return self.url
-
-    @property
-    def sqlite_path(self) -> Path:
-        if not self.url.startswith("sqlite:///"):
-            raise ValueError("sqlite_path is only available for sqlite:/// database URLs.")
-        if self.url == "sqlite:///:memory:":
-            raise ValueError("sqlite_path is not available for in-memory sqlite databases.")
-        raw_path = self.url.replace("sqlite:///", "", 1)
-        return _resolve_path(raw_path)
+        return _normalize_mysql_url(self.url)
 
 
 class StorageConfig(BaseModel):
@@ -201,6 +205,12 @@ class SecurityConfig(BaseModel):
     refresh_token_expires_days: int = 14
 
 
+class OCRCacheSweepConfig(BaseModel):
+    enabled: bool = True
+    interval_seconds: int = 1800
+    run_on_startup: bool = True
+
+
 class SubjectSeedConfig(BaseModel):
     code: str = Field(validation_alias=AliasChoices("code", "id"))
     name: str
@@ -214,6 +224,7 @@ class Settings(BaseModel):
     redis: RedisConfig = Field(default_factory=RedisConfig)
     celery: CeleryConfig = Field(default_factory=CeleryConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    ocr_cache_sweep: OCRCacheSweepConfig = Field(default_factory=OCRCacheSweepConfig)
     subjects: list[SubjectSeedConfig] = Field(default_factory=list)
 
 
@@ -226,6 +237,7 @@ def get_settings() -> Settings:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
 
     settings = Settings.model_validate(_expand_env(_apply_env_overrides(raw)))
+    settings.db.resolved_url
     for env_name in ("PUBLIC_WEB_URL", "PUBLIC_WEB_ORIGIN"):
         raw_origin = os.getenv(env_name)
         if not raw_origin:
@@ -235,6 +247,4 @@ def get_settings() -> Settings:
             if origin not in settings.app.cors_origins:
                 settings.app.cors_origins.append(origin)
     settings.storage.root_path.mkdir(parents=True, exist_ok=True)
-    if settings.db.url.startswith("sqlite:///") and settings.db.url != "sqlite:///:memory:":
-        settings.db.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     return settings

@@ -3,8 +3,8 @@ app:
   context_token_limit: 900000
 llm:
   generator:
-    provider: openai_compat
-    model: deepseek-v4-flash
+    provider: deepseek
+    model: deepseek-chat
     max_tokens: 100000
     api_key: ${DEEPSEEK_GENERATOR_API_KEY}
     base_url: https://api.deepseek.com/v1
@@ -24,7 +24,7 @@ storage:
   type: local
   root: ./data
 db:
-  url: sqlite:///./data/app.db
+  url: mysql+pymysql://examkit:examkit123@127.0.0.1:3309/exam_kit_migrate_20260509?charset=utf8mb4
   echo: false
   pool_size: 10
   max_overflow: 20

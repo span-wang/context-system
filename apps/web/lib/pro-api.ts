@@ -113,7 +113,7 @@ async function refreshPlatformToken(): Promise<boolean> {
 
 function formatApiError(status: number, text: string): string {
   if (status === 401) {
-    return "请先在 /platform/settings 登录后再执行该操作。";
+    return "请求未授权。";
   }
   if (status === 403) {
     return "当前账号没有执行该操作的权限。";
@@ -271,6 +271,7 @@ export type SubjectBatchDeleteResponse = {
 
 export type ParsePreset = "auto" | "fast" | "balanced" | "accurate" | "formula";
 export type ParseOutputFormat = "markdown" | "text";
+export type ParseMode = "rules";
 
 export type SubjectCategoryResponse = {
   id: number;
@@ -395,11 +396,13 @@ export type PaperParseResponse = {
   tagged_count: number;
   preview?: string | null;
   provider?: string | null;
+  parse_mode: ParseMode;
   output_format: ParseOutputFormat;
   warnings: string[];
   parse_options: Record<string, unknown>;
   dataset_sample_path?: string | null;
   dataset_auto_exported?: boolean;
+  dataset_export_error?: string | null;
 };
 
 export type PaperParseJobResponse = {
@@ -424,8 +427,12 @@ export type PaperDeleteResponse = {
   id: number;
   paper_name: string;
   deleted: boolean;
-  removed_question_count: number;
-  removed_source_link_count: number;
+  removed_asset?: boolean;
+  removed_storage_file?: boolean;
+  removed_dataset_dir?: boolean;
+  removed_parsed_cache_files?: number;
+  removed_pdf_checkpoint_dirs?: number;
+  cleanup_warnings?: string[];
 };
 
 export type PaperSectionResponse = {
@@ -439,6 +446,7 @@ export type PaperSectionResponse = {
 };
 
 export type PaperDetailResponse = PaperSummary & {
+  asset_id: number;
   subject_name?: string | null;
   category?: string | null;
   asset_filename?: string | null;
@@ -450,265 +458,141 @@ export type PaperDetailResponse = PaperSummary & {
   sections: PaperSectionResponse[];
 };
 
-export type QuestionSummary = {
+export type PaperReviewQuestionResponse = {
   id: number;
   paper_id: number;
-  subject_id: number;
   section_id?: number | null;
-  question_no: string;
   question_uid: string;
+  content_fingerprint: string;
+  sort_order: number;
+  question_no: string;
   question_type: string;
+  source_section_name: string;
+  source_raw_text: string;
   stem_text: string;
+  options_json?: string[] | null;
   answer_text?: string | null;
-  score?: number | null;
+  analysis_text?: string | null;
   difficulty_level?: number | null;
+  quality_score?: number | null;
+  subquestion_count: number;
+  quality_issues_json?: string[] | null;
   parse_status: string;
   review_status: string;
   review_note?: string | null;
-  paper_name?: string | null;
-  source_label?: string | null;
-  source_year?: number | null;
-  source_region?: string | null;
-};
-
-export type QuestionKnowledgeLinkResponse = {
-  id: number;
-  knowledge_point_id: number;
-  question_layer: string;
-  link_type: string;
-  confidence_score?: number | null;
-  evidence_text?: string | null;
-  tag_source?: string | null;
-  is_primary: boolean;
-  review_status: string;
+  ai_review_status?: string | null;
+  ai_review_note?: string | null;
+  ai_standardization_note?: string | null;
+  last_ai_standardized_at?: string | null;
+  last_ai_reviewed_at?: string | null;
+  reviewed_by?: number | null;
   reviewed_at?: string | null;
-  knowledge_point_name?: string | null;
-};
-
-export type QuestionDetailResponse = QuestionSummary & {
-  options_json?: string[] | null;
-  analysis_text?: string | null;
-  source_page_from?: number | null;
-  source_page_to?: number | null;
-  quality_score?: number | null;
-  links: QuestionKnowledgeLinkResponse[];
-};
-
-export type QuestionBatchReviewResponse = {
-  updated_count: number;
-  review_status: string;
-  question_ids: number[];
-};
-
-export type QuestionKnowledgeReviewResponse = {
-  question_id: number;
-  updated_count: number;
-  review_status: string;
-  link_ids: number[];
-  primary_link_id?: number | null;
-};
-
-export type QuestionRetagResponse = {
-  question_id: number;
-  created_links: number;
-  ai_created_links: number;
-  total_links: number;
-};
-
-export type QuestionAiCompleteResponse = {
-  requested_count: number;
-  updated_count: number;
-  unchanged_count: number;
-  failed_count: number;
-  question_ids: number[];
-  failed_question_ids: number[];
-  message: string;
-};
-
-export type QuestionAiReviewResponse = {
-  requested_count: number;
-  updated_count: number;
-  approved_count: number;
-  needs_revision_count: number;
-  rejected_count: number;
-  failed_count: number;
-  question_ids: number[];
-  failed_question_ids: number[];
-  message: string;
-};
-
-export type QuestionAiKnowledgeReviewResponse = {
-  question_id: number;
-  updated_count: number;
-  approved_count: number;
-  rejected_count: number;
-  link_ids: number[];
-  primary_link_id?: number | null;
-  message: string;
-};
-
-export type QuestionAiProcessResponse = {
-  requested_count: number;
-  updated_count: number;
-  completed_count: number;
-  approved_count: number;
-  needs_revision_count: number;
-  rejected_count: number;
-  tagged_question_count: number;
-  created_link_count: number;
-  failed_count: number;
-  question_ids: number[];
-  failed_question_ids: number[];
-  message: string;
-};
-
-export type DashboardMetric = {
-  key: string;
-  label: string;
-  value: string;
-  trend?: string | null;
-};
-
-export type AnalysisFilterOption = {
-  value: string;
-  label: string;
-};
-
-export type AnalysisMetric = {
-  key: string;
-  label: string;
-  value: string;
-  helper?: string | null;
-};
-
-export type DashboardFocusItem = {
-  knowledge_point_id: number;
-  knowledge_point_name: string;
-  frequency: number;
-  paper_coverage: number;
-  hot_score: number;
-};
-
-export type DashboardResponse = {
-  metrics: DashboardMetric[];
-  focus_points: DashboardFocusItem[];
-  pending_reviews: number;
-  latest_report_name?: string | null;
-};
-
-export type FrequencyResponse = {
-  knowledge_point_id: number;
-  knowledge_point_name: string;
-  question_count: number;
-  paper_count: number;
-  hot_score: number;
-};
-
-export type TrendResponse = {
-  label: string;
-  year?: number | null;
-  question_count: number;
-};
-
-export type AnalysisYearSummary = {
-  year?: number | null;
-  label: string;
-  paper_count: number;
-  question_count: number;
-  mapped_question_count: number;
-  total_score: number;
-};
-
-export type AnalysisTypeBreakdown = {
-  question_type: string;
-  question_type_label: string;
-  count: number;
-  score: number;
-  count_share: number;
-  score_share: number;
-};
-
-export type AnalysisPointYearStat = {
-  year?: number | null;
-  label: string;
-  frequency: number;
-  paper_count: number;
-  score: number;
-  score_share: number;
-};
-
-export type AnalysisPointRow = {
-  knowledge_point_id: number;
-  knowledge_point_name: string;
-  chapter_id?: number | null;
-  chapter_name?: string | null;
-  chapter_path?: string | null;
-  category_name?: string | null;
-  frequency: number;
-  paper_coverage: number;
-  total_score: number;
-  score_share: number;
-  avg_score: number;
-  continuous_years: number;
-  last_seen_year?: number | null;
-  dominant_question_type?: string | null;
-  dominant_question_type_label?: string | null;
-  dominant_question_type_share: number;
-  hot_score: number;
-  importance_level: string;
-  type_breakdown: AnalysisTypeBreakdown[];
-  yearly_stats: AnalysisPointYearStat[];
-};
-
-export type AnalysisChapterYearStat = {
-  year?: number | null;
-  label: string;
-  frequency: number;
-  score: number;
-  score_share: number;
-};
-
-export type AnalysisChapterRow = {
-  chapter_id: number;
-  chapter_name: string;
-  chapter_path: string;
-  point_count: number;
-  frequency: number;
-  paper_coverage: number;
-  total_score: number;
-  score_share: number;
-  yearly_stats: AnalysisChapterYearStat[];
-};
-
-export type AnalysisInsight = {
-  title: string;
-  description: string;
-};
-
-export type KnowledgeAnalysisResponse = {
-  data_as_of: string;
-  coverage_rate: number;
-  summary_metrics: AnalysisMetric[];
-  available_years: number[];
-  available_question_types: AnalysisFilterOption[];
-  available_paper_types: string[];
-  available_regions: string[];
-  years: AnalysisYearSummary[];
-  points: AnalysisPointRow[];
-  chapters: AnalysisChapterRow[];
-  insights: AnalysisInsight[];
-};
-
-export type ReportResponse = {
-  id: number;
-  subject_id?: number | null;
-  report_type: string;
-  report_name: string;
-  snapshot_date?: string | null;
-  version_no: number;
-  status: string;
-  report_json?: Record<string, unknown> | null;
   created_at: string;
+  updated_at: string;
+  suggested_knowledge_points: PaperReviewQuestionKnowledgePointResponse[];
+  confirmed_knowledge_points: PaperReviewQuestionKnowledgePointResponse[];
+};
+
+export type PaperReviewQuestionKnowledgePointResponse = {
+  id: number;
+  question_id: number;
+  knowledge_point_id: number;
+  name: string;
+  path: string;
+  chapter_id?: number | null;
+  category_id?: number | null;
+  status: "suggested" | "confirmed" | "rejected";
+  relation_type: "primary" | "secondary";
+  source: string;
+  confidence?: number | null;
+  reason?: string | null;
+  rank: number;
+};
+
+export type PaperReviewSummaryResponse = {
+  total_questions: number;
+  pending_count: number;
+  approved_count: number;
+  needs_revision_count: number;
+  rejected_count: number;
+  ai_flagged_count: number;
+  ai_reviewed_count: number;
+  missing_solution_count: number;
+};
+
+export type PaperReviewPaperResponse = {
+  id: number;
+  paper_name: string;
+  subject_name?: string | null;
+  category?: string | null;
+  status: string;
+  review_status: string;
+  total_question_count: number;
+  question_review_count: number;
+};
+
+export type PaperReviewWorkspaceResponse = {
+  paper: PaperReviewPaperResponse;
+  sections: PaperSectionResponse[];
+  summary: PaperReviewSummaryResponse;
+  questions: PaperReviewQuestionResponse[];
+};
+
+export type PaperReviewQuestionUpdateRequest = {
+  question_type?: string | null;
+  stem_text?: string | null;
+  options_json?: string[] | null;
+  answer_text?: string | null;
+  analysis_text?: string | null;
+  review_status?: "pending" | "approved" | "needs_revision" | "rejected" | null;
+  review_note?: string | null;
+};
+
+export type PaperReviewQuestionKnowledgePointUpsertItem = {
+  knowledge_point_id: number;
+  relation_type: "primary" | "secondary";
+  source: string;
+  confidence?: number | null;
+  reason?: string | null;
+  rank: number;
+};
+
+export type PaperReviewQuestionKnowledgePointUpdateRequest = {
+  suggested: PaperReviewQuestionKnowledgePointUpsertItem[];
+  confirmed: PaperReviewQuestionKnowledgePointUpsertItem[];
+};
+
+export type PaperReviewRebuildResponse = {
+  paper_id: number;
+  imported_count: number;
+  replaced_count: number;
+  section_count: number;
+  message: string;
+};
+
+export type PaperReviewAutoTagResponse = {
+  paper_id: number;
+  status: string;
+  progress: number;
+  requested_count: number;
+  updated_count: number;
+  failed_count: number;
+  skipped_count: number;
+  message: string;
+};
+
+export type PaperReviewAutoTagJobResponse = {
+  job_id: number;
+  paper_id: number;
+  status: string;
+  progress: number;
+};
+
+export type PaperReviewAIActionResponse = {
+  message: string;
+  changed: boolean;
+  used_ai: boolean;
+  question: PaperReviewQuestionResponse;
 };
 
 export type AnalysisJobResponse = {
@@ -730,177 +614,9 @@ export type AnalysisJobResponse = {
   created_at: string;
 };
 
-export type StandardizeQuestionsResponse = {
-  created: number;
-  linked: number;
-  unlinked: number;
-  skipped: number;
-  normalized: number;
-  ai_completed: number;
-  tagged: number;
-  ai_tagged: number;
-};
-
-export type QuestionSourceSummaryResponse = {
-  id: number;
-  exam_question_id: number;
-  paper_id: number;
-  paper_name: string;
-  question_no: string;
-  source_label: string;
-  source_year?: number | null;
-  source_region?: string | null;
-};
-
-export type QuestionBankItemResponse = {
-  id: number;
-  subject_id: number;
-  canonical_stem: string;
-  canonical_options_json?: string[] | null;
-  canonical_answer?: string | null;
-  canonical_analysis?: string | null;
-  question_type: string;
-  difficulty_level?: number | null;
-  quality_score?: number | null;
-  source_count: number;
-  status: string;
-  source_labels: string[];
-  sources: QuestionSourceSummaryResponse[];
-};
-
-export type PracticeSetResponse = {
-  id: number;
-  subject_id: number;
-  set_type: string;
-  title: string;
-  description?: string | null;
-  source_report_id?: number | null;
-  difficulty_policy?: string | null;
-  question_count: number;
-  status: string;
-};
-
-export type PracticeSetQuestionResponse = {
-  id: number;
-  bank_question_id: number;
-  sort_order: number;
-  score?: number | null;
-  question_type: string;
-  stem_text: string;
-  options_json?: string[] | null;
-  answer_text?: string | null;
-  analysis_text?: string | null;
-  difficulty_level?: number | null;
-  quality_score?: number | null;
-  source_count: number;
-  knowledge_point_names: string[];
-};
-
-export type PracticeSetDetailResponse = PracticeSetResponse & {
-  questions: PracticeSetQuestionResponse[];
-};
-
-export type MockExamResponse = {
-  id: number;
-  subject_id: number;
-  title: string;
-  exam_mode: string;
-  duration_minutes?: number | null;
-  total_score?: number | null;
-  status: string;
-};
-
-export type LearningHomeResponse = {
-  learner_name?: string | null;
-  target_exam?: string | null;
-  active_subject?: string | null;
-  total_sessions: number;
-  wrong_book_count: number;
-  favorite_count: number;
-  weakest_points: string[];
-};
-
-export type PracticeSessionResponse = {
-  id: number;
-  learner_id: number;
-  session_type: string;
-  practice_mode: "instant_feedback" | "deferred_feedback";
-  subject_id?: number | null;
-  practice_set_id?: number | null;
-  mock_exam_id?: number | null;
-  status: string;
-  started_at?: string | null;
-  submitted_at?: string | null;
-  score?: number | null;
-  accuracy_rate?: number | null;
-  duration_seconds?: number | null;
-};
-
-export type PracticeAnswerResultResponse = {
-  bank_question_id: number;
-  learner_answer?: string | null;
-  correct_answer?: string | null;
-  is_correct?: boolean | null;
-  score?: number | null;
-  full_score?: number | null;
-  spent_seconds?: number | null;
-  analysis_text?: string | null;
-};
-
-export type PracticeSessionDetailResponse = PracticeSessionResponse & {
-  practice_set_title?: string | null;
-  questions: PracticeSetQuestionResponse[];
-  answers: PracticeAnswerResultResponse[];
-};
-
-export type WrongBookResponse = {
-  id: number;
-  learner_id: number;
-  bank_question_id: number;
-  source_session_id?: number | null;
-  wrong_count: number;
-  mastered: boolean;
-};
-
-export type MasteryResponse = {
-  id: number;
-  learner_id: number;
-  subject_id: number;
-  knowledge_point_id: number;
-  mastery_score: number;
-  answered_count: number;
-  correct_count: number;
-  snapshot_date: string;
-  knowledge_point_name?: string | null;
-};
-
-export type ReviewTaskResponse = {
-  id: number;
-  task_type: string;
-  target_type: string;
-  target_id: string;
-  status: string;
-  assigned_to?: number | null;
-  priority: string;
-  review_note?: string | null;
-  created_at: string;
-};
-
-export type WorkflowTopicResponse = {
-  title: string;
-  source_report: string;
-  task_type: string;
-  priority: string;
-  status: string;
-};
-
 export const moduleLabelMap: Record<string, string> = {
   auth: "认证与权限",
   papers: "试卷中心",
-  questions: "题目中心",
+  paper_review: "题目解析",
   knowledge: "学科中心",
-  analysis: "分析中心",
-  question_bank: "题库中心",
-  learning: "学习中心",
-  workflow: "工作流联动",
 };

@@ -16,7 +16,7 @@ def main() -> int:
     from app.services.papers import _parse_question_block, _split_paper_sections
 
     text = sample_path.read_text(encoding="utf-8")
-    sections = _split_paper_sections(text)
+    sections = _split_paper_sections(None, text)
     payload: list[dict[str, object]] = []
     for section in sections:
         items: list[dict[str, object]] = []

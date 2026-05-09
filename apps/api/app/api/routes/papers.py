@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_session, require_roles
-from app.schemas.auth import CurrentUserResponse
+from app.api.deps import get_session
 from app.schemas.papers import (
+    AnalysisJobResponse,
     PaperDeleteResponse,
     PaperParseJobResponse,
     PaperDetailResponse,
@@ -16,7 +16,7 @@ from app.schemas.papers import (
 from app.services.audit import AuditService
 from app.services.paper_parse_jobs import start_paper_parse_job
 from app.services.papers import PaperService
-from library.parse_options import DocumentParseOptions, ParseOutputFormat, ParsePreset
+from library.parse_options import DocumentParseOptions, ParseMode, ParseOutputFormat, ParsePreset
 
 
 router = APIRouter(prefix="/api/papers", tags=["papers"])
@@ -42,7 +42,6 @@ async def upload_paper(
     paper_type: str | None = Form(None),
     paper_code: str | None = Form(None),
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> PaperUploadResponse:
     result = await PaperService(session).upload_paper(
         file=file,
@@ -59,7 +58,7 @@ async def upload_paper(
         paper_code=paper_code,
     )
     AuditService(session).log(
-        current_user,
+        None,
         module="papers",
         action="upload",
         target_type="paper",
@@ -73,6 +72,7 @@ async def upload_paper(
 def parse_paper(
     paper_id: int,
     preset: ParsePreset = Form("auto"),
+    parse_mode: ParseMode = Form("rules"),
     output_format: ParseOutputFormat = Form("markdown"),
     force_ocr: bool | None = Form(None),
     render_dpi: int | None = Form(None),
@@ -84,10 +84,10 @@ def parse_paper(
     enable_formula_recognition: bool | None = Form(None),
     pdf_page_chunk_size: int | None = Form(None, ge=1, le=50),
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "reviewer")),
 ) -> PaperParseResponse:
     options = DocumentParseOptions(
         preset=preset,
+        parse_mode=parse_mode,
         output_format=output_format,
         force_ocr=force_ocr,
         render_dpi=render_dpi,
@@ -101,7 +101,7 @@ def parse_paper(
     )
     result = PaperService(session).parse_paper(paper_id, options=options)
     AuditService(session).log(
-        current_user,
+        None,
         module="papers",
         action="parse",
         target_type="paper",
@@ -116,10 +116,45 @@ def parse_paper(
     return result
 
 
+@router.get("/{paper_id}/preview")
+def preview_paper(
+    paper_id: int,
+    preset: ParsePreset = Query("accurate"),
+    parse_mode: ParseMode = Query("rules"),
+    output_format: ParseOutputFormat = Query("markdown"),
+    force_ocr: bool | None = Query(None),
+    render_dpi: int | None = Query(None, ge=96, le=360),
+    crop_header_ratio: float | None = Query(None, ge=0.0, le=0.2),
+    crop_footer_ratio: float | None = Query(None, ge=0.0, le=0.2),
+    trim_margins: bool | None = Query(None),
+    remove_repeated_lines: bool | None = Query(None),
+    watermark_detection: bool | None = Query(None),
+    enable_formula_recognition: bool | None = Query(None),
+    pdf_page_chunk_size: int | None = Query(None, ge=1, le=50),
+    session: Session = Depends(get_session),
+):
+    options = DocumentParseOptions(
+        preset=preset,
+        parse_mode=parse_mode,
+        output_format=output_format,
+        force_ocr=force_ocr,
+        render_dpi=render_dpi,
+        crop_header_ratio=crop_header_ratio,
+        crop_footer_ratio=crop_footer_ratio,
+        trim_margins=trim_margins,
+        remove_repeated_lines=remove_repeated_lines,
+        watermark_detection=watermark_detection,
+        enable_formula_recognition=enable_formula_recognition,
+        pdf_page_chunk_size=pdf_page_chunk_size,
+    )
+    return PaperService(session).preview_paper(paper_id, options=options)
+
+
 @router.post("/{paper_id}/parse-jobs", response_model=PaperParseJobResponse)
 def start_parse_paper_job(
     paper_id: int,
     preset: ParsePreset = Form("auto"),
+    parse_mode: ParseMode = Form("rules"),
     output_format: ParseOutputFormat = Form("markdown"),
     force_ocr: bool | None = Form(None),
     render_dpi: int | None = Form(None),
@@ -131,10 +166,10 @@ def start_parse_paper_job(
     enable_formula_recognition: bool | None = Form(None),
     pdf_page_chunk_size: int | None = Form(None, ge=1, le=50),
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "reviewer")),
 ) -> PaperParseJobResponse:
     options = DocumentParseOptions(
         preset=preset,
+        parse_mode=parse_mode,
         output_format=output_format,
         force_ocr=force_ocr,
         render_dpi=render_dpi,
@@ -151,7 +186,7 @@ def start_parse_paper_job(
     job_status = job.status
     job_progress = job.progress
     AuditService(session).log(
-        current_user,
+        None,
         module="papers",
         action="parse_job_start",
         target_type="paper",
@@ -159,6 +194,16 @@ def start_parse_paper_job(
         payload={"job_id": job_id, "parse_options": options.normalized_dump()},
     )
     return PaperParseJobResponse(job_id=job_id, paper_id=paper_id, status=job_status, progress=job_progress)
+
+
+@router.get("/parse-jobs/{job_id}", response_model=AnalysisJobResponse)
+def get_parse_paper_job(job_id: int, session: Session = Depends(get_session)) -> AnalysisJobResponse:
+    job = PaperService(session).repository.get_job(job_id)
+    if job is None:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return AnalysisJobResponse.model_validate(job)
 
 
 @router.get("/{paper_id}", response_model=PaperDetailResponse)
@@ -170,19 +215,22 @@ def get_paper(paper_id: int, session: Session = Depends(get_session)) -> PaperDe
 def delete_paper(
     paper_id: int,
     session: Session = Depends(get_session),
-    current_user: CurrentUserResponse = Depends(require_roles("admin", "teacher", "operator")),
 ) -> PaperDeleteResponse:
     result = PaperService(session).delete_paper(paper_id)
     AuditService(session).log(
-        current_user,
+        None,
         module="papers",
         action="delete",
         target_type="paper",
         target_id=paper_id,
         payload={
             "paper_name": result.paper_name,
-            "removed_question_count": result.removed_question_count,
-            "removed_source_link_count": result.removed_source_link_count,
+            "removed_asset": result.removed_asset,
+            "removed_storage_file": result.removed_storage_file,
+            "removed_dataset_dir": result.removed_dataset_dir,
+            "removed_parsed_cache_files": result.removed_parsed_cache_files,
+            "removed_pdf_checkpoint_dirs": result.removed_pdf_checkpoint_dirs,
+            "cleanup_warnings": result.cleanup_warnings,
         },
     )
     return result

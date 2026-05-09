@@ -1,5 +1,1 @@
-import { redirect } from "next/navigation";
-
-export default function AnalysisQuestionsRedirectPage() {
-  redirect("/platform/analysis/questions");
-}
+export { default } from "../../platform/analysis/questions/page";

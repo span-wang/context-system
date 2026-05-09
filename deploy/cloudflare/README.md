@@ -1,13 +1,9 @@
 # Context_For_XHS Cloudflare Tunnel
 
 This project follows the same named-tunnel pattern used in the `DESK` project,
-but exposes the new platform through:
+and exposes the unified web app through:
 
 - `https://context.panspan.cloud`
-
-If your current public hostname is already in use and must stay untouched, keep
-`deploy\cloudflare\config.yml` as-is and create a second tunnel config just for
-the dataset / training entrance, for example `training.example.com`.
 
 ## Recommended mapping
 
@@ -15,7 +11,7 @@ the dataset / training entrance, for example `training.example.com`.
 - Local FastAPI backend: `http://127.0.0.1:8000`
 - Cloudflare public hostname: `https://context.panspan.cloud`
 
-The `/platform/*` frontend routes call `/platform/api/*` on the same origin, so
+The frontend routes call `/platform/api/*` on the same origin, so
 the tunnel only needs to expose the web app port.
 
 When `deploy\cloudflare\config.yml` exists, `scripts\start.ps1` now auto-detects
@@ -59,15 +55,6 @@ powershell -ExecutionPolicy Bypass -File .\deploy\cloudflare\configure_named_tun
   -Hostname context.panspan.cloud
 ```
 
-For a separate dataset/training hostname that does not touch the current
-`config.yml`, generate `config.dataset.yml` instead:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\cloudflare\configure_dataset_tunnel.ps1 `
-  -TunnelId YOUR_TUNNEL_UUID `
-  -Hostname training.example.com
-```
-
 5. Edit `deploy\cloudflare\config.yml`:
 
 - `tunnel`: your tunnel UUID
@@ -79,14 +66,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy\cloudflare\configure_dataset_t
 deploy\cloudflare\start_named_tunnel.bat
 ```
 
-To start the separate dataset/training hostname:
-
-```bat
-deploy\cloudflare\start_dataset_tunnel.bat
-```
-
 ## Notes
 
-- The old product remains under the original local routes.
-- The new platform frontend is now unified under `/platform/*`.
-- If you later want the old product to have its own public hostname too, add a second hostname rule in `ingress`.
+- Web 入口统一使用一个公网域名。
+- 兼容保留 `/platform/*`，但建议直接使用主导航中的旧页面路径。

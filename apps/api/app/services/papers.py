@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
+import logging
+import mimetypes
 import re
+import shutil
+from uuid import uuid4
 from datetime import datetime
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 from fastapi import HTTPException
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.models import Asset, ExamPaper, ExamQuestion, PaperSection, Subject
+from app.models import Asset, ExamPaper, PaperSection, Subject
 from app.repositories.papers import PaperRepository
 from app.schemas.papers import (
     PaperDeleteResponse,
@@ -22,13 +29,22 @@ from app.schemas.papers import (
     PaperSummary,
     PaperUploadResponse,
 )
-from app.services.paper_dataset import export_paper_parser_sample, should_auto_export_paper_dataset
-from app.services.question_enrichment import normalize_question_fields
-from app.services.tagging import apply_rule_tags
+from app.services.paper_dataset import (
+    export_paper_parser_sample,
+    resolve_paper_dataset_root,
+    resolve_paper_dataset_sample_dir,
+    should_auto_export_paper_dataset,
+)
+from app.services.paper_parser_rules import parse_sections_with_rules
+from app.services.paper_parser_rules.engine import parse_question_block as parse_rule_question_block, parse_sections_from_text
+from library.ocr_cleaner import clean_parsed_document
 from library.parse_options import DocumentParseOptions
-from library.parser import parse_document
+from library.pdf_ocr_pipeline import CHECKPOINT_NAMESPACE_FILENAME, OCRPipelineOptions, _get_pdf_ocr_checkpoint_root
+from library.parser import ParsedDocument, parse_document
 
 PaperParseProgressCallback = Callable[[str, int, dict[str, object] | None], None]
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".md", ".txt"}
 ALLOWED_UPLOAD_MIME_PREFIXES = ("application/", "image/", "text/")
@@ -39,17 +55,34 @@ ANSWER_PATTERN = re.compile(
 )
 ANALYSIS_PATTERN = re.compile(r"(?ms)^\s*(?:#+\s*)?(?:解析|答案解析|【解析】)\s*(?:[:：]\s*|\n+)(.+)$")
 ANSWER_ANALYSIS_HEADER_PATTERN = re.compile(r"(?m)^\s*(?:#+\s*)?答案与解析\s*$")
+INLINE_OPTION_PATTERN = re.compile(r"(?<![A-Za-z0-9\u4e00-\u9fff])([A-H])[\.\、．)]\s*")
+OPTION_LINE_PATTERN = re.compile(r"^\s*[A-H][\.\、．)]\s*")
+TRAILING_OPTION_HINT_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-H])\s*$")
+ANSWER_HEADER_INLINE_PATTERNS = (
+    re.compile(r"(?ms)^\s*(?:#+\s*)?(?:答案|参考答案|正确答案)\s*[:：]\s*"),
+    re.compile(r"(?<![\u4e00-\u9fffA-Za-z0-9])(?:答案|参考答案|正确答案)\s*[:：]\s*"),
+)
+ANALYSIS_HEADER_INLINE_PATTERNS = (
+    re.compile(r"(?ms)^\s*(?:#+\s*)?(?:答案解析|【解析】)\s*(?:[:：]\s*|\n+)?"),
+    re.compile(r"(?ms)^\s*(?:#+\s*)?解析\s*(?:[:：]\s*|\n+)"),
+    re.compile(r"(?<![\u4e00-\u9fffA-Za-z0-9])(?:答案解析|【解析】)\s*(?:[:：]\s*|\n+)?"),
+    re.compile(r"(?<![\u4e00-\u9fffA-Za-z0-9])解析\s*[:：]\s*"),
+)
 SECTION_HEADER_PATTERN = re.compile(
     r"(?m)^\s*(?:#+\s*)?(?:(?:第\s*[一二三四五六七八九十百0-9]+\s*部分)|(?:[一二三四五六七八九十百0-9]+\s*[、.．]))?\s*"
     r"(?P<title>(?:单项选择题|多项选择题|不定项选择题|判断题|填空题|简答题|计算题|案例分析题|综合题|材料分析题))"
     r"[^\n]*$"
 )
 SUBQUESTION_PATTERN = re.compile(r"(?m)^\s*[(（]([1-9][0-9]{0,2}|[一二三四五六七八九十]+)[)）]\s*")
+SUBQUESTION_LABEL_PATTERN = re.compile(r"(?m)(?:^|\s)第\s*([1-9][0-9]{0,2}|[一二三四五六七八九十]+)\s*小题")
 MATERIAL_ITEM_PATTERN = re.compile(r"(?m)^\s*(?:[(（][1-9][0-9]{0,2}[)）]|资料[一二三四五六七八九十0-9]+(?:\s*[:：]|$))")
 CASE_GROUP_PATTERN = re.compile(r"(?m)^\s*(?:#+\s*)?[（(]([一二三四五六七八九十0-9]+)[)）]\s*$")
 SHARED_STEM_CUE_PATTERN = re.compile(
     r"(?:要求\s*[:：]?|根据上述资料|根据下列资料|阅读下列材料|分析回答下列|回答下列|下列小题|不考虑其他因素)"
 )
+QUESTION_PROMPT_PREFIX_PATTERN = re.compile(r"^(?:根据|下列|关于|对|按照|依据|计算|第\s*[0-9一二三四五六七八九十]+\s*小题)")
+EMPTY_ANSWER_SLOT_PATTERN = re.compile(r"[（(]\s*[）)]")
+BLANK_PLACEHOLDER_PATTERN = re.compile(r"[（(]?\s*(?:[_＿—–-]\s*){2,}[）)]?|[（(]\s*[）)]")
 MULTI_ANSWER_PATTERN = re.compile(r"^[A-H](?:[\s,，/、]+[A-H])+$")
 JUDGE_ANSWER_PATTERN = re.compile(r"^(?:正确|错误|对|错|√|×)$")
 SECTION_TYPE_MAP = {
@@ -94,6 +127,41 @@ class ParsedQuestionBlock:
     subquestion_count: int
     source_section_name: str
     quality_issues: list[str]
+
+
+@dataclass(slots=True)
+class PaperCleanupSummary:
+    removed_asset: bool = False
+    removed_storage_file: bool = False
+    removed_dataset_dir: bool = False
+    removed_parsed_cache_files: int = 0
+    removed_pdf_checkpoint_dirs: int = 0
+    warnings: list[str] | None = None
+
+
+@dataclass(slots=True)
+class PaperPreviewResponse:
+    paper_id: int
+    asset_id: int
+    filename: str
+    provider: str
+    raw_text: str
+    raw_markdown: str
+    text: str
+    markdown: str
+    content: str
+    token_count: int
+    cleanup_report: dict[str, Any]
+    cleanup_score: float | None
+    parse_options: dict[str, object]
+    warnings: list[str]
+
+
+@dataclass(slots=True)
+class AppendixSolutionEntry:
+    question_no: str
+    answer_text: str | None = None
+    analysis_text: str | None = None
 
 
 class PaperService:
@@ -144,10 +212,35 @@ class PaperService:
         paper = self.repository.get_paper(paper_id)
         if paper is None:
             raise HTTPException(status_code=404, detail="试卷不存在")
+        asset = self.repository.get_asset(paper.asset_id)
+        asset_cleanup_snapshot = (
+            {
+                "id": asset.id,
+                "storage_path": asset.storage_path,
+                "sha256": asset.sha256,
+                "filename": asset.filename,
+                "mime_type": asset.mime_type,
+            }
+            if asset is not None
+            else None
+        )
         paper_name = paper.paper_name
-        removed_question_count = len(self.repository.list_questions(paper.id))
-        removed_source_link_count = self.repository.count_source_links(paper.id)
         parse_jobs = self.repository.list_jobs(paper.id)
+        should_delete_asset = bool(
+            asset is not None
+            and self.repository.count_papers_by_asset(asset.id, exclude_paper_id=paper.id) == 0
+        )
+        should_cleanup_sha_cache = bool(
+            asset is not None
+            and self.repository.count_assets_by_sha(asset.sha256, exclude_asset_id=asset.id) == 0
+        )
+        cleanup_parse_options = [
+            job_options
+            for job in parse_jobs
+            if isinstance((job.scope_config_json or {}).get("parse_options"), dict)
+            and (job_options := (job.scope_config_json or {}).get("parse_options"))
+        ]
+        cleanup_summary = PaperCleanupSummary(removed_asset=should_delete_asset, warnings=[])
         finished_at = datetime.utcnow()
         for job in parse_jobs:
             if job.status in {"completed", "failed"}:
@@ -164,12 +257,42 @@ class PaperService:
             job.finished_at = finished_at
         self.repository.delete_paper(paper.id)
         self.session.commit()
+        if should_delete_asset and asset_cleanup_snapshot is not None:
+            try:
+                cleanup_summary = self._cleanup_deleted_asset_files(
+                    asset_cleanup_snapshot,
+                    cleanup_parse_options,
+                    cleanup_sha_cache=should_cleanup_sha_cache,
+                )
+                cleanup_summary.removed_asset = True
+            except Exception as exc:
+                cleanup_summary.warnings.append(f"素材清理失败：{exc}")
+        try:
+            if self._cleanup_deleted_paper_dataset(paper_id, paper_name):
+                cleanup_summary.removed_dataset_dir = True
+        except Exception as exc:
+            cleanup_summary.warnings.append(f"训练样本清理失败：{exc}")
+        logger.info(
+            "paper_delete_cleanup paper_id=%s asset_id=%s removed_asset=%s removed_storage_file=%s removed_dataset_dir=%s removed_parsed_cache_files=%s removed_pdf_checkpoint_dirs=%s warnings=%s",
+            paper_id,
+            asset_cleanup_snapshot["id"] if asset_cleanup_snapshot is not None else None,
+            cleanup_summary.removed_asset,
+            cleanup_summary.removed_storage_file,
+            cleanup_summary.removed_dataset_dir,
+            cleanup_summary.removed_parsed_cache_files,
+            cleanup_summary.removed_pdf_checkpoint_dirs,
+            cleanup_summary.warnings or [],
+        )
         return PaperDeleteResponse(
             id=paper_id,
             paper_name=paper_name,
             deleted=True,
-            removed_question_count=removed_question_count,
-            removed_source_link_count=removed_source_link_count,
+            removed_asset=cleanup_summary.removed_asset,
+            removed_storage_file=cleanup_summary.removed_storage_file,
+            removed_dataset_dir=cleanup_summary.removed_dataset_dir,
+            removed_parsed_cache_files=cleanup_summary.removed_parsed_cache_files,
+            removed_pdf_checkpoint_dirs=cleanup_summary.removed_pdf_checkpoint_dirs,
+            cleanup_warnings=cleanup_summary.warnings or [],
         )
 
     def parse_paper(
@@ -204,7 +327,9 @@ class PaperService:
             asset.mime_type,
             options=options,
             progress_callback=progress_callback,
+            cache_namespace=f"paper_asset_{asset.id}",
         )
+        parsed_document = clean_parsed_document(parsed_document)
         parsed_output = options.select_output(text=parsed_document.text, markdown=parsed_document.markdown).strip()
         split_source_text = (parsed_document.text or parsed_output).strip()
         if not parsed_output:
@@ -220,19 +345,25 @@ class PaperService:
         operator = self.repository.get_default_user(tenant.id)
         operator_id = operator.id if operator else None
 
-        _emit_parse_progress(progress_callback, "split_questions", 76, {"text_length": len(split_source_text)})
+        _emit_parse_progress(
+            progress_callback,
+            "split_questions",
+            76,
+            {
+                "text_length": len(split_source_text),
+                "parse_mode": options.parse_mode,
+            },
+        )
         self._sync_parse_runtime_status(paper, asset, "split_questions")
-        parsed_sections = _split_paper_sections(split_source_text)
+        parsed_sections = _split_paper_sections(parsed_document, split_source_text)
         _emit_parse_progress(
             progress_callback,
             "build_sections",
             80,
-            {"section_count": len(parsed_sections)},
+            {"section_count": len(parsed_sections), "parse_mode": options.parse_mode},
         )
         self.repository.delete_parse_outputs(paper.id)
-        questions: list[ExamQuestion] = []
         created_sections: list[PaperSection] = []
-        quality_warnings: list[str] = []
         subject_id = paper.subject_id
         if subject_id is None:
             subject_id = asset.subject_id
@@ -245,7 +376,6 @@ class PaperService:
         subject = self.repository.get_subject(subject_id)
         category = self.repository.get_subject_category(paper.category_id)
 
-        running_start_no: int | None = 1
         for section_index, parsed_section in enumerate(parsed_sections, start=1):
             section = self.repository.create_section(
                 PaperSection(
@@ -263,78 +393,55 @@ class PaperService:
             )
             created_sections.append(section)
             self._sync_parse_runtime_status(paper, asset, "build_sections")
+            section_question_count = len(parsed_section.blocks)
+            if section_question_count:
+                start_no = 1 if not created_sections[:-1] else (created_sections[-2].end_no or 0) + 1
+                section.start_no = start_no
+                section.end_no = start_no + section_question_count - 1
+            section.question_type = parsed_section.section_type
 
-            section_questions: list[ExamQuestion] = []
-            for question_index, block in enumerate(parsed_section.blocks, start=1):
-                parsed = _parse_question_block(block, parsed_section)
-                question = ExamQuestion(
-                    tenant_id=paper.tenant_id,
-                    paper_id=paper.id,
-                    subject_id=subject_id,
-                    section_id=section.id,
-                    question_no=parsed.question_no,
-                    question_uid=_make_question_uid(paper.id, section.id, question_index, parsed),
-                    question_type=parsed.question_type,
-                    stem_text=parsed.stem_text,
-                    options_json=parsed.options_json,
-                    answer_text=parsed.answer_text,
-                    analysis_text=parsed.analysis_text,
-                    source_page_from=None,
-                    source_page_to=None,
-                    score=None,
-                    difficulty_level=parsed.difficulty_level,
-                    quality_score=parsed.quality_score,
-                    is_duplicate=False,
-                    duplicate_group_id=None,
-                    parse_status="parsed",
-                    review_status="pending",
-                    review_note=None,
-                    created_by=operator_id,
-                    updated_by=operator_id,
-                )
-                normalize_question_fields(question)
-                quality_issues = _collect_quality_issues(
-                    question_type=question.question_type,
-                    stem=question.stem_text,
-                    options=question.options_json or [],
-                    answer_text=question.answer_text,
-                    analysis_text=question.analysis_text,
-                    quality_score=float(question.quality_score or parsed.quality_score),
-                )
-                if quality_issues:
-                    question.parse_status = "needs_review"
-                    question.review_status = "needs_revision"
-                    question.review_note = "；".join(quality_issues)
-                    quality_warnings.append(
-                        f"{parsed_section.title} 第{question.question_no}题：{'；'.join(quality_issues)}"
-                    )
-                section_questions.append(question)
-
-            if section_questions:
-                section.start_no = running_start_no
-                running_start_no = (running_start_no or 1) + len(section_questions)
-                section.end_no = (running_start_no - 1) if running_start_no else None
-            section.question_type = _merge_section_question_type(parsed_section.section_type, section_questions)
-            questions.extend(section_questions)
-
-        quality_warnings.extend(_collect_numbering_warnings(questions))
-        self.repository.create_questions(questions)
-        self._sync_parse_runtime_status(paper, asset, "tagging")
-        points = self.repository.list_knowledge_points(subject_id)
         tagged_count = 0
-        for question in questions:
-            rule_created = apply_rule_tags(self.session, question, points, paper.tenant_id, operator_id)
-            tagged_count += len(rule_created)
 
         asset.parsed_text = parsed_output
         asset.token_count = max(1, len(parsed_output) // 2)
         asset.parse_status = "parsed"
         asset.ocr_status = "completed"
         paper.status = "parsed"
-        paper.total_question_count = len(questions)
-        paper.review_status = "pending"
+        review_sync_count = sum(len(section.blocks) for section in parsed_sections)
+        review_payloads = [
+            {
+                "section_id": created_section.id,
+                "title": parsed_section.title,
+                "section_type": parsed_section.section_type,
+                "sort_order": parsed_section.sort_order,
+                "blocks": [
+                    {
+                        "raw_text": block.raw_text,
+                        "question_no_override": block.question_no_override,
+                        "stem_prefix": block.stem_prefix,
+                    }
+                    for block in parsed_section.blocks
+                ],
+            }
+            for created_section, parsed_section in zip(created_sections, parsed_sections)
+        ]
+        try:
+            from app.services.paper_review import PaperReviewService
+
+            review_sync = PaperReviewService(self.session).sync_questions_from_sections(
+                paper_id=paper.id,
+                section_payloads=review_payloads,
+                operator_id=operator_id,
+                commit=False,
+            )
+            review_sync_count = review_sync.imported_count
+            paper.review_status = "pending"
+        except Exception as exc:
+            logger.warning("Skip paper review sync during parse because paper_review module is unavailable: %s", exc)
+        paper.total_question_count = review_sync_count
         self.session.commit()
         dataset_sample_path: str | None = None
+        dataset_export_error: str | None = None
         dataset_warnings: list[str] = []
         if should_auto_export_paper_dataset():
             try:
@@ -358,36 +465,90 @@ class PaperService:
                     asset_parse_status=asset.parse_status,
                     asset_ocr_status=asset.ocr_status,
                     provider=parsed_document.provider,
+                    markdown_image_roots=parsed_document.markdown_image_roots,
                     parse_options=options.normalized_dump(),
                     stored_section_count=len([section for section in created_sections if section.start_no is not None]),
-                    stored_question_count=len(questions),
-                    stored_needs_review_count=sum(
-                        1 for question in questions if question.parse_status == "needs_review"
-                    ),
+                    stored_question_count=review_sync_count,
+                    stored_needs_review_count=0,
                 )
                 dataset_sample_path = str(sample_dir)
             except Exception as exc:
-                dataset_warnings.append(f"样本自动导入失败：{exc}")
-        _emit_parse_progress(progress_callback, "completed", 100, {"question_count": len(questions)})
+                dataset_export_error = str(exc)
+                dataset_warnings.append(f"样本自动导入失败：{dataset_export_error}")
+        _emit_parse_progress(progress_callback, "completed", 100, {"question_count": paper.total_question_count})
         return PaperParseResponse(
             paper_id=paper.id,
             asset_id=asset.id,
             parse_status=asset.parse_status,
             paper_status=paper.status,
-            question_count=len(questions),
+            question_count=paper.total_question_count,
             section_count=len([section for section in created_sections if section.start_no is not None]),
             tagged_count=tagged_count,
             preview=parsed_output[:300],
             provider=parsed_document.provider,
+            parse_mode=options.parse_mode,
             output_format=options.output_format,
-            warnings=[
-                *parsed_document.warnings,
-                *quality_warnings,
-                *dataset_warnings,
-            ][:10],
+            warnings=[*dataset_warnings, *parsed_document.warnings][:10],
             parse_options=options.normalized_dump(),
             dataset_sample_path=dataset_sample_path,
             dataset_auto_exported=bool(dataset_sample_path),
+            dataset_export_error=dataset_export_error,
+        )
+
+    def preview_paper(
+        self,
+        paper_id: int,
+        options: DocumentParseOptions | None = None,
+        progress_callback: PaperParseProgressCallback | None = None,
+    ) -> PaperPreviewResponse:
+        options = options or DocumentParseOptions()
+        paper = self.repository.get_paper(paper_id)
+        if paper is None:
+            raise HTTPException(status_code=404, detail="试卷不存在")
+        asset = self.repository.get_asset(paper.asset_id)
+        if asset is None:
+            raise HTTPException(status_code=422, detail="试卷未绑定素材")
+
+        settings = get_settings()
+        storage_path = Path(asset.storage_path)
+        if not storage_path.is_absolute():
+            storage_path = settings.storage.root_path / storage_path
+        if not storage_path.exists():
+            raise HTTPException(status_code=404, detail=f"素材文件不存在：{asset.storage_path}")
+
+        _emit_parse_progress(progress_callback, "prepare", 5, {"paper_id": paper_id})
+        data = storage_path.read_bytes()
+        parsed_document = parse_document(
+            data,
+            asset.filename,
+            asset.mime_type,
+            options=options,
+            progress_callback=progress_callback,
+            cache_namespace=f"paper_asset_{asset.id}",
+        )
+        cleaned_document = clean_parsed_document(parsed_document)
+        text = cleaned_document.text or ""
+        markdown = cleaned_document.markdown or text
+        raw_text = cleaned_document.raw_text or parsed_document.text or text
+        raw_markdown = cleaned_document.raw_markdown or parsed_document.markdown or markdown
+        raw_markdown = _inline_markdown_images(raw_markdown, getattr(parsed_document, "markdown_image_roots", []) or [])
+        markdown = _inline_markdown_images(markdown, getattr(parsed_document, "markdown_image_roots", []) or [])
+        preview_text = options.select_output(text=text, markdown=markdown).strip()
+        return PaperPreviewResponse(
+            paper_id=paper.id,
+            asset_id=asset.id,
+            filename=asset.filename,
+            provider=cleaned_document.provider,
+            raw_text=raw_text,
+            raw_markdown=raw_markdown,
+            text=text,
+            markdown=markdown,
+            content=preview_text,
+            token_count=max(1, len(preview_text) // 2),
+            cleanup_report=cleaned_document.cleanup_report,
+            cleanup_score=cleaned_document.cleanup_score,
+            parse_options=options.normalized_dump(),
+            warnings=[*parsed_document.warnings, *cleaned_document.warnings][:10],
         )
 
     async def upload_paper(
@@ -443,56 +604,33 @@ class PaperService:
             raise HTTPException(status_code=422, detail="学科不存在")
 
         sha256 = hashlib.sha256(data).hexdigest()
-        existing_asset = self.repository.get_asset_by_sha(sha256)
-        if existing_asset:
-            if subject and existing_asset.subject_id != subject.id:
-                existing_asset.subject_id = subject.id
-            if normalized_category:
-                existing_tags = [
-                    tag
-                    for tag in existing_asset.tags_json or []
-                    if not (isinstance(tag, str) and tag.startswith("category:"))
-                ]
-                existing_tags.append(f"category:{normalized_category}")
-                existing_asset.tags_json = existing_tags
-            existing_paper = self.repository.get_paper_by_asset(existing_asset.id)
-            if existing_paper:
-                if subject and existing_paper.subject_id != subject.id:
-                    existing_paper.subject_id = subject.id
-                if subject_category:
-                    existing_paper.category_id = subject_category.id
-                self.session.commit()
-                return self._upload_response(existing_paper, existing_asset)
-            asset = existing_asset
-        else:
-            yyyymm = datetime.utcnow().strftime("%Y%m")
-            storage_key = f"papers/{yyyymm}/{sha256}{suffix}"
-            storage_path = settings.storage.root_path / storage_key
-            storage_path.parent.mkdir(parents=True, exist_ok=True)
-            if not storage_path.exists():
-                storage_path.write_bytes(data)
+        yyyymm = datetime.utcnow().strftime("%Y%m")
+        storage_key = f"papers/{yyyymm}/{sha256}-{uuid4().hex}{suffix}"
+        storage_path = settings.storage.root_path / storage_key
+        storage_path.parent.mkdir(parents=True, exist_ok=True)
+        storage_path.write_bytes(data)
 
-            asset = self.repository.create_asset(
-                Asset(
-                    tenant_id=tenant.id,
-                    subject_id=subject.id if subject else None,
-                    asset_type=suffix.lstrip(".") or "file",
-                    source_type="exam",
-                    source_title=name,
-                    filename=filename,
-                    mime_type=mime_type,
-                    storage_path=storage_key,
-                    sha256=sha256,
-                    file_size=len(data),
-                    parse_status="pending",
-                    ocr_status="pending",
-                    year=exam_year,
-                    region=exam_region.strip() if exam_region else None,
-                    tags_json=_paper_tags(normalized_category),
-                    created_by=operator_id,
-                    updated_by=operator_id,
-                )
+        asset = self.repository.create_asset(
+            Asset(
+                tenant_id=tenant.id,
+                subject_id=subject.id if subject else None,
+                asset_type=suffix.lstrip(".") or "file",
+                source_type="exam",
+                source_title=name,
+                filename=filename,
+                mime_type=mime_type,
+                storage_path=storage_key,
+                sha256=sha256,
+                file_size=len(data),
+                parse_status="pending",
+                ocr_status="pending",
+                year=exam_year,
+                region=exam_region.strip() if exam_region else None,
+                tags_json=_paper_tags(normalized_category),
+                created_by=operator_id,
+                updated_by=operator_id,
             )
+        )
 
         paper = self.repository.create_paper(
             ExamPaper(
@@ -563,6 +701,145 @@ class PaperService:
             }
         )
 
+    def _cleanup_deleted_asset_files(
+        self,
+        asset: dict[str, str | int],
+        parse_option_dumps: list[dict[str, Any]],
+        *,
+        cleanup_sha_cache: bool,
+    ) -> PaperCleanupSummary:
+        summary = PaperCleanupSummary(warnings=[])
+        storage_path = _resolve_asset_storage_path(asset["storage_path"])
+        if storage_path.exists():
+            storage_path.unlink(missing_ok=True)
+            summary.removed_storage_file = True
+        summary.removed_parsed_cache_files = self._cleanup_parsed_text_cache(
+            int(asset["id"]),
+            asset["sha256"],
+            cleanup_sha_cache=cleanup_sha_cache,
+        )
+        summary.removed_pdf_checkpoint_dirs = self._cleanup_pdf_parse_cache(
+            asset_id=int(asset["id"]),
+            asset=asset,
+            parse_option_dumps=parse_option_dumps,
+            cleanup_sha_cache=cleanup_sha_cache,
+        )
+        return summary
+
+    def _cleanup_parsed_text_cache(self, asset_id: int, sha256: str, *, cleanup_sha_cache: bool) -> int:
+        cache_root = get_settings().storage.root_path / "cache" / "parsed"
+        if not cache_root.exists():
+            return 0
+        patterns = [f"paper_asset_{asset_id}__*.txt", f"paper_asset_{asset_id}__*.json"]
+        if cleanup_sha_cache:
+            patterns.extend(
+                (
+                    f"{sha256}.txt",
+                    f"{sha256}.json",
+                    f"{sha256}__*.txt",
+                    f"{sha256}__*.json",
+                )
+            )
+        removed_count = 0
+        for pattern in patterns:
+            for cache_path in cache_root.glob(pattern):
+                if cache_path.is_file():
+                    cache_path.unlink(missing_ok=True)
+                    removed_count += 1
+        return removed_count
+
+    def _cleanup_pdf_parse_cache(
+        self,
+        *,
+        asset_id: int,
+        asset: dict[str, str | int],
+        parse_option_dumps: list[dict[str, Any]],
+        cleanup_sha_cache: bool,
+    ) -> int:
+        if Path(asset.get("filename") or "").suffix.lower() != ".pdf" and asset.get("mime_type") != "application/pdf":
+            return 0
+        checkpoint_root = _get_pdf_ocr_checkpoint_root(ensure_exists=False)
+        removed_count = 0
+        if cleanup_sha_cache and checkpoint_root.exists():
+            for root in (checkpoint_root, checkpoint_root / "layout"):
+                removed_count += self._cleanup_sha_cache_directories(root, asset["sha256"])
+        removed_count += self._cleanup_namespace_cache_directories(checkpoint_root, f"paper_asset_{asset_id}")
+        for cache_dir in _build_pdf_checkpoint_dirs(asset_id, asset["sha256"], parse_option_dumps):
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                removed_count += 1
+        self._prune_empty_dirs(checkpoint_root)
+        return removed_count
+
+    def _cleanup_sha_cache_directories(self, root: Path, sha256: str) -> int:
+        if not root.exists():
+            return 0
+        removed_count = 0
+        for fingerprint_path in root.rglob("source.sha256"):
+            cache_dir = fingerprint_path.parent
+            if not cache_dir.is_dir():
+                continue
+            try:
+                cached_sha256 = fingerprint_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if cached_sha256 == sha256:
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                removed_count += 1
+        return removed_count
+
+    def _cleanup_namespace_cache_directories(self, root: Path, cache_namespace: str) -> int:
+        if not root.exists():
+            return 0
+        removed_count = 0
+        seen_dirs: set[Path] = set()
+        for marker_path in root.rglob(CHECKPOINT_NAMESPACE_FILENAME):
+            cache_dir = marker_path.parent
+            if cache_dir in seen_dirs or not cache_dir.is_dir():
+                continue
+            try:
+                recorded_namespace = marker_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if recorded_namespace != cache_namespace:
+                continue
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            seen_dirs.add(cache_dir)
+            removed_count += 1
+        return removed_count
+
+    def _prune_empty_dirs(self, root: Path) -> None:
+        if not root.exists():
+            return
+        for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            if not path.is_dir():
+                continue
+            try:
+                next(path.iterdir())
+            except StopIteration:
+                path.rmdir()
+            except OSError:
+                continue
+        try:
+            next(root.iterdir())
+        except StopIteration:
+            root.rmdir()
+        except OSError:
+            pass
+
+    def _cleanup_deleted_paper_dataset(self, paper_id: int, paper_name: str) -> bool:
+        dataset_root = resolve_paper_dataset_root()
+        if not dataset_root.exists():
+            return False
+        sample_dirs = {resolve_paper_dataset_sample_dir(paper_id, paper_name)}
+        sample_dirs.update(path for path in dataset_root.glob(f"paper_{paper_id:06d}_*") if path.is_dir())
+        removed = False
+        for sample_dir in sample_dirs:
+            if sample_dir.exists():
+                shutil.rmtree(sample_dir, ignore_errors=True)
+                removed = True
+        return removed
+
     def _sync_parse_runtime_status(self, paper: ExamPaper, asset: Asset, stage: str) -> None:
         paper.status = _paper_runtime_status(stage)
         asset.parse_status = _asset_runtime_status(stage)
@@ -604,122 +881,320 @@ def _asset_runtime_status(stage: str) -> str:
     return mapping.get(stage, "parsing")
 
 
-def _split_question_blocks(text: str) -> list[SplitQuestionBlock]:
+def _resolve_asset_storage_path(storage_path: str) -> Path:
+    candidate = Path(storage_path)
+    if candidate.is_absolute():
+        return candidate
+    return get_settings().storage.root_path / candidate
+
+
+def _build_pdf_checkpoint_dirs(
+    asset_id: int,
+    asset_sha256: str,
+    parse_option_dumps: list[dict[str, Any]],
+) -> set[Path]:
+    cache_dirs: set[Path] = set()
+    root = _get_pdf_ocr_checkpoint_root()
+    parse_candidates: list[dict[str, Any]] = [*parse_option_dumps, {}, {"preset": "auto"}]
+    for dump in parse_candidates:
+        try:
+            options = DocumentParseOptions(**dump)
+        except Exception:
+            continue
+        pipeline_options = options.to_pipeline_options()
+        pipeline_options.cache_namespace = f"paper_asset_{asset_id}"
+        cache_dirs.add(
+            _build_pdf_ocr_checkpoint_dir(
+                root,
+                asset_sha256,
+                pipeline_options,
+                cache_namespace=f"paper_asset_{asset_id}",
+            )
+        )
+        if options.should_use_layout_pipeline():
+            cache_dirs.add(
+                _build_pdf_layout_checkpoint_dir(
+                    root,
+                    asset_sha256,
+                    pipeline_options,
+                    cache_namespace=f"paper_asset_{asset_id}",
+                )
+            )
+        if options.preset == "auto" and not options.should_use_pdf_ocr("paper.pdf", "application/pdf"):
+            fallback_options = OCRPipelineOptions(
+                force_ocr=True,
+                render_dpi=240,
+                cache_namespace=f"paper_asset_{asset_id}",
+                trim_margins=True,
+                remove_repeated_lines=True,
+                watermark_detection=False,
+            )
+            cache_dirs.add(
+                _build_pdf_ocr_checkpoint_dir(
+                    root,
+                    asset_sha256,
+                    fallback_options,
+                    cache_namespace=f"paper_asset_{asset_id}",
+                )
+            )
+    return cache_dirs
+
+
+def _build_pdf_ocr_checkpoint_dir(
+    root: Path,
+    asset_sha256: str,
+    options: OCRPipelineOptions,
+    *,
+    cache_namespace: str | None = None,
+) -> Path:
+    options_payload = {
+        key: value
+        for key, value in asdict(options).items()
+        if key not in {"max_pages", "page_chunk_size"}
+    }
+    payload = json.dumps(
+        {
+            "sha256": asset_sha256,
+            "options": options_payload,
+            "cache_namespace": cache_namespace,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    return root / digest[:2] / digest
+
+
+def _build_pdf_layout_checkpoint_dir(
+    root: Path,
+    asset_sha256: str,
+    options: OCRPipelineOptions,
+    *,
+    cache_namespace: str | None = None,
+) -> Path:
+    options_payload = {
+        key: value
+        for key, value in asdict(options).items()
+        if key not in {"max_pages", "page_chunk_size"}
+    }
+    payload = json.dumps(
+        {
+            "provider": "pp_structure_v3",
+            "sha256": asset_sha256,
+            "options": options_payload,
+            "cache_namespace": cache_namespace,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    return root / "layout" / digest[:2] / digest
+
+
+def _split_paper_sections(document: ParsedDocument | None, text: str) -> list[ParsedSection]:
+    if document is not None and document.pages:
+        sections = _adapt_rule_sections(parse_sections_with_rules(document))
+    else:
+        sections = _adapt_rule_sections(parse_sections_from_text(text))
+    return _attach_appendix_solutions(sections, text)
+
+
+def _adapt_rule_sections(rule_sections: list[object]) -> list[ParsedSection]:
+    return [
+        ParsedSection(
+            title=str(getattr(section, "title", "") or "自动切题"),
+            section_type=str(getattr(section, "section_type", "mixed") or "mixed"),
+            sort_order=int(getattr(section, "sort_order", index)),
+            blocks=[
+                SplitQuestionBlock(
+                    raw_text=str(getattr(block, "raw_text", "") or ""),
+                    question_no_override=str(getattr(block, "question_no_override", "") or "").strip() or None,
+                    stem_prefix=str(getattr(block, "stem_prefix", "") or "").strip() or None,
+                )
+                for block in getattr(section, "blocks", [])
+                if str(getattr(block, "raw_text", "") or "").strip()
+            ],
+        )
+        for index, section in enumerate(rule_sections, start=1)
+        if getattr(section, "blocks", None)
+    ]
+
+
+def _attach_appendix_solutions(sections: list[ParsedSection], text: str) -> list[ParsedSection]:
+    appendix_entries = _extract_appendix_solution_entries(text)
+    if not appendix_entries:
+        return sections
+
+    for section in sections:
+        for block in section.blocks:
+            base_text = _strip_appendix_from_block(block.raw_text)
+            parsed = _parse_question_block(
+                SplitQuestionBlock(
+                    raw_text=base_text,
+                    question_no_override=block.question_no_override,
+                    stem_prefix=block.stem_prefix,
+                ),
+                section,
+            )
+            entry = appendix_entries.get(_normalized_question_no(parsed.question_no))
+            if entry is None:
+                continue
+            additions: list[str] = []
+            if not (parsed.answer_text or "").strip() and (entry.answer_text or "").strip():
+                additions.append(f"答案：{entry.answer_text.strip()}")
+            if not (parsed.analysis_text or "").strip() and (entry.analysis_text or "").strip():
+                additions.append(f"解析：{entry.analysis_text.strip()}")
+            if additions:
+                block.raw_text = f"{base_text.rstrip()}\n" + "\n".join(additions)
+            else:
+                block.raw_text = base_text
+    return sections
+
+
+def _extract_appendix_solution_entries(text: str) -> dict[str, AppendixSolutionEntry]:
+    entries: dict[str, AppendixSolutionEntry] = {}
+    for segment in _answer_appendix_segments(text):
+        for entry in _parse_answer_appendix_segment(segment):
+            key = _normalized_question_no(entry.question_no)
+            if not key:
+                continue
+            current = entries.get(key)
+            if current is None:
+                entries[key] = entry
+                continue
+            if not current.answer_text and entry.answer_text:
+                current.answer_text = entry.answer_text
+            if not current.analysis_text and entry.analysis_text:
+                current.analysis_text = entry.analysis_text
+    return entries
+
+
+def _strip_appendix_from_block(raw_text: str) -> str:
+    if not raw_text:
+        return raw_text
+    if not ANSWER_ANALYSIS_HEADER_PATTERN.search(raw_text):
+        return raw_text
+    appendix_start = ANSWER_ANALYSIS_HEADER_PATTERN.search(raw_text)
+    if appendix_start is None:
+        return raw_text
+    return raw_text[: appendix_start.start()].rstrip()
+
+
+def _answer_appendix_segments(text: str) -> list[str]:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    matches = list(QUESTION_SPLIT_PATTERN.finditer(normalized))
-    raw_blocks: list[str] = []
+    matches = list(ANSWER_ANALYSIS_HEADER_PATTERN.finditer(normalized))
     if not matches:
-        chunks = [chunk.strip() for chunk in re.split(r"\n{2,}", normalized) if chunk.strip()]
-        fallback_blocks = chunks[:80] if chunks else [normalized.strip()]
-        return [SplitQuestionBlock(raw_text=block) for block in fallback_blocks if block]
-
-    leading_text = normalized[:matches[0].start()].strip()
-    for index, match in enumerate(matches):
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
-        block = normalized[match.start():end].strip()
-        if block:
-            raw_blocks.append(block)
-    raw_blocks = _collapse_out_of_sequence_blocks(raw_blocks[:200])
-    return _expand_shared_stem_blocks(raw_blocks[:200], leading_text=leading_text)
-
-
-def _split_paper_sections(text: str) -> list[ParsedSection]:
-    normalized = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
-    matches = list(SECTION_HEADER_PATTERN.finditer(normalized))
-    sections: list[ParsedSection] = []
-
-    if not matches:
-        blocks = _split_question_blocks(normalized)
-        return [ParsedSection(title="自动切题", section_type="mixed", sort_order=1, blocks=blocks)]
-
+        return []
+    segments: list[str] = []
     for index, match in enumerate(matches):
         start = match.end()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
-        body = normalized[start:end].strip()
-        title = match.group("title").strip()
-        blocks = _split_section_blocks(title, body) if body else []
-        if not blocks:
+        segment = normalized[start:end].strip()
+        if segment:
+            segments.append(segment)
+    return segments
+
+
+def _parse_answer_appendix_segment(segment: str) -> list[AppendixSolutionEntry]:
+    pattern = re.compile(
+        r"(?ms)^\s*(?:第\s*)?(?P<no>[0-9]{1,3}|[一二三四五六七八九十百]{1,6})\s*[\.、．)]?\s*(?P<body>.+?)(?=^\s*(?:第\s*)?(?:[0-9]{1,3}|[一二三四五六七八九十百]{1,6})\s*[\.、．)]?\s*|\Z)"
+    )
+    results: list[AppendixSolutionEntry] = []
+    for match in pattern.finditer(segment):
+        question_no = str(match.group("no") or "").strip()
+        body = str(match.group("body") or "").strip()
+        if not question_no or not body:
             continue
-        sections.append(
-            ParsedSection(
-                title=title,
-                section_type=SECTION_TYPE_MAP.get(title, "mixed"),
-                sort_order=len(sections) + 1,
-                blocks=blocks,
+        answer_text, analysis_text = _extract_appendix_answer_analysis(body)
+        if not answer_text and not analysis_text:
+            continue
+        results.append(
+            AppendixSolutionEntry(
+                question_no=question_no,
+                answer_text=answer_text,
+                analysis_text=analysis_text,
             )
         )
-
-    if sections:
-        return sections
-
-    blocks = _split_question_blocks(normalized)
-    return [ParsedSection(title="自动切题", section_type="mixed", sort_order=1, blocks=blocks)]
+    return results
 
 
-def _split_section_blocks(title: str, body: str) -> list[SplitQuestionBlock]:
-    grouped_blocks = _split_case_group_blocks(body)
-    if grouped_blocks:
-        return grouped_blocks
-    return _split_question_blocks(body)
+def _extract_appendix_answer_analysis(body: str) -> tuple[str | None, str | None]:
+    answer_match = _find_earliest_match(ANSWER_HEADER_INLINE_PATTERNS, body)
+    analysis_match = _find_earliest_match(ANALYSIS_HEADER_INLINE_PATTERNS, body)
+
+    if answer_match is not None:
+        answer_end = answer_match.end()
+        answer_stop = analysis_match.start() if analysis_match and analysis_match.start() > answer_end else len(body)
+        answer_text = _clean_solution_text(body[answer_end:answer_stop])
+        analysis_text = _clean_solution_text(body[analysis_match.end() :]) if analysis_match else None
+        return answer_text, analysis_text
+
+    first_line, _, remainder = body.partition("\n")
+    compact_first = re.sub(r"\s+", "", first_line).upper()
+    if MULTI_ANSWER_PATTERN.match(compact_first) or re.fullmatch(r"[A-H]", compact_first) or JUDGE_ANSWER_PATTERN.match(compact_first):
+        answer_text = first_line.strip() or None
+        analysis_text = _clean_solution_text(remainder)
+        return answer_text, analysis_text
+
+    if analysis_match is not None:
+        analysis_end = analysis_match.end()
+        analysis_text = _clean_solution_text(body[analysis_end:])
+        return None, analysis_text
+
+    return None, None
+
+
+def _normalized_question_no(value: str | None) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip()
+
+
+def _find_earliest_match(patterns: tuple[re.Pattern[str], ...], text: str) -> re.Match[str] | None:
+    earliest: re.Match[str] | None = None
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        if earliest is None or match.start() < earliest.start():
+            earliest = match
+    return earliest
+
+
+def _clean_solution_text(value: str) -> str | None:
+    text = value.strip()
+    if not text:
+        return None
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text or None
 
 
 def _parse_question_block(block: SplitQuestionBlock, section: ParsedSection) -> ParsedQuestionBlock:
-    raw_text = block.raw_text.strip()
-    number_match = QUESTION_SPLIT_PATTERN.match(raw_text)
-    question_no = block.question_no_override or (number_match.group(1) if number_match else str(section.sort_order))
-    content = raw_text[number_match.end():].strip() if number_match else raw_text
-    content = ANSWER_ANALYSIS_HEADER_PATTERN.sub("", content).strip()
+    from app.services.paper_parser_rules.engine import RuleBlock, RuleSection
 
-    answer_text = _extract_pattern(ANSWER_PATTERN, content)
-    analysis_text = _extract_pattern(ANALYSIS_PATTERN, content)
-    content_without_answer = ANSWER_PATTERN.sub("", content).strip()
-    content_without_answer = ANALYSIS_PATTERN.sub("", content_without_answer).strip()
-
-    options = [f"{match.group(1)}. {match.group(2).strip()}" for match in OPTION_PATTERN.finditer(content_without_answer)]
-    stem = OPTION_PATTERN.sub("", content_without_answer).strip()
-    stem = re.sub(r"\n{3,}", "\n\n", stem)
-    if block.stem_prefix:
-        stem = f"{block.stem_prefix}\n\n{stem}".strip()
-    subquestion_count = len(SUBQUESTION_PATTERN.findall(content_without_answer))
-    contextual_subquestion_count = subquestion_count
-    if block.stem_prefix:
-        contextual_subquestion_count = max(contextual_subquestion_count, len(SUBQUESTION_PATTERN.findall(block.stem_prefix)))
-    question_type = _detect_question_type(
-        section.section_type,
-        options,
-        answer_text,
-        content_without_answer,
-        contextual_subquestion_count,
+    parsed = parse_rule_question_block(
+        RuleBlock(
+            raw_text=block.raw_text,
+            question_no_override=block.question_no_override,
+            stem_prefix=block.stem_prefix,
+        ),
+        RuleSection(
+            title=section.title,
+            section_type=section.section_type,
+            sort_order=section.sort_order,
+            blocks=[],
+        ),
     )
-    quality_score = _estimate_quality_score(
-        stem,
-        options,
-        answer_text,
-        analysis_text,
-        contextual_subquestion_count,
-        section.section_type,
-    )
-    quality_issues = _collect_quality_issues(
-        question_type=question_type,
-        stem=stem,
-        options=options,
-        answer_text=answer_text,
-        analysis_text=analysis_text,
-        quality_score=quality_score,
-    )
-    difficulty = _estimate_difficulty(question_type, contextual_subquestion_count)
     return ParsedQuestionBlock(
-        question_no=str(question_no),
-        question_type=question_type,
-        stem_text=stem or block.stem_prefix or content[:500] or f"第 {question_no} 题",
-        options_json=options,
-        answer_text=answer_text,
-        analysis_text=analysis_text,
-        difficulty_level=difficulty,
-        quality_score=quality_score,
-        subquestion_count=contextual_subquestion_count,
-        source_section_name=section.title,
-        quality_issues=quality_issues,
+        question_no=parsed.question_no,
+        question_type=parsed.question_type,
+        stem_text=parsed.stem_text,
+        options_json=parsed.options,
+        answer_text=parsed.answer_text,
+        analysis_text=parsed.analysis_text,
+        difficulty_level=parsed.difficulty_level,
+        quality_score=parsed.quality_score,
+        subquestion_count=parsed.subquestion_count,
+        source_section_name=parsed.source_section_name,
+        quality_issues=parsed.quality_issues,
     )
 
 
@@ -732,354 +1207,6 @@ def _make_question_uid(
     uid_seed = f"{paper_id}:{section_id or 0}:{question_index}:{parsed.question_no}:{parsed.stem_text[:80]}"
     question_uid = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()[:24]
     return f"P{paper_id}-{question_uid}"
-
-
-def _split_case_group_blocks(text: str) -> list[SplitQuestionBlock]:
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    matches = list(CASE_GROUP_PATTERN.finditer(normalized))
-    if not matches:
-        return []
-    if SHARED_STEM_CUE_PATTERN.search(normalized) is None:
-        return []
-
-    blocks: list[SplitQuestionBlock] = []
-    for index, match in enumerate(matches):
-        start = match.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
-        group_body = normalized[start:end].strip()
-        if not group_body:
-            continue
-        label = match.group(1).strip()
-        group_blocks = _split_question_blocks(group_body)
-        if not group_blocks:
-            continue
-        for block in group_blocks:
-            question_no = _extract_question_no(block.raw_text)
-            if question_no:
-                block.question_no_override = f"{label}-{question_no}"
-        blocks.extend(group_blocks)
-    return blocks
-
-
-def _expand_shared_stem_blocks(raw_blocks: list[str], leading_text: str | None = None) -> list[SplitQuestionBlock]:
-    leading_blocks = _expand_leading_shared_stem_blocks(raw_blocks, leading_text=leading_text)
-    if leading_blocks is not None:
-        return leading_blocks
-
-    expanded_blocks: list[SplitQuestionBlock] = []
-    index = 0
-    while index < len(raw_blocks):
-        block = raw_blocks[index].strip()
-        if not block:
-            index += 1
-            continue
-
-        parent_match = QUESTION_SPLIT_PATTERN.match(block)
-        if parent_match is None or not _looks_like_shared_stem_block(block):
-            expanded_blocks.append(SplitQuestionBlock(raw_text=block))
-            index += 1
-            continue
-
-        parent_no = parent_match.group(1).strip()
-        shared_stem_parts = [block[parent_match.end():].strip()]
-        child_entries: list[tuple[str, str]] = []
-        cursor = index + 1
-        expected_child_no = 1
-
-        while cursor < len(raw_blocks):
-            candidate = raw_blocks[cursor].strip()
-            child_match = QUESTION_SPLIT_PATTERN.match(candidate)
-            child_number = _question_no_to_int(child_match.group(1).strip()) if child_match else None
-            if child_match and child_number == expected_child_no:
-                child_entries.append((child_match.group(1).strip(), candidate))
-                expected_child_no += 1
-                cursor += 1
-                continue
-
-            if _has_following_expected_child(raw_blocks, cursor + 1, expected_child_no):
-                if child_entries:
-                    child_no, child_text = child_entries[-1]
-                    child_entries[-1] = (child_no, f"{child_text}\n{candidate}".strip())
-                else:
-                    shared_stem_parts.append(candidate)
-                cursor += 1
-                continue
-            break
-
-        if not child_entries:
-            expanded_blocks.append(SplitQuestionBlock(raw_text=block))
-            index += 1
-            continue
-
-        shared_stem = "\n".join(part for part in shared_stem_parts if part.strip()).strip()
-        expanded_blocks.extend(
-            SplitQuestionBlock(
-                raw_text=child_text,
-                question_no_override=f"{parent_no}-{child_no}",
-                stem_prefix=shared_stem,
-            )
-            for child_no, child_text in child_entries
-        )
-        index = cursor
-
-    return expanded_blocks
-
-
-def _collapse_out_of_sequence_blocks(raw_blocks: list[str]) -> list[str]:
-    collapsed: list[str] = []
-    expected_no: int | None = None
-
-    for index, block in enumerate(raw_blocks):
-        question_no = _question_no_to_int(_extract_question_no(block) or "")
-        if not collapsed:
-            collapsed.append(block)
-            expected_no = question_no + 1 if question_no is not None else None
-            continue
-
-        if expected_no is not None and question_no == expected_no:
-            collapsed.append(block)
-            expected_no += 1
-            continue
-
-        if expected_no is not None and _has_following_expected_child(raw_blocks, index + 1, expected_no):
-            collapsed[-1] = f"{collapsed[-1]}\n{block}".strip()
-            continue
-
-        collapsed.append(block)
-        expected_no = question_no + 1 if question_no is not None else None
-
-    return collapsed
-
-
-def _expand_leading_shared_stem_blocks(
-    raw_blocks: list[str],
-    *,
-    leading_text: str | None,
-) -> list[SplitQuestionBlock] | None:
-    shared_stem = (leading_text or "").strip()
-    if not shared_stem:
-        return None
-    if not _looks_like_leading_shared_stem(shared_stem, raw_blocks):
-        if not raw_blocks:
-            return None
-        merged_first = f"{shared_stem}\n{raw_blocks[0]}".strip()
-        return [SplitQuestionBlock(raw_text=merged_first), *[SplitQuestionBlock(raw_text=block) for block in raw_blocks[1:]]]
-    return [
-        SplitQuestionBlock(
-            raw_text=block,
-            stem_prefix=shared_stem,
-        )
-        for block in raw_blocks
-    ]
-
-
-def _looks_like_shared_stem_block(block: str) -> bool:
-    number_match = QUESTION_SPLIT_PATTERN.match(block.strip())
-    if number_match is None:
-        return False
-    content = block[number_match.end():].strip()
-    if not content:
-        return False
-    if len(OPTION_PATTERN.findall(content)) >= 2:
-        return False
-    material_item_count = len(MATERIAL_ITEM_PATTERN.findall(content))
-    subquestion_count = len(SUBQUESTION_PATTERN.findall(content))
-    if max(material_item_count, subquestion_count) < 2:
-        return False
-    return SHARED_STEM_CUE_PATTERN.search(content) is not None
-
-
-def _looks_like_leading_shared_stem(shared_stem: str, raw_blocks: list[str]) -> bool:
-    if not raw_blocks:
-        return False
-    first_question_no = _question_no_to_int(_extract_question_no(raw_blocks[0]) or "")
-    if first_question_no != 1:
-        return False
-    material_item_count = len(MATERIAL_ITEM_PATTERN.findall(shared_stem))
-    subquestion_count = len(SUBQUESTION_PATTERN.findall(shared_stem))
-    if max(material_item_count, subquestion_count) >= 2:
-        return True
-    return SHARED_STEM_CUE_PATTERN.search(shared_stem) is not None
-
-
-def _has_following_expected_child(raw_blocks: list[str], start_index: int, expected_child_no: int, max_lookahead: int = 2) -> bool:
-    for offset in range(max_lookahead):
-        position = start_index + offset
-        if position >= len(raw_blocks):
-            return False
-        candidate = raw_blocks[position].strip()
-        match = QUESTION_SPLIT_PATTERN.match(candidate)
-        if match is None:
-            continue
-        number = _question_no_to_int(match.group(1).strip())
-        if number == expected_child_no:
-            return True
-    return False
-
-
-def _question_no_to_int(value: str) -> int | None:
-    normalized = value.strip()
-    if not normalized:
-        return None
-    if normalized.isdigit():
-        return int(normalized)
-    return _chinese_numeral_to_int(normalized)
-
-
-def _extract_question_no(block: str) -> str | None:
-    match = QUESTION_SPLIT_PATTERN.match(block.strip())
-    if match is None:
-        return None
-    return match.group(1).strip() or None
-
-
-def _chinese_numeral_to_int(value: str) -> int | None:
-    numerals = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-    units = {"十": 10, "百": 100}
-    total = 0
-    current = 0
-    for char in value:
-        if char in numerals:
-            current = numerals[char]
-            continue
-        if char in units:
-            total += (current or 1) * units[char]
-            current = 0
-            continue
-        return None
-    return total + current
-
-
-def _detect_question_type(
-    section_type: str,
-    options: list[str],
-    answer_text: str | None,
-    content_without_answer: str,
-    subquestion_count: int,
-) -> str:
-    normalized_answer = re.sub(r"\s+", " ", answer_text or "").strip().upper()
-    if section_type != "mixed":
-      return section_type
-    if len(options) >= 2 and normalized_answer and MULTI_ANSWER_PATTERN.match(normalized_answer):
-        return "multiple_choice"
-    if len(options) >= 2:
-        return "single_choice"
-    if normalized_answer and JUDGE_ANSWER_PATTERN.match(normalized_answer):
-        return "judge"
-    if subquestion_count >= 2:
-        return "case_analysis"
-    if "计算" in content_without_answer[:30]:
-        return "calculation"
-    if "材料" in content_without_answer[:40] or "阅读下列" in content_without_answer[:40]:
-        return "material_analysis"
-    if re.search(r"[_＿]{2,}", content_without_answer):
-        return "fill_blank"
-    return "short_answer"
-
-
-def _estimate_quality_score(
-    stem: str,
-    options: list[str],
-    answer_text: str | None,
-    analysis_text: str | None,
-    subquestion_count: int,
-    section_type: str,
-) -> float:
-    score = 0.45
-    if stem:
-        score += 0.18
-    if options:
-        score += 0.12
-    if answer_text:
-        score += 0.1
-    if analysis_text:
-        score += 0.08
-    if subquestion_count:
-        score += min(0.08, subquestion_count * 0.02)
-    if section_type != "mixed":
-        score += 0.05
-    return round(min(score, 0.96), 2)
-
-
-def _collect_quality_issues(
-    *,
-    question_type: str,
-    stem: str,
-    options: list[str],
-    answer_text: str | None,
-    analysis_text: str | None,
-    quality_score: float,
-) -> list[str]:
-    issues: list[str] = []
-    if len(stem.strip()) < 8:
-        issues.append("题干过短或缺失")
-    if question_type in {"single_choice", "multiple_choice"}:
-        option_labels = {option[:1].upper() for option in options if option}
-        expected = {"A", "B", "C", "D"}
-        missing = sorted(expected - option_labels)
-        if missing:
-            issues.append(f"选项缺失：{','.join(missing)}")
-        if answer_text:
-            answer_letters = set(re.findall(r"[A-H]", answer_text.upper()))
-            if answer_letters and not answer_letters.issubset(option_labels):
-                issues.append("答案选项与识别选项不匹配")
-        else:
-            issues.append("答案缺失")
-    elif not answer_text:
-        issues.append("答案缺失")
-    if not analysis_text:
-        issues.append("解析缺失")
-    if quality_score < 0.72:
-        issues.append("结构化质量分偏低")
-    return issues[:6]
-
-
-def _collect_numbering_warnings(questions: list[ExamQuestion]) -> list[str]:
-    numeric_numbers = []
-    for question in questions:
-        try:
-            numeric_numbers.append(int(str(question.question_no)))
-        except ValueError:
-            continue
-    if len(numeric_numbers) < 2:
-        return []
-    expected = list(range(min(numeric_numbers), max(numeric_numbers) + 1))
-    missing = sorted(set(expected) - set(numeric_numbers))
-    duplicates = sorted({number for number in numeric_numbers if numeric_numbers.count(number) > 1})
-    warnings: list[str] = []
-    if missing:
-        warnings.append(f"题号不连续，缺少：{','.join(str(item) for item in missing[:20])}")
-    if duplicates:
-        warnings.append(f"题号重复：{','.join(str(item) for item in duplicates[:20])}")
-    return warnings
-
-
-def _estimate_difficulty(question_type: str, subquestion_count: int) -> int:
-    if question_type in {"single_choice", "judge"}:
-        return 2
-    if question_type in {"multiple_choice", "fill_blank", "short_answer"}:
-        return 3
-    if question_type in {"calculation", "case_analysis", "material_analysis", "composite"}:
-        return 4 if subquestion_count >= 2 else 3
-    return 3
-
-
-def _merge_section_question_type(default_type: str, questions: list[ExamQuestion]) -> str:
-    if not questions:
-        return default_type
-    if default_type != "mixed":
-        return default_type
-    first_type = questions[0].question_type
-    if any(question.question_type != first_type for question in questions):
-        return "mixed"
-    return first_type
-
-
-def _extract_pattern(pattern: re.Pattern[str], text: str) -> str | None:
-    match = pattern.search(text)
-    if not match:
-        return None
-    return re.sub(r"\s+", " ", match.group(1)).strip() or None
 
 
 def _paper_tags(category: str | None) -> list[str]:
@@ -1113,3 +1240,48 @@ def _emit_parse_progress(
     if callback is None:
         return
     callback(stage, max(0, min(100, progress)), detail)
+
+
+def _inline_markdown_images(markdown: str, markdown_image_roots: list[str]) -> str:
+    if not markdown or not markdown_image_roots:
+        return markdown
+
+    source_roots = [Path(root) for root in markdown_image_roots if str(root).strip()]
+    if not source_roots:
+        return markdown
+
+    def replace_markdown(match: re.Match[str]) -> str:
+        alt_text = match.group(1)
+        image_path = match.group(2).replace("\\", "/")
+        data_url = _load_markdown_image_data_url(image_path, source_roots)
+        if not data_url:
+            return match.group(0)
+        return f'![{alt_text}]({data_url})'
+
+    def replace_html(match: re.Match[str]) -> str:
+        before = match.group(1)
+        image_path = match.group(2).replace("\\", "/")
+        after = match.group(3)
+        data_url = _load_markdown_image_data_url(image_path, source_roots)
+        if not data_url:
+            return match.group(0)
+        return f'<img{before}src="{data_url}"{after}>'
+
+    updated = re.sub(r"!\[([^\]]*)\]\((imgs/[^)\s]+)\)", replace_markdown, markdown)
+    updated = re.sub(r'<img([^>]*?)src=["\'](imgs/[^"\']+)["\']([^>]*?)>', replace_html, updated, flags=re.IGNORECASE)
+    return updated
+
+
+def _load_markdown_image_data_url(relative_path: str, source_roots: list[Path]) -> str:
+    normalized = relative_path.replace("\\", "/").lstrip("/")
+    for source_root in source_roots:
+        candidate = source_root / normalized
+        if not candidate.exists() and normalized.startswith("imgs/"):
+            candidate = source_root / normalized.removeprefix("imgs/")
+        if not candidate.exists():
+            continue
+        raw = candidate.read_bytes()
+        mime_type = mimetypes.guess_type(candidate.name)[0] or "image/jpeg"
+        encoded = base64.b64encode(raw).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+    return ""

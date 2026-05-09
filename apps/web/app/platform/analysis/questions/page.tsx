@@ -1,1129 +1,1144 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import {
-  apiFetch,
-  QuestionAiCompleteResponse,
-  QuestionAiKnowledgeReviewResponse,
-  QuestionAiProcessResponse,
-  QuestionAiReviewResponse,
-  QuestionBatchReviewResponse,
-  QuestionDetailResponse,
-  QuestionKnowledgeReviewResponse,
-  PaperSummary,
-  QuestionRetagResponse,
-  QuestionSummary,
-  SubjectCategoryResponse,
-  SubjectResponse,
-} from "../../../../lib/pro-api";
+import Link from "next/link";
+import { Bot, BrainCircuit, Orbit, RefreshCw, ShieldCheck, Sparkles, Wand2 } from "lucide-react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useMemo, useRef, useState, type TextareaHTMLAttributes } from "react";
+
 import { LoadState } from "../../../../components/shared/LoadState";
 import { StatusBadge } from "../../../../components/shared/StatusBadge";
-import { allRejected, firstRejectedReason, summarizeRejectedRequests, toErrorMessage, useLatestRequestGate } from "../../../../lib/request-guard";
+import { renderDocumentPreviewHtml } from "../../../../lib/document-preview";
+import {
+  apiFetch,
+  KnowledgePointResponse,
+  PaperReviewAIActionResponse,
+  PaperReviewAutoTagJobResponse,
+  PaperReviewAutoTagResponse,
+  PaperReviewQuestionKnowledgePointUpdateRequest,
+  PaperReviewQuestionResponse,
+  PaperReviewQuestionUpdateRequest,
+  PaperReviewSummaryResponse,
+  PaperReviewWorkspaceResponse,
+  PaperSummary,
+} from "../../../../lib/pro-api";
+import { toErrorMessage, useLatestRequestGate } from "../../../../lib/request-guard";
 
-type ReviewStatusFilter = "all" | "pending" | "approved" | "rejected" | "needs_revision";
-type QuestionTypeFilter =
-  | "all"
-  | "single_choice"
-  | "multiple_choice"
-  | "judge"
-  | "fill_blank"
-  | "short_answer"
-  | "calculation"
-  | "case_analysis"
-  | "material_analysis"
-  | "composite";
-type DetailTab = "content" | "analysis" | "knowledge";
+type DraftState = {
+  questionType: string;
+  stemText: string;
+  options: string[];
+  answerText: string;
+  analysisText: string;
+  reviewStatus: "pending" | "approved" | "needs_revision" | "rejected";
+  reviewNote: string;
+  suggestedKnowledgePointIds: number[];
+  confirmedKnowledgePointIds: number[];
+  primaryKnowledgePointId: number | null;
+};
 
-const pageSummary =
-  "当前页面已升级为“原始题复核 + 候选考点审核”的第一版工作台，支持题目批量复核、候选考点确认与主次考点人工收口。";
+const emptyDraft: DraftState = {
+  questionType: "",
+  stemText: "",
+  options: [],
+  answerText: "",
+  analysisText: "",
+  reviewStatus: "pending",
+  reviewNote: "",
+  suggestedKnowledgePointIds: [],
+  confirmedKnowledgePointIds: [],
+  primaryKnowledgePointId: null,
+};
 
-export default function QuestionsPage() {
-  const [paperIdFilter, setPaperIdFilter] = useState<number | null>(null);
-  const [subjects, setSubjects] = useState<SubjectResponse[]>([]);
-  const [categories, setCategories] = useState<SubjectCategoryResponse[]>([]);
+const reviewStatusOptions = [
+  { value: "all", label: "全部人工状态" },
+  { value: "pending", label: "待人工审核" },
+  { value: "approved", label: "人工通过" },
+  { value: "needs_revision", label: "待修订" },
+  { value: "rejected", label: "已驳回" },
+] as const;
+
+const aiStatusOptions = [
+  { value: "all", label: "全部 AI 状态" },
+  { value: "pending", label: "未做 AI 审核" },
+  { value: "approved", label: "AI 通过" },
+  { value: "needs_revision", label: "AI 提醒修订" },
+  { value: "rejected", label: "AI 判定异常" },
+] as const;
+
+const questionTypeOptions = [
+  "single_choice",
+  "multiple_choice",
+  "judge",
+  "fill_blank",
+  "short_answer",
+  "calculation",
+  "case_analysis",
+  "material_analysis",
+  "composite",
+  "mixed",
+];
+
+export default function PaperReviewPage() {
+  return (
+    <Suspense fallback={<div className="panel"><div className="panelBody">加载中...</div></div>}>
+      <PaperReviewPageContent />
+    </Suspense>
+  );
+}
+
+function PaperReviewPageContent() {
+  const paperReviewApiBase = "/api/paper-review";
+  const searchParams = useSearchParams();
+  const preferredPaperId = Number(searchParams.get("paperId") || "") || null;
+  const paperGate = useLatestRequestGate();
+  const workspaceGate = useLatestRequestGate();
+
   const [papers, setPapers] = useState<PaperSummary[]>([]);
-  const [subjectIdFilter, setSubjectIdFilter] = useState<number | null>(null);
-  const [categoryIdFilter, setCategoryIdFilter] = useState<number | null>(null);
-  const [yearFilter, setYearFilter] = useState<number | null>(null);
-  const [questions, setQuestions] = useState<QuestionSummary[]>([]);
-  const [selected, setSelected] = useState<QuestionDetailResponse | null>(null);
-  const [detailTab, setDetailTab] = useState<DetailTab>("content");
-  const [keyword, setKeyword] = useState("");
-  const [selectedIds, setSelectedIds] = useState<number[]>([]);
-  const [selectedLinkIds, setSelectedLinkIds] = useState<number[]>([]);
-  const [primaryLinkId, setPrimaryLinkId] = useState<number | null>(null);
-  const [reviewStatusFilter, setReviewStatusFilter] = useState<ReviewStatusFilter>("all");
-  const [questionTypeFilter, setQuestionTypeFilter] = useState<QuestionTypeFilter>("all");
-  const [reviewNote, setReviewNote] = useState("");
-  const [aiConcurrency, setAiConcurrency] = useState("3");
-  const [loading, setLoading] = useState(true);
-  const [reviewing, setReviewing] = useState(false);
-  const [aiCompleting, setAiCompleting] = useState(false);
-  const [aiCompletingIds, setAiCompletingIds] = useState<number[]>([]);
-  const [aiReviewing, setAiReviewing] = useState(false);
-  const [aiReviewingIds, setAiReviewingIds] = useState<number[]>([]);
-  const [aiProcessing, setAiProcessing] = useState(false);
-  const [aiProcessingIds, setAiProcessingIds] = useState<number[]>([]);
-  const [knowledgeReviewing, setKnowledgeReviewing] = useState(false);
-  const [aiKnowledgeReviewing, setAiKnowledgeReviewing] = useState(false);
-  const [retagging, setRetagging] = useState(false);
+  const [workspace, setWorkspace] = useState<PaperReviewWorkspaceResponse | null>(null);
+  const [knowledgePoints, setKnowledgePoints] = useState<KnowledgePointResponse[]>([]);
+  const [selectedPaperId, setSelectedPaperId] = useState<number | null>(null);
+  const [selectedQuestionId, setSelectedQuestionId] = useState<number | null>(null);
+  const [draft, setDraft] = useState<DraftState>(emptyDraft);
+  const [loadingPapers, setLoadingPapers] = useState(true);
+  const [loadingWorkspace, setLoadingWorkspace] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [savingKnowledgePoints, setSavingKnowledgePoints] = useState(false);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [autoTagging, setAutoTagging] = useState(false);
+  const [autoTaggingQuestionId, setAutoTaggingQuestionId] = useState<number | null>(null);
+  const [autoTagProgress, setAutoTagProgress] = useState<PaperReviewAutoTagResponse | null>(null);
+  const [standardizingId, setStandardizingId] = useState<number | null>(null);
+  const [reviewingId, setReviewingId] = useState<number | null>(null);
   const [error, setError] = useState("");
-  const [loadWarning, setLoadWarning] = useState("");
+  const [workspaceError, setWorkspaceError] = useState("");
   const [actionMessage, setActionMessage] = useState("");
-  const [aiActionMessage, setAiActionMessage] = useState("");
-  const [knowledgeActionMessage, setKnowledgeActionMessage] = useState("");
-  const pageRequestGate = useLatestRequestGate();
-  const detailRequestIdRef = useRef(0);
-
-  function applySelectedDetail(detail: QuestionDetailResponse | null) {
-    setSelected(detail);
-    setKnowledgeActionMessage("");
-    if (!detail) {
-      setDetailTab("content");
-      setSelectedLinkIds([]);
-      setPrimaryLinkId(null);
-      return;
-    }
-    const pendingLinks = detail.links.filter((link) => link.review_status === "pending");
-    const approvedPrimary = detail.links.find((link) => link.review_status === "approved" && link.is_primary);
-    setSelectedLinkIds(pendingLinks.map((link) => link.id));
-    setPrimaryLinkId(approvedPrimary?.id || pendingLinks.find((link) => link.is_primary)?.id || pendingLinks[0]?.id || null);
-  }
-
-  async function loadQuestionDetail(questionId: number, fallback: string) {
-    const requestId = detailRequestIdRef.current + 1;
-    detailRequestIdRef.current = requestId;
-    try {
-      const detail = await apiFetch<QuestionDetailResponse>(`/api/questions/${questionId}`);
-      if (detailRequestIdRef.current !== requestId) return null;
-      applySelectedDetail(detail);
-      return detail;
-    } catch (err) {
-      if (detailRequestIdRef.current !== requestId) return null;
-      setError(toErrorMessage(err, fallback));
-      return null;
-    }
-  }
-
-  async function loadPage(preferredQuestionId?: number) {
-    const requestId = pageRequestGate.begin();
-    setLoading(true);
-    setError("");
-    setLoadWarning("");
-    try {
-      const [nextQuestions, nextSubjects, nextCategories, nextPapers] = await Promise.allSettled([
-        loadQuestions({
-          reviewStatus: reviewStatusFilter,
-          questionType: questionTypeFilter,
-          paperId: paperIdFilter,
-          subjectId: subjectIdFilter,
-          categoryId: categoryIdFilter,
-          year: yearFilter,
-        }),
-        apiFetch<SubjectResponse[]>("/api/knowledge/subjects"),
-        apiFetch<SubjectCategoryResponse[]>("/api/knowledge/categories"),
-        apiFetch<PaperSummary[]>("/api/papers"),
-      ]);
-      if (!pageRequestGate.isCurrent(requestId)) return;
-      const results = [nextQuestions, nextSubjects, nextCategories, nextPapers];
-      if (allRejected(results)) {
-        throw firstRejectedReason(results) || new Error("No question page requests succeeded.");
-      }
-
-      const next = nextQuestions.status === "fulfilled" ? nextQuestions.value : [];
-      const nextSubjectList = nextSubjects.status === "fulfilled" ? nextSubjects.value : [];
-      const nextCategoryList = nextCategories.status === "fulfilled" ? nextCategories.value : [];
-      const nextPaperList = nextPapers.status === "fulfilled" ? nextPapers.value : [];
-
-      setQuestions(next);
-      setSubjects(nextSubjectList);
-      setCategories(nextCategoryList);
-      setPapers(nextPaperList);
-      setSelectedIds((current) => current.filter((id) => next.some((item) => item.id === id)));
-      setLoadWarning(
-        summarizeRejectedRequests([
-          { label: "题目列表", result: nextQuestions },
-          { label: "学科列表", result: nextSubjects },
-          { label: "类目列表", result: nextCategories },
-          { label: "试卷列表", result: nextPapers },
-        ]),
-      );
-
-      const nextId =
-        preferredQuestionId && next.some((item) => item.id === preferredQuestionId)
-          ? preferredQuestionId
-          : selected?.id && next.some((item) => item.id === selected.id)
-            ? selected.id
-            : next[0]?.id;
-
-      if (!nextId) {
-        applySelectedDetail(null);
-        return;
-      }
-
-      await loadQuestionDetail(nextId, "加载题目详情失败");
-    } catch (err) {
-      if (!pageRequestGate.isCurrent(requestId)) return;
-      setError(toErrorMessage(err, "加载题目失败"));
-    } finally {
-      if (pageRequestGate.isCurrent(requestId)) setLoading(false);
-    }
-  }
+  const [search, setSearch] = useState("");
+  const [reviewFilter, setReviewFilter] = useState<(typeof reviewStatusOptions)[number]["value"]>("all");
+  const [aiFilter, setAiFilter] = useState<(typeof aiStatusOptions)[number]["value"]>("all");
+  const [sectionFilter, setSectionFilter] = useState("all");
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const nextPaperId = Number(new URLSearchParams(window.location.search).get("paper_id") || 0) || null;
-    setPaperIdFilter(nextPaperId);
+    loadPapers();
   }, []);
 
   useEffect(() => {
-    loadPage();
-  }, [reviewStatusFilter, questionTypeFilter, paperIdFilter, subjectIdFilter, categoryIdFilter, yearFilter]);
+    if (!papers.length) return;
+    if (selectedPaperId && papers.some((paper) => paper.id === selectedPaperId)) return;
+    const fallbackPaperId = preferredPaperId && papers.some((paper) => paper.id === preferredPaperId)
+      ? preferredPaperId
+      : papers[0]?.id || null;
+    setSelectedPaperId(fallbackPaperId);
+  }, [papers, preferredPaperId, selectedPaperId]);
 
   useEffect(() => {
-    if (subjectIdFilter === null) {
-      setCategoryIdFilter((current) => {
-        if (current === null) return current;
-        return categories.some((item) => item.id === current) ? current : null;
-      });
+    if (!selectedPaperId) {
+      setWorkspace(null);
+      setSelectedQuestionId(null);
       return;
     }
-    setCategoryIdFilter((current) => {
-      if (current === null) return current;
-      return categories.some((item) => item.id === current && item.subject_id === subjectIdFilter) ? current : null;
+    void loadWorkspace(selectedPaperId);
+    syncPaperQuery(selectedPaperId);
+  }, [selectedPaperId]);
+
+  const filteredQuestions = useMemo(() => {
+    if (!workspace) return [] as PaperReviewQuestionResponse[];
+    const keyword = search.trim().toLowerCase();
+    return workspace.questions.filter((question) => {
+      if (reviewFilter !== "all" && question.review_status !== reviewFilter) return false;
+      if (aiFilter === "pending") {
+        if (question.ai_review_status) return false;
+      } else if (aiFilter !== "all" && question.ai_review_status !== aiFilter) {
+        return false;
+      }
+      if (sectionFilter !== "all" && String(question.section_id || "") !== sectionFilter) return false;
+      if (!keyword) return true;
+      return [
+        question.question_no,
+        question.source_section_name,
+        question.stem_text,
+        question.answer_text || "",
+        question.analysis_text || "",
+      ]
+        .join("\n")
+        .toLowerCase()
+        .includes(keyword);
     });
-  }, [subjectIdFilter, categories]);
+  }, [aiFilter, reviewFilter, search, sectionFilter, workspace]);
+
+  const activeQuestion = useMemo(
+    () => workspace?.questions.find((question) => question.id === selectedQuestionId) || null,
+    [selectedQuestionId, workspace],
+  );
+
+  const scopedKnowledgePoints = useMemo(() => {
+    if (!workspace?.paper.subject_name) return knowledgePoints;
+    const categoryId = papers.find((paper) => paper.id === selectedPaperId)?.category_id || null;
+    return knowledgePoints.filter((point) => {
+      if (workspace.paper && papers.find((paper) => paper.id === selectedPaperId)?.subject_id && point.subject_id !== papers.find((paper) => paper.id === selectedPaperId)?.subject_id) {
+        return false;
+      }
+      if (categoryId && point.category_id && point.category_id !== categoryId) {
+        return false;
+      }
+      return true;
+    });
+  }, [knowledgePoints, papers, selectedPaperId, workspace]);
 
   useEffect(() => {
-    setPaperIdFilter((current) => {
-      if (current === null) return current;
-      return papers.some((paper) => {
-        if (paper.id !== current) return false;
-        if (subjectIdFilter !== null && paper.subject_id !== subjectIdFilter) return false;
-        if (categoryIdFilter !== null && paper.category_id !== categoryIdFilter) return false;
-        if (yearFilter !== null && paper.exam_year !== yearFilter) return false;
-        return true;
-      })
-        ? current
-        : null;
-    });
-  }, [papers, subjectIdFilter, categoryIdFilter, yearFilter]);
-
-  async function refreshQuestions(preferredQuestionId?: number) {
-    await loadPage(preferredQuestionId);
-  }
-
-  async function pickQuestion(id: number) {
-    setError("");
-    await loadQuestionDetail(id, "加载题目详情失败");
-  }
-
-  function toggleQuestion(id: number) {
-    setSelectedIds((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
-  }
-
-  function toggleAllCurrent() {
-    if (!visibleQuestions.length) return;
-    const visibleIds = visibleQuestions.map((item) => item.id);
-    const allSelected = visibleIds.every((id) => selectedIds.includes(id));
-    setSelectedIds(allSelected ? selectedIds.filter((id) => !visibleIds.includes(id)) : Array.from(new Set([...selectedIds, ...visibleIds])));
-  }
-
-  async function batchReview(reviewStatus: Exclude<ReviewStatusFilter, "all">) {
-    if (!selectedIds.length) {
-      setError("请先选择需要复核的题目");
+    if (!activeQuestion) {
+      setDraft(emptyDraft);
       return;
     }
-    setReviewing(true);
-    setError("");
-    setActionMessage("");
-    try {
-      const result = await apiFetch<QuestionBatchReviewResponse>("/api/questions/batch-review", {
-        method: "POST",
-        body: JSON.stringify({
-          question_ids: selectedIds,
-          review_status: reviewStatus,
-          review_note: reviewNote.trim() || null,
-        }),
-      });
-      await refreshQuestions(selected?.id && result.question_ids.includes(selected.id) ? selected.id : result.question_ids[0]);
-      setActionMessage(
-        `已批量更新 ${result.updated_count} 道题为 ${questionReviewLabel(result.review_status)}，通过题目会自动同步到题库中心并保留来源标识。`,
-      );
-      setReviewNote("");
-    } catch (err) {
-      setError(toErrorMessage(err, "批量复核失败"));
-    } finally {
-      setReviewing(false);
-    }
-  }
+    setDraft(buildDraft(activeQuestion));
+  }, [activeQuestion]);
 
-  async function aiCompleteQuestions(questionIds: number[]) {
-    if (!questionIds.length) {
-      setError("请先选择需要 AI 补全的题目");
-      return;
-    }
-    setAiCompleting(true);
-    setAiCompletingIds(questionIds);
-    setError("");
-    setAiActionMessage("");
-    try {
-      const result = await runConcurrentQuestionAction<QuestionAiCompleteResponse>(
-        questionIds,
-        parseConcurrency(aiConcurrency),
-        async (batchIds) =>
-          apiFetch<QuestionAiCompleteResponse>("/api/questions/ai-complete", {
-            method: "POST",
-            body: JSON.stringify({ question_ids: batchIds }),
-          }),
-      );
-      const preferredId =
-        selected?.id && questionIds.includes(selected.id)
-          ? selected.id
-          : questionIds[0];
-      await refreshQuestions(preferredId);
-      setAiActionMessage(
-        `AI补全完成：更新 ${result.updatedCount} 道，未变更 ${result.unchangedCount} 道`
-          + (result.failedCount ? `，失败 ${result.failedCount} 道` : ""),
-      );
-    } catch (err) {
-      setError(toErrorMessage(err, "AI补全失败"));
-    } finally {
-      setAiCompleting(false);
-      setAiCompletingIds([]);
-    }
-  }
+  useEffect(() => {
+    if (!autoTagging && autoTaggingQuestionId == null) return;
+    if (!autoTagProgress) return;
+    if (!selectedPaperId) return;
+    const jobId = (window as typeof window & { __paperReviewAutoTagJobId?: number }).__paperReviewAutoTagJobId;
+    if (!jobId) return;
 
-  async function aiReviewQuestions(questionIds: number[]) {
-    if (!questionIds.length) {
-      setError("请先选择需要 AI 复核的题目");
-      return;
-    }
-    setAiReviewing(true);
-    setAiReviewingIds(questionIds);
-    setError("");
-    setActionMessage("");
-    try {
-      const result = await runConcurrentQuestionAction<QuestionAiReviewResponse>(
-        questionIds,
-        parseConcurrency(aiConcurrency),
-        async (batchIds) =>
-          apiFetch<QuestionAiReviewResponse>("/api/questions/ai-review", {
-            method: "POST",
-            body: JSON.stringify({ question_ids: batchIds }),
-          }),
-      );
-      const preferredId =
-        selected?.id && questionIds.includes(selected.id)
-          ? selected.id
-          : questionIds[0];
-      await refreshQuestions(preferredId);
-      setActionMessage(
-        `AI复核完成：通过 ${result.approvedCount} 道，待修订 ${result.needsRevisionCount} 道，退回 ${result.rejectedCount} 道`
-          + (result.failedCount ? `，失败 ${result.failedCount} 道` : ""),
-      );
-    } catch (err) {
-      setError(toErrorMessage(err, "AI复核失败"));
-    } finally {
-      setAiReviewing(false);
-      setAiReviewingIds([]);
-    }
-  }
-
-  async function aiProcessQuestions(questionIds: number[]) {
-    if (!questionIds.length) {
-      setError("请先选择需要 AI 综合处理的题目");
-      return;
-    }
-    setAiProcessing(true);
-    setAiProcessingIds(questionIds);
-    setError("");
-    setAiActionMessage("");
-    try {
-      const result = await runConcurrentQuestionAction<QuestionAiProcessResponse>(
-        questionIds,
-        parseConcurrency(aiConcurrency),
-        async (batchIds) =>
-          apiFetch<QuestionAiProcessResponse>("/api/questions/ai-process", {
-            method: "POST",
-            body: JSON.stringify({ question_ids: batchIds }),
-          }),
-      );
-      const preferredId =
-        selected?.id && questionIds.includes(selected.id)
-          ? selected.id
-          : questionIds[0];
-      await refreshQuestions(preferredId);
-      setAiActionMessage(
-        `AI综合处理完成：补全更新 ${result.updatedCount} 道，确认考点 ${result.taggedQuestionCount} 道，通过 ${result.approvedCount} 道，待修订 ${result.needsRevisionCount} 道，退回 ${result.rejectedCount} 道`
-          + (result.failedCount ? `，失败 ${result.failedCount} 道` : ""),
-      );
-    } catch (err) {
-      setError(toErrorMessage(err, "AI综合处理失败"));
-    } finally {
-      setAiProcessing(false);
-      setAiProcessingIds([]);
-    }
-  }
-
-  function toggleKnowledgeLink(linkId: number) {
-    setSelectedLinkIds((current) => {
-      if (current.includes(linkId)) {
-        const next = current.filter((item) => item !== linkId);
-        if (primaryLinkId === linkId) {
-          setPrimaryLinkId(next[0] || null);
+    const timer = window.setInterval(async () => {
+      try {
+        const progress = await apiFetch<PaperReviewAutoTagResponse>(`${paperReviewApiBase}/auto-tag-jobs/${jobId}`);
+        setAutoTagProgress(progress);
+        const done = progress.status === "completed" || progress.status === "failed";
+        if (done) {
+          window.clearInterval(timer);
+          (window as typeof window & { __paperReviewAutoTagJobId?: number }).__paperReviewAutoTagJobId = undefined;
+          setAutoTagging(false);
+          setAutoTaggingQuestionId(null);
+          await loadWorkspace(selectedPaperId, activeQuestion?.id || null);
+          setActionMessage(progress.message);
         }
-        return next;
+      } catch {
+        window.clearInterval(timer);
       }
-      return [...current, linkId];
+    }, 1200);
+
+    return () => window.clearInterval(timer);
+  }, [activeQuestion?.id, autoTagProgress, autoTagging, autoTaggingQuestionId, paperReviewApiBase, selectedPaperId]);
+
+  async function loadPapers() {
+    const requestId = paperGate.begin();
+    setLoadingPapers(true);
+    setError("");
+    try {
+      const nextPapers = await apiFetch<PaperSummary[]>("/api/papers");
+      const nextKnowledgePoints = await apiFetch<KnowledgePointResponse[]>("/api/knowledge/points");
+      if (!paperGate.isCurrent(requestId)) return;
+      setPapers(nextPapers);
+      setKnowledgePoints(nextKnowledgePoints);
+    } catch (err) {
+      if (!paperGate.isCurrent(requestId)) return;
+      setError(toErrorMessage(err, "加载试卷列表失败"));
+    } finally {
+      if (paperGate.isCurrent(requestId)) setLoadingPapers(false);
+    }
+  }
+
+  async function loadWorkspace(paperId: number, preferredQuestionId?: number | null) {
+    const requestId = workspaceGate.begin();
+    setLoadingWorkspace(true);
+    setWorkspaceError("");
+    try {
+      const nextWorkspace = await apiFetch<PaperReviewWorkspaceResponse>(`${paperReviewApiBase}/papers/${paperId}`);
+      if (!workspaceGate.isCurrent(requestId)) return;
+      setWorkspace(nextWorkspace);
+      setSelectedQuestionId((current) => {
+        if (preferredQuestionId && nextWorkspace.questions.some((question) => question.id === preferredQuestionId)) {
+          return preferredQuestionId;
+        }
+        if (current && nextWorkspace.questions.some((question) => question.id === current)) {
+          return current;
+        }
+        return nextWorkspace.questions[0]?.id || null;
+      });
+      if (sectionFilter !== "all" && !nextWorkspace.sections.some((section) => String(section.id) === sectionFilter)) {
+        setSectionFilter("all");
+      }
+    } catch (err) {
+      if (!workspaceGate.isCurrent(requestId)) return;
+      setWorkspace(null);
+      setSelectedQuestionId(null);
+      setWorkspaceError(toErrorMessage(err, "加载题目解析工作台失败"));
+    } finally {
+      if (workspaceGate.isCurrent(requestId)) setLoadingWorkspace(false);
+    }
+  }
+
+  async function saveQuestion() {
+    if (!activeQuestion) return;
+    setSaving(true);
+    setActionMessage("");
+    setWorkspaceError("");
+    try {
+      const payload: PaperReviewQuestionUpdateRequest = {
+        question_type: draft.questionType.trim(),
+        stem_text: draft.stemText,
+        options_json: draft.options,
+        answer_text: draft.answerText,
+        analysis_text: draft.analysisText,
+        review_status: draft.reviewStatus,
+        review_note: draft.reviewNote,
+      };
+      const nextQuestion = await apiFetch<PaperReviewQuestionResponse>(`${paperReviewApiBase}/questions/${activeQuestion.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      });
+      replaceQuestion(nextQuestion);
+      setActionMessage("人工审核已保存。");
+    } catch (err) {
+      setWorkspaceError(toErrorMessage(err, "保存题目失败"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveKnowledgePoints() {
+    if (!activeQuestion) return;
+    setSavingKnowledgePoints(true);
+    setActionMessage("");
+    setWorkspaceError("");
+    try {
+      const payload: PaperReviewQuestionKnowledgePointUpdateRequest = {
+        suggested: draft.suggestedKnowledgePointIds
+          .filter((id) => !draft.confirmedKnowledgePointIds.includes(id))
+          .map((knowledgePointId, index) => ({
+            knowledge_point_id: knowledgePointId,
+            relation_type: "secondary",
+            source: "manual",
+            rank: index + 1,
+          })),
+        confirmed: draft.confirmedKnowledgePointIds.map((knowledgePointId, index) => ({
+          knowledge_point_id: knowledgePointId,
+          relation_type: draft.primaryKnowledgePointId === knowledgePointId ? "primary" : "secondary",
+          source: "manual",
+          rank: index + 1,
+        })),
+      };
+      const nextQuestion = await apiFetch<PaperReviewQuestionResponse>(`${paperReviewApiBase}/questions/${activeQuestion.id}/knowledge-points`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      replaceQuestion(nextQuestion);
+      setActionMessage("考点标注已保存。");
+    } catch (err) {
+      setWorkspaceError(toErrorMessage(err, "保存考点标注失败"));
+    } finally {
+      setSavingKnowledgePoints(false);
+    }
+  }
+
+  async function rebuildQuestions() {
+    if (!selectedPaperId) return;
+    setRebuilding(true);
+    setActionMessage("");
+    setWorkspaceError("");
+    try {
+      const result = await apiFetch<{ message: string }>(`${paperReviewApiBase}/papers/${selectedPaperId}/rebuild`, {
+        method: "POST",
+      });
+      await loadWorkspace(selectedPaperId);
+      setActionMessage(result.message);
+    } catch (err) {
+      setWorkspaceError(toErrorMessage(err, "重建题目失败"));
+    } finally {
+      setRebuilding(false);
+    }
+  }
+
+  async function autoTagQuestions() {
+    if (!selectedPaperId) return;
+    setAutoTagging(true);
+    setActionMessage("");
+    setWorkspaceError("");
+    setAutoTagProgress(null);
+    try {
+      const result = await apiFetch<PaperReviewAutoTagJobResponse>(`${paperReviewApiBase}/papers/${selectedPaperId}/auto-tag`, {
+        method: "POST",
+      });
+      (window as typeof window & { __paperReviewAutoTagJobId?: number }).__paperReviewAutoTagJobId = result.job_id;
+      setAutoTagProgress({
+        paper_id: result.paper_id,
+        status: result.status,
+        progress: result.progress,
+        requested_count: 0,
+        updated_count: 0,
+        failed_count: 0,
+        skipped_count: 0,
+        message: "自动标注任务已启动。",
+      });
+    } catch (err) {
+      setWorkspaceError(toErrorMessage(err, "自动考点标注失败"));
+      setAutoTagging(false);
+    } finally {
+      // Keep polling until job completion.
+    }
+  }
+
+  async function autoTagCurrentQuestion() {
+    if (!activeQuestion || !selectedPaperId) return;
+    setAutoTaggingQuestionId(activeQuestion.id);
+    setActionMessage("");
+    setWorkspaceError("");
+    setAutoTagProgress(null);
+    try {
+      const result = await apiFetch<PaperReviewAutoTagJobResponse>(`${paperReviewApiBase}/questions/${activeQuestion.id}/auto-tag`, {
+        method: "POST",
+      });
+      (window as typeof window & { __paperReviewAutoTagJobId?: number }).__paperReviewAutoTagJobId = result.job_id;
+      setAutoTagProgress({
+        paper_id: result.paper_id,
+        status: result.status,
+        progress: result.progress,
+        requested_count: 0,
+        updated_count: 0,
+        failed_count: 0,
+        skipped_count: 0,
+        message: "当前题自动标注任务已启动。",
+      });
+    } catch (err) {
+      setWorkspaceError(toErrorMessage(err, "当前题自动考点标注失败"));
+      setAutoTaggingQuestionId(null);
+    } finally {
+      // Keep polling until job completion.
+    }
+  }
+
+  async function runAiStandardize() {
+    if (!activeQuestion) return;
+    setStandardizingId(activeQuestion.id);
+    setActionMessage("");
+    setWorkspaceError("");
+    try {
+      const result = await apiFetch<PaperReviewAIActionResponse>(`${paperReviewApiBase}/questions/${activeQuestion.id}/ai-standardize`, {
+        method: "POST",
+      });
+      replaceQuestion(result.question);
+      setActionMessage(result.message);
+    } catch (err) {
+      setWorkspaceError(toErrorMessage(err, "AI 标准化失败"));
+    } finally {
+      setStandardizingId(null);
+    }
+  }
+
+  async function runAiReview() {
+    if (!activeQuestion) return;
+    setReviewingId(activeQuestion.id);
+    setActionMessage("");
+    setWorkspaceError("");
+    try {
+      const result = await apiFetch<PaperReviewAIActionResponse>(`${paperReviewApiBase}/questions/${activeQuestion.id}/ai-review`, {
+        method: "POST",
+      });
+      replaceQuestion(result.question);
+      setActionMessage(result.message);
+    } catch (err) {
+      setWorkspaceError(toErrorMessage(err, "AI 审核失败"));
+    } finally {
+      setReviewingId(null);
+    }
+  }
+
+  function replaceQuestion(nextQuestion: PaperReviewQuestionResponse) {
+    setWorkspace((current) => {
+      if (!current) return current;
+      const nextQuestions = current.questions.map((question) => (question.id === nextQuestion.id ? nextQuestion : question));
+      return {
+        ...current,
+        paper: {
+          ...current.paper,
+          total_question_count: nextQuestions.length,
+          question_review_count: nextQuestions.length,
+        },
+        summary: summarizeQuestions(nextQuestions),
+        questions: nextQuestions,
+      };
     });
+    setSelectedQuestionId(nextQuestion.id);
   }
 
-  function setPrimaryLink(linkId: number) {
-    setPrimaryLinkId(linkId);
-    setSelectedLinkIds((current) => (current.includes(linkId) ? current : [...current, linkId]));
+  function syncPaperQuery(paperId: number | null) {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    if (paperId) {
+      url.searchParams.set("paperId", String(paperId));
+    } else {
+      url.searchParams.delete("paperId");
+    }
+    window.history.replaceState({}, "", url.toString());
   }
-
-  function toggleAllPendingKnowledgeLinks() {
-    if (!selected) return;
-    const pendingIds = selected.links.filter((link) => link.review_status === "pending").map((link) => link.id);
-    if (!pendingIds.length) return;
-    const allSelected = pendingIds.every((id) => selectedLinkIds.includes(id));
-    if (allSelected) {
-      setSelectedLinkIds((current) => current.filter((id) => !pendingIds.includes(id)));
-      if (primaryLinkId && pendingIds.includes(primaryLinkId)) {
-        setPrimaryLinkId(null);
-      }
-      return;
-    }
-    setSelectedLinkIds((current) => Array.from(new Set([...current, ...pendingIds])));
-    if (!primaryLinkId) {
-      setPrimaryLinkId(pendingIds[0]);
-    }
-  }
-
-  async function reviewKnowledgeLinks(reviewStatus: "approved" | "rejected") {
-    if (!selected) {
-      setError("请先选择题目");
-      return;
-    }
-    if (!selectedLinkIds.length) {
-      setError("请先选择需要审核的候选考点");
-      return;
-    }
-    if (reviewStatus === "approved" && !primaryLinkId) {
-      setError("请先指定一个主考点");
-      return;
-    }
-    setKnowledgeReviewing(true);
-    setError("");
-    setKnowledgeActionMessage("");
-    try {
-      const result = await apiFetch<QuestionKnowledgeReviewResponse>(`/api/questions/${selected.id}/knowledge-links/review`, {
-        method: "POST",
-        body: JSON.stringify({
-          link_ids: selectedLinkIds,
-          review_status: reviewStatus,
-          primary_link_id: reviewStatus === "approved" ? primaryLinkId : null,
-        }),
-      });
-      await refreshQuestions(selected.id);
-      setKnowledgeActionMessage(
-        reviewStatus === "approved"
-          ? `已确认 ${result.updated_count} 条候选考点，并更新主考点。`
-          : `已退回 ${result.updated_count} 条候选考点。`,
-      );
-    } catch (err) {
-      setError(toErrorMessage(err, "候选考点审核失败"));
-    } finally {
-      setKnowledgeReviewing(false);
-    }
-  }
-
-  async function aiReviewKnowledgeLinks() {
-    if (!selected) {
-      setError("请先选择题目");
-      return;
-    }
-    if (!selectedLinkIds.length) {
-      setError("请先选择需要 AI 审核的候选考点");
-      return;
-    }
-    setAiKnowledgeReviewing(true);
-    setError("");
-    setKnowledgeActionMessage("");
-    try {
-      const result = await apiFetch<QuestionAiKnowledgeReviewResponse>(`/api/questions/${selected.id}/knowledge-links/ai-review`, {
-        method: "POST",
-        body: JSON.stringify({ link_ids: selectedLinkIds }),
-      });
-      await refreshQuestions(selected.id);
-      setKnowledgeActionMessage(result.message);
-    } catch (err) {
-      setError(toErrorMessage(err, "AI考点审核失败"));
-    } finally {
-      setAiKnowledgeReviewing(false);
-    }
-  }
-
-  async function retagSelectedQuestion() {
-    if (!selected) return;
-    setRetagging(true);
-    setError("");
-    setKnowledgeActionMessage("");
-    try {
-      const result = await apiFetch<QuestionRetagResponse>(`/api/questions/${selected.id}/retag`, {
-        method: "POST",
-      });
-      await refreshQuestions(selected.id);
-      setKnowledgeActionMessage(
-        `已重新召回候选考点，新增 ${result.created_links} 条，其中 AI 候选 ${result.ai_created_links} 条，当前共 ${result.total_links} 条。`,
-      );
-    } catch (err) {
-      setError(toErrorMessage(err, "重新召回候选考点失败"));
-    } finally {
-      setRetagging(false);
-    }
-  }
-
-  const pendingKnowledgeIds = selected?.links.filter((link) => link.review_status === "pending").map((link) => link.id) || [];
-  const allPendingKnowledgeSelected =
-    pendingKnowledgeIds.length > 0 && pendingKnowledgeIds.every((id) => selectedLinkIds.includes(id));
-  const availableCategories = subjectIdFilter === null
-    ? categories
-    : categories.filter((category) => category.subject_id === subjectIdFilter);
-  const availableYearPapers = papers.filter((paper) => {
-    if (paperIdFilter !== null && paper.id !== paperIdFilter) return false;
-    if (subjectIdFilter !== null && paper.subject_id !== subjectIdFilter) return false;
-    if (categoryIdFilter !== null && paper.category_id !== categoryIdFilter) return false;
-    return true;
-  });
-  const availablePapers = papers.filter((paper) => {
-    if (subjectIdFilter !== null && paper.subject_id !== subjectIdFilter) return false;
-    if (categoryIdFilter !== null && paper.category_id !== categoryIdFilter) return false;
-    if (yearFilter !== null && paper.exam_year !== yearFilter) return false;
-    return true;
-  });
-  const availableYears = Array.from(
-    new Set(availableYearPapers.map((paper) => paper.exam_year).filter((year): year is number => typeof year === "number")),
-  ).sort((left, right) => right - left);
-  const normalizedKeyword = keyword.trim().toLowerCase();
-  const visibleQuestions = normalizedKeyword
-    ? questions.filter((question) => {
-        const haystack = `${question.question_no} ${question.stem_text} ${question.question_type} ${question.review_note || ""}`.toLowerCase();
-        return haystack.includes(normalizedKeyword);
-      })
-    : questions;
-  const allVisibleSelected = visibleQuestions.length > 0 && visibleQuestions.every((item) => selectedIds.includes(item.id));
-  const selectedQuestionIndex = selected ? visibleQuestions.findIndex((item) => item.id === selected.id) : -1;
-  const previousQuestionId = selectedQuestionIndex > 0 ? visibleQuestions[selectedQuestionIndex - 1]?.id : null;
-  const nextQuestionId =
-    selectedQuestionIndex >= 0 && selectedQuestionIndex < visibleQuestions.length - 1
-      ? visibleQuestions[selectedQuestionIndex + 1]?.id
-      : null;
 
   return (
-    <>
-      <header className="pageHeader">
-        <div>
-          <h1>题目中心</h1>
-          <p suppressHydrationWarning>{pageSummary}</p>
-        </div>
-      </header>
-
-      <section className="dashboardGrid twoCol questionWorkspace">
-        <div className="panel questionPanel questionQueuePanel">
-          <div className="panelHeader">
-            <h2>原始题复核队列</h2>
-            <p>按学科、类目、年份、试卷、复核状态和题型筛选，批量推进原始题人工确认。</p>
+    <div className="questionPageShell paperReviewPageRoot">
+      <section className="paperReviewHeroCompact">
+        <div className="paperReviewHeroMain">
+          <span className="analysisEyebrow">Question Intelligence Desk</span>
+          <div>
+            <h1 className="paperReviewHeroTitle">题目解析与审核工作台</h1>
+            <p className="paperReviewHeroCaption">
+              {workspace?.paper
+                ? `${workspace.paper.paper_name} · ${workspace.summary.pending_count} 道待审 · ${workspace.summary.ai_flagged_count} 道 AI 风险提示`
+                : "逐题审核、AI 补全与标准化、答案解析复核"}
+            </p>
           </div>
-          <div className="panelBody questionQueueBody">
-            {loadWarning ? <div className="calloutBox">{loadWarning}</div> : null}
-            <div className="questionQueueControls stackList">
-              <div className="row">
-                <label className="field">
-                  <span>学科</span>
-                  <select
-                    value={subjectIdFilter === null ? "" : String(subjectIdFilter)}
-                    onChange={(event) => {
-                      const nextValue = Number(event.target.value || 0) || null;
-                      setSubjectIdFilter(nextValue);
-                      setCategoryIdFilter(null);
-                    }}
-                  >
-                    <option value="">全部</option>
-                    {subjects.map((subject) => (
-                      <option key={subject.id} value={subject.id}>
-                        {subject.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field">
-                  <span>类目</span>
-                  <select
-                    value={categoryIdFilter === null ? "" : String(categoryIdFilter)}
-                    onChange={(event) => setCategoryIdFilter(Number(event.target.value || 0) || null)}
-                  >
-                    <option value="">全部</option>
-                    {availableCategories.map((category) => (
-                      <option key={category.id} value={category.id}>
-                        {category.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field">
-                  <span>年份</span>
-                  <select value={yearFilter === null ? "" : String(yearFilter)} onChange={(event) => setYearFilter(Number(event.target.value || 0) || null)}>
-                    <option value="">全部</option>
-                    {availableYears.map((year) => (
-                      <option key={year} value={year}>
-                        {year}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field">
-                  <span>试卷</span>
-                  <select value={paperIdFilter === null ? "" : String(paperIdFilter)} onChange={(event) => setPaperIdFilter(Number(event.target.value || 0) || null)}>
-                    <option value="">全部</option>
-                    {availablePapers.map((paper) => (
-                      <option key={paper.id} value={paper.id}>
-                        {paper.paper_name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-
-              <div className="row">
-                <label className="field">
-                  <span>复核状态</span>
-                  <select value={reviewStatusFilter} onChange={(event) => setReviewStatusFilter(event.target.value as ReviewStatusFilter)}>
-                    <option value="all">全部</option>
-                    <option value="pending">待复核</option>
-                    <option value="approved">已通过</option>
-                    <option value="rejected">已退回</option>
-                    <option value="needs_revision">待修订</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span>题型</span>
-                  <select value={questionTypeFilter} onChange={(event) => setQuestionTypeFilter(event.target.value as QuestionTypeFilter)}>
-                    <option value="all">全部</option>
-                    <option value="single_choice">单选题</option>
-                    <option value="multiple_choice">多选题</option>
-                    <option value="judge">判断题</option>
-                    <option value="fill_blank">填空题</option>
-                    <option value="short_answer">简答题</option>
-                    <option value="calculation">计算题</option>
-                    <option value="case_analysis">案例分析题</option>
-                    <option value="material_analysis">材料分析题</option>
-                    <option value="composite">综合题</option>
-                  </select>
-                </label>
-              </div>
-
-              <div className="questionQueueStats">
-                <div className="questionMiniStat">
-                  <span>当前结果</span>
-                  <strong>{visibleQuestions.length}</strong>
-                </div>
-                <div className="questionMiniStat">
-                  <span>已选题目</span>
-                  <strong>{selectedIds.length}</strong>
-                </div>
-              </div>
-
-              <label className="field">
-                <span>题目搜索</span>
-                <input
-                  type="search"
-                  value={keyword}
-                  onChange={(event) => setKeyword(event.target.value)}
-                  placeholder="搜索题号、题干关键词、题型或备注"
-                />
-              </label>
-
-              <div className="questionQueueSecondary">
-                <label className="field">
-                  <span>复核备注</span>
-                  <textarea value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} rows={3} placeholder="可选：记录退回原因、修订要求或通过说明" />
-                </label>
-                <label className="field">
-                  <span>AI并发数</span>
-                  <input
-                    type="number"
-                    min="1"
-                    max="20"
-                    value={aiConcurrency}
-                    onChange={(event) => setAiConcurrency(event.target.value)}
-                    placeholder="默认 3"
-                  />
-                </label>
-              </div>
-
-              <div className="buttonRow">
-                <button className="button" type="button" onClick={toggleAllCurrent} disabled={!visibleQuestions.length}>
-                  {allVisibleSelected ? "取消全选当前列表" : "全选当前列表"}
-                </button>
-                <button className="button primary" type="button" onClick={() => aiProcessQuestions(selectedIds)} disabled={aiProcessing || !selectedIds.length}>
-                  {aiProcessing ? "AI综合处理中..." : "批量AI综合处理"}
-                </button>
-                <button className="button" type="button" onClick={() => aiCompleteQuestions(selectedIds)} disabled={aiCompleting || aiProcessing || !selectedIds.length}>
-                  {aiCompleting ? "AI补全中..." : "批量AI补全"}
-                </button>
-                <button className="button" type="button" onClick={() => aiReviewQuestions(selectedIds)} disabled={aiReviewing || aiProcessing || !selectedIds.length}>
-                  {aiReviewing ? "AI复核中..." : "批量AI复核"}
-                </button>
-                <button className="button primary" type="button" onClick={() => batchReview("approved")} disabled={reviewing || !selectedIds.length}>
-                  {reviewing ? "处理中..." : "批量通过"}
-                </button>
-                <button className="button" type="button" onClick={() => batchReview("needs_revision")} disabled={reviewing || !selectedIds.length}>
-                  标记待修订
-                </button>
-                <button className="button" type="button" onClick={() => batchReview("rejected")} disabled={reviewing || !selectedIds.length}>
-                  批量退回
-                </button>
-              </div>
-
-              {actionMessage ? <div className="calloutBox">{actionMessage}</div> : null}
-              {aiActionMessage ? <div className="calloutBox">{aiActionMessage}</div> : null}
+        </div>
+        <div className="paperReviewHeroActions">
+          {workspace && (
+            <div className="paperReviewHeroBadges">
+              <StatusBadge value={`待审 ${workspace.summary.pending_count}`} tone="warn" />
+              <StatusBadge value={`缺答案/解析 ${workspace.summary.missing_solution_count}`} tone="info" />
             </div>
+          )}
+          <div className="buttonRow">
+            <Link className="button" href="/analysis/papers">
+              返回试卷中心
+            </Link>
+            {selectedPaperId && (
+              <button className="button primary" type="button" onClick={rebuildQuestions} disabled={rebuilding}>
+                <RefreshCw size={16} aria-hidden />
+                <span>{rebuilding ? "重建中..." : "重新切分同步"}</span>
+              </button>
+            )}
+            {selectedPaperId && (
+              <button className="button" type="button" onClick={autoTagQuestions} disabled={autoTagging}>
+                <Sparkles size={16} aria-hidden />
+                <span>{autoTagging ? "标注中..." : "自动标注未标注题"}</span>
+              </button>
+            )}
+          </div>
+        </div>
+      </section>
 
-            <div className="questionQueueListHeader">
-              <strong>题目列表</strong>
-              <span className="muted">{visibleQuestions.length ? `共 ${visibleQuestions.length} 道，点击切换右侧详情` : "当前筛选下暂无题目"}</span>
+      <section className="panel questionWorkbenchPanel">
+        <div className="panelHeader">
+          <div className="questionWorkbenchHeader">
+            <div>
+              <h2>
+                <Orbit size={18} aria-hidden />
+                审核编排
+              </h2>
             </div>
-
-            <div className="questionQueueList">
-              <LoadState loading={loading} error={error} empty={!visibleQuestions.length} emptyLabel="当前筛选条件下暂无题目" />
-
-              {!!visibleQuestions.length && (
-                <div className="stackList">
-                  {visibleQuestions.map((question) => {
-                    const checked = selectedIds.includes(question.id);
-                    const active = selected?.id === question.id;
-                    return (
-                      <div key={question.id} className="selectableRow questionSelectableRow">
-                        <label className="rowCheck" aria-label={`选择题目 ${question.question_no}`}>
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={() => toggleQuestion(question.id)}
-                          />
-                        </label>
-                        <button className={`listButton questionListButton${active ? " active" : ""}`} type="button" onClick={() => pickQuestion(question.id)}>
-                          <div className="questionListContent">
-                            <strong className="questionListTitle">
-                              {question.question_no}. {question.stem_text}
-                            </strong>
-                            <span className="muted questionListMeta">
-                              {questionTypeLabel(question.question_type)} · 难度 {question.difficulty_level || "-"} · {question.score || 0} 分 · {question.parse_status}
-                            </span>
-                            {question.source_label ? <span className="muted questionListNote">来源：{question.source_label}</span> : null}
-                            {question.review_note ? <span className="muted questionListNote">备注：{question.review_note}</span> : null}
-                          </div>
-                          <div className="questionListBadges">
-                            <StatusBadge value={questionReviewLabel(question.review_status)} tone={questionTone(question.review_status)} />
-                            {checked ? <span className="badge">已选</span> : null}
-                          </div>
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
+            <div className="questionWorkbenchHeaderMeta">
+              {workspace && (
+                <>
+                  <StatusBadge value={`${workspace.paper.question_review_count} 道题`} tone="info" />
+                  <StatusBadge value={`人工通过 ${workspace.summary.approved_count}`} tone="good" />
+                  <StatusBadge value={`待修订 ${workspace.summary.needs_revision_count}`} tone="warn" />
+                </>
               )}
             </div>
           </div>
         </div>
+        <div className="panelBody questionWorkbenchBody">
+          <div className="questionWorkbenchPrimary">
+            <label className="field questionPaperField">
+              <span>试卷</span>
+              <select
+                value={selectedPaperId ? String(selectedPaperId) : ""}
+                onChange={(event) => {
+                  setSelectedPaperId(Number(event.target.value) || null);
+                  setActionMessage("");
+                }}
+                disabled={loadingPapers || !papers.length}
+              >
+                {!papers.length && <option value="">暂无试卷</option>}
+                {papers.map((paper) => (
+                  <option key={paper.id} value={paper.id}>
+                    {paper.paper_name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field questionSearchField">
+              <span>关键词搜索</span>
+              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="题干、答案、解析、题号" />
+            </label>
+            <label className="field">
+              <span>人工审核</span>
+              <select value={reviewFilter} onChange={(event) => setReviewFilter(event.target.value as typeof reviewFilter)}>
+                {reviewStatusOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>AI 审核</span>
+              <select value={aiFilter} onChange={(event) => setAiFilter(event.target.value as typeof aiFilter)}>
+                {aiStatusOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>分区</span>
+              <select value={sectionFilter} onChange={(event) => setSectionFilter(event.target.value)}>
+                <option value="all">全部分区</option>
+                {(workspace?.sections || []).map((section) => (
+                  <option key={section.id} value={section.id}>
+                    {section.section_name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          {autoTagProgress && (
+            <div className="calloutBox">
+              {autoTagProgress.message}
+              {` 进度 ${autoTagProgress.progress}% · 共 ${autoTagProgress.requested_count} 题，已完成 ${autoTagProgress.updated_count + autoTagProgress.failed_count}，成功 ${autoTagProgress.updated_count}，失败 ${autoTagProgress.failed_count}，跳过 ${autoTagProgress.skipped_count}。`}
+            </div>
+          )}
+          {actionMessage && <div className="calloutBox">{actionMessage}</div>}
+          {workspaceError && <div className="errorPanel">{workspaceError}</div>}
+        </div>
+      </section>
 
-        <div className="panel questionPanel questionDetailPanel">
+      <section className="dashboardGrid twoCol questionWorkspace">
+        <article className="panel questionPanel questionQueuePanel">
           <div className="panelHeader">
-            <h2>题目详情与考点审核</h2>
-            <p>查看题干、答案、解析和候选考点，并人工指定主考点或退回不合适候选。</p>
+            <div className="questionQueueListHeader">
+              <div className="questionQueueListLead">
+                <h2>题目队列</h2>
+                {workspace && <p>{`${filteredQuestions.length} / ${workspace.questions.length} 道题`}</p>}
+              </div>
+              <div className="questionQueueListHeaderActions">
+                {workspace?.paper.id ? (
+                  <Link className="button small" href={`/analysis/papers?paperId=${workspace.paper.id}`}>
+                    试卷详情
+                  </Link>
+                ) : null}
+              </div>
+            </div>
+          </div>
+          <div className="panelBody questionQueueBody">
+            <div className="questionQueueStats">
+              <div className="questionMiniStat">
+                <span>待人工审核</span>
+                <strong>{workspace?.summary.pending_count || 0}</strong>
+              </div>
+              <div className="questionMiniStat">
+                <span>AI 标记风险</span>
+                <strong>{workspace?.summary.ai_flagged_count || 0}</strong>
+              </div>
+              <div className="questionMiniStat">
+                <span>缺答案/解析</span>
+                <strong>{workspace?.summary.missing_solution_count || 0}</strong>
+              </div>
+              <div className="questionMiniStat">
+                <span>人工通过率</span>
+                <strong>{formatRate(workspace?.summary)}</strong>
+              </div>
+            </div>
+            <LoadState
+              loading={loadingPapers || loadingWorkspace}
+              error={error}
+              empty={!loadingPapers && !loadingWorkspace && !papers.length}
+              emptyLabel="暂无试卷，请先到试卷中心上传并切题"
+            />
+            {!error && (
+              <div className="questionQueueList">
+                {filteredQuestions.map((question) => {
+                  const active = question.id === activeQuestion?.id;
+                  return (
+                    <div key={question.id} className="selectableRow questionSelectableRow">
+                      <button
+                        className={active ? "listButton questionListButton active paperReviewQueueCard" : "listButton questionListButton paperReviewQueueCard"}
+                        type="button"
+                        onClick={() => setSelectedQuestionId(question.id)}
+                      >
+                        <div className="questionListContent">
+                          <div className="paperReviewQueueTop">
+                            <strong className="questionListTitle">第 {question.question_no || question.sort_order} 题</strong>
+                            <div className="paperReviewQueueMetaLine">
+                              <span className="paperReviewQuestionLabel">{questionTypeLabel(question.question_type)}</span>
+                              <StatusBadge value={reviewStatusLabel(question.review_status)} tone={reviewTone(question.review_status)} />
+                              {question.ai_review_status ? (
+                                <StatusBadge value={`AI ${reviewStatusLabel(question.ai_review_status)}`} tone={aiTone(question.ai_review_status)} />
+                              ) : (
+                                <StatusBadge value="AI 未审" tone="info" />
+                              )}
+                              <StatusBadge value={`质检 ${formatScore(question.quality_score)}`} tone="info" />
+                            </div>
+                          </div>
+                          <span
+                            className="questionListNote paperPreviewHtml"
+                            dangerouslySetInnerHTML={{ __html: renderDocumentPreviewHtml(question.stem_text) }}
+                          />
+                        </div>
+                      </button>
+                    </div>
+                  );
+                })}
+                {!loadingWorkspace && !!papers.length && !filteredQuestions.length && (
+                  <div className="empty compact">当前筛选下没有题目</div>
+                )}
+              </div>
+            )}
+          </div>
+        </article>
+
+        <article className="panel questionPanel questionDetailPanel">
+          <div className="panelHeader">
+              <div className="questionDetailSummary">
+                <div>
+                  <h2>题目详情</h2>
+                  {activeQuestion && (
+                    <p className="questionDetailLead">
+                      {`${activeQuestion.source_section_name} · 第 ${activeQuestion.question_no} 题 · ${questionTypeLabel(activeQuestion.question_type)}`}
+                    </p>
+                  )}
+                </div>
+              <div className="questionDetailSummaryBadges">
+                {activeQuestion && (
+                  <>
+                    <StatusBadge value={reviewStatusLabel(activeQuestion.review_status)} tone={reviewTone(activeQuestion.review_status)} />
+                    <StatusBadge
+                      value={activeQuestion.ai_review_status ? `AI ${reviewStatusLabel(activeQuestion.ai_review_status)}` : "AI 未审"}
+                      tone={activeQuestion.ai_review_status ? aiTone(activeQuestion.ai_review_status) : "info"}
+                    />
+                  </>
+                )}
+              </div>
+            </div>
           </div>
           <div className="panelBody questionDetailBody">
-            <LoadState loading={loading} error={error} empty={!selected} emptyLabel="请选择一道题目" />
-            {selected && (
-              <>
+            <LoadState
+              loading={loadingWorkspace}
+              error={workspaceError}
+              empty={!loadingWorkspace && !activeQuestion}
+              emptyLabel="请选择一道题目"
+            />
+            {activeQuestion && (
+              <div className="questionDetailWorkspace">
                 <div className="questionDetailSticky">
-                  <div className="questionDetailSummary">
-                    <div>
-                      <strong>第 {selected.question_no} 题</strong>
-                      <p className="muted questionDetailLead">{selected.stem_text}</p>
-                    </div>
-                    <div className="questionDetailSummaryBadges">
-                      <StatusBadge value={questionReviewLabel(selected.review_status)} tone={questionTone(selected.review_status)} />
-                      <StatusBadge value={questionTypeLabel(selected.question_type)} tone="info" />
-                    </div>
-                  </div>
                   <div className="questionDetailNav">
-                    <button className="button" type="button" onClick={() => previousQuestionId && pickQuestion(previousQuestionId)} disabled={!previousQuestionId}>
-                      上一题
-                    </button>
-                    <span className="muted">{visibleQuestions.length ? `${Math.max(selectedQuestionIndex + 1, 1)} / ${visibleQuestions.length}` : "0 / 0"}</span>
-                    <button className="button" type="button" onClick={() => nextQuestionId && pickQuestion(nextQuestionId)} disabled={!nextQuestionId}>
-                      下一题
-                    </button>
-                  </div>
-                  <div className="buttonRow">
-                    <button
-                      className="button primary"
-                      type="button"
-                      onClick={() => aiProcessQuestions([selected.id])}
-                      disabled={aiProcessing}
-                    >
-                      {aiProcessingIds.includes(selected.id) ? "AI综合处理中..." : "对当前题AI综合处理"}
+                    <button className="button primary" type="button" onClick={saveQuestion} disabled={saving}>
+                      <ShieldCheck size={16} aria-hidden />
+                      <span>{saving ? "保存中..." : "保存人工审核"}</span>
                     </button>
                     <button
                       className="button"
                       type="button"
-                      onClick={() => aiCompleteQuestions([selected.id])}
-                      disabled={aiCompleting || aiProcessing}
+                      onClick={saveKnowledgePoints}
+                      disabled={savingKnowledgePoints}
                     >
-                      {aiCompletingIds.includes(selected.id) ? "AI补全中..." : "对当前题AI补全"}
+                      <Sparkles size={16} aria-hidden />
+                      <span>{savingKnowledgePoints ? "保存中..." : "保存考点标注"}</span>
                     </button>
                     <button
                       className="button"
                       type="button"
-                      onClick={() => aiReviewQuestions([selected.id])}
-                      disabled={aiReviewing || aiProcessing}
+                      onClick={autoTagCurrentQuestion}
+                      disabled={autoTaggingQuestionId === activeQuestion.id}
                     >
-                      {aiReviewing ? "AI复核中..." : "对当前题AI复核"}
+                      <Sparkles size={16} aria-hidden />
+                      <span>{autoTaggingQuestionId === activeQuestion.id ? "标注中..." : "自动标注当前题"}</span>
                     </button>
-                  </div>
-                  <div className="tabs questionDetailTabs" role="tablist" aria-label="题目详情标签">
-                    <button className={`tab${detailTab === "content" ? " active" : ""}`} type="button" onClick={() => setDetailTab("content")}>
-                      题目内容
+                    <button
+                      className="button"
+                      type="button"
+                      onClick={runAiStandardize}
+                      disabled={standardizingId === activeQuestion.id}
+                    >
+                      <Wand2 size={16} aria-hidden />
+                      <span>{standardizingId === activeQuestion.id ? "AI 处理中..." : "AI 补全与标准化"}</span>
                     </button>
-                    <button className={`tab${detailTab === "analysis" ? " active" : ""}`} type="button" onClick={() => setDetailTab("analysis")}>
-                      答案解析
-                    </button>
-                    <button className={`tab${detailTab === "knowledge" ? " active" : ""}`} type="button" onClick={() => setDetailTab("knowledge")}>
-                      考点审核
+                    <button
+                      className="button"
+                      type="button"
+                      onClick={runAiReview}
+                      disabled={reviewingId === activeQuestion.id}
+                    >
+                      <Bot size={16} aria-hidden />
+                      <span>{reviewingId === activeQuestion.id ? "AI 审核中..." : "AI 答案审核"}</span>
                     </button>
                   </div>
                 </div>
 
                 <div className="questionDetailScroll">
-                  {detailTab === "content" ? (
-                    <div className="questionDetailSection">
-                      <div className="detailRow">
-                        <span>复核备注</span>
-                        <strong>{selected.review_note || "-"}</strong>
-                      </div>
-                      <div className="questionMetaGrid">
-                        <div className="questionMetaCard">
-                          <span>来源标识</span>
-                          <strong>{selected.source_label || "-"}</strong>
+                  <div className="questionDetailSection paperReviewDetailGrid">
+                    <section className="paperReviewEditorStack">
+                      <div className="infoCard">
+                        <div className="infoCardTop">
+                          <strong>题干与作答信息</strong>
+                          <BrainCircuit size={18} aria-hidden />
                         </div>
-                        <div className="questionMetaCard">
-                          <span>来源试卷</span>
-                          <strong>{selected.paper_name || "-"}</strong>
-                        </div>
-                        <div className="questionMetaCard">
-                          <span>年份 / 地区</span>
-                          <strong>{selected.source_year || "-"} / {selected.source_region || "-"}</strong>
-                        </div>
-                        <div className="questionMetaCard">
-                          <span>题型</span>
-                          <strong>{questionTypeLabel(selected.question_type)}</strong>
-                        </div>
-                        <div className="questionMetaCard">
-                          <span>分值 / 难度</span>
-                          <strong>{selected.score || 0} 分 · 难度 {selected.difficulty_level || "-"}</strong>
-                        </div>
-                        <div className="questionMetaCard">
-                          <span>页码范围</span>
-                          <strong>{selected.source_page_from || "-"} - {selected.source_page_to || "-"}</strong>
-                        </div>
-                        <div className="questionMetaCard">
-                          <span>解析状态</span>
-                          <strong>{selected.parse_status}</strong>
-                        </div>
-                      </div>
-                      <div className="questionCard">
-                        <strong>
-                          {selected.question_no}. {selected.stem_text}
-                        </strong>
-                        {selected.options_json?.length ? (
-                          <ul className="plainList">
-                            {selected.options_json.map((option, index) => (
-                              <li key={`${selected.id}-${index}`}>{option}</li>
-                            ))}
-                          </ul>
-                        ) : null}
-                      </div>
-                    </div>
-                  ) : null}
-
-                  {detailTab === "analysis" ? (
-                    <div className="questionDetailSection">
-                      <div className="questionMetaGrid">
-                        <div className="questionMetaCard">
-                          <span>标准答案</span>
-                          <strong>{selected.answer_text || "-"}</strong>
-                        </div>
-                        <div className="questionMetaCard">
-                          <span>质量分</span>
-                          <strong>{selected.quality_score || "-"}</strong>
-                        </div>
-                      </div>
-                      <div className="questionCard">
-                        <strong>答案与解析</strong>
-                        <p>{selected.analysis_text || "暂无解析"}</p>
-                      </div>
-                    </div>
-                  ) : null}
-
-                  {detailTab === "knowledge" ? (
-                    <div className="questionDetailSection subsection">
-                      <div className="panelHeaderActions">
-                        <div>
-                          <strong>候选考点审核</strong>
-                          <p className="muted" style={{ margin: "6px 0 0" }}>
-                            当前共 {selected.links.length} 条映射，其中待审核 {pendingKnowledgeIds.length} 条。
-                          </p>
-                        </div>
-                        <button className="button" type="button" onClick={retagSelectedQuestion} disabled={retagging}>
-                          {retagging ? "召回中..." : "重新召回候选"}
-                        </button>
-                      </div>
-
-                      {knowledgeActionMessage ? <div className="calloutBox">{knowledgeActionMessage}</div> : null}
-
-                      {!selected.links.length ? (
-                        <div className="calloutBox">当前题目还没有候选考点，可先执行“重新召回候选”生成规则候选，再继续人工审核。</div>
-                      ) : (
-                        <>
-                          <div className="buttonRow">
-                            <button className="button" type="button" onClick={toggleAllPendingKnowledgeLinks} disabled={!pendingKnowledgeIds.length}>
-                              {allPendingKnowledgeSelected ? "取消全选待审核候选" : "全选待审核候选"}
-                            </button>
-                            <button
-                              className="button"
-                              type="button"
-                              onClick={aiReviewKnowledgeLinks}
-                              disabled={aiKnowledgeReviewing || !selectedLinkIds.length}
-                            >
-                              {aiKnowledgeReviewing ? "AI审核中..." : "AI审核候选"}
-                            </button>
-                            <button
-                              className="button primary"
-                              type="button"
-                              onClick={() => reviewKnowledgeLinks("approved")}
-                              disabled={knowledgeReviewing || !selectedLinkIds.length}
-                            >
-                              {knowledgeReviewing ? "处理中..." : "确认候选考点"}
-                            </button>
-                            <button
-                              className="button"
-                              type="button"
-                              onClick={() => reviewKnowledgeLinks("rejected")}
-                              disabled={knowledgeReviewing || !selectedLinkIds.length}
-                            >
-                              退回候选
-                            </button>
+                        <div className="paperReviewComposeBoard">
+                          <div className="paperReviewMetaBar" aria-label="题目元信息">
+                            <label className="field paperReviewInlineField">
+                              <span>题型</span>
+                              <select
+                                value={draft.questionType}
+                                onChange={(event) => setDraft((current) => ({ ...current, questionType: event.target.value }))}
+                              >
+                                {questionTypeOptions.map((option) => (
+                                  <option key={option} value={option}>
+                                    {questionTypeLabel(option)}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className="field paperReviewInlineField">
+                              <span>答案</span>
+                              <input
+                                value={draft.answerText}
+                                onChange={(event) => setDraft((current) => ({ ...current, answerText: event.target.value }))}
+                                placeholder="A / AC / 正确"
+                              />
+                            </label>
+                            <label className="field paperReviewInlineField">
+                              <span>审核状态</span>
+                              <select
+                                value={draft.reviewStatus}
+                                onChange={(event) => setDraft((current) => ({ ...current, reviewStatus: event.target.value as DraftState["reviewStatus"] }))}
+                              >
+                                {reviewStatusOptions.filter((option) => option.value !== "all").map((option) => (
+                                  <option key={option.value} value={option.value}>
+                                    {option.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className="field paperReviewInlineField">
+                              <span>结构质量</span>
+                              <input className="paperReviewReadonlyInput" value={formatScore(activeQuestion.quality_score)} readOnly />
+                            </label>
+                            <label className="field paperReviewInlineField">
+                              <span>子问数量</span>
+                              <input className="paperReviewReadonlyInput" value={String(activeQuestion.subquestion_count || 0)} readOnly />
+                            </label>
                           </div>
-
-                          <div className="metricTable">
-                            {selected.links.map((link) => {
-                              const checked = selectedLinkIds.includes(link.id);
-                              const canSetPrimary = checked && link.review_status !== "rejected";
-                              return (
-                                <div
-                                  key={link.id}
-                                  className="metricRow"
-                                  style={{
-                                    alignItems: "flex-start",
-                                    borderColor: checked ? "#9ecbc6" : undefined,
-                                    boxShadow: checked ? "0 0 0 3px rgba(15, 118, 110, 0.08)" : undefined,
-                                  }}
+                          <div className="paperReviewComposeMain">
+                            <label className="field">
+                              <span>题干</span>
+                              <AutoResizeTextarea
+                                className="paperReviewAdaptiveTextarea paperReviewStemTextarea"
+                                minRows={4}
+                                value={draft.stemText}
+                                onChange={(event) => setDraft((current) => ({ ...current, stemText: event.target.value }))}
+                              />
+                            </label>
+                            <div className="paperReviewOptionList">
+                              <div className="paperReviewOptionHeader">
+                                <strong>选项</strong>
+                                <button
+                                  className="button small"
+                                  type="button"
+                                  onClick={() => setDraft((current) => ({ ...current, options: [...current.options, ""] }))}
                                 >
-                                  <div style={{ display: "grid", gap: 8, flex: "1 1 auto", minWidth: 0 }}>
-                                    <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-                                      <input type="checkbox" checked={checked} onChange={() => toggleKnowledgeLink(link.id)} />
-                                      <div style={{ minWidth: 0 }}>
-                                        <strong>{link.knowledge_point_name || `考点 #${link.knowledge_point_id}`}</strong>
-                                        <span className="muted">{link.evidence_text || "暂无证据片段"}</span>
-                                      </div>
-                                    </div>
-                                    <div className="metaLine">
-                                      <span>类型：{link.link_type}</span>
-                                      <span>来源：{link.tag_source || "-"}</span>
-                                      <span>置信度：{link.confidence_score ?? "-"}</span>
-                                    </div>
-                                    <label className="checkLine" style={{ marginTop: 0 }}>
-                                      <input
-                                        type="radio"
-                                        name="primaryKnowledgeLink"
-                                        checked={primaryLinkId === link.id}
-                                        disabled={!canSetPrimary}
-                                        onChange={() => setPrimaryLink(link.id)}
-                                      />
-                                      <span>设为主考点</span>
-                                    </label>
-                                  </div>
-                                  <div style={{ display: "grid", gap: 8, justifyItems: "end" }}>
-                                    <StatusBadge value={knowledgeReviewLabel(link.review_status)} tone={knowledgeTone(link.review_status)} />
-                                    <StatusBadge value={link.is_primary ? "主考点" : "次考点"} tone={link.is_primary ? "good" : "info"} />
-                                  </div>
+                                  新增选项
+                                </button>
+                              </div>
+                              {(draft.options.length ? draft.options : [""]).map((option, index) => (
+                                <div key={`option-${index}`} className="paperReviewOptionRow">
+                                  <span>{String.fromCharCode(65 + index)}</span>
+                                  <input
+                                    value={option}
+                                    onChange={(event) => {
+                                      const nextOptions = [...draft.options];
+                                      nextOptions[index] = event.target.value;
+                                      setDraft((current) => ({ ...current, options: nextOptions }));
+                                    }}
+                                    placeholder={`选项 ${String.fromCharCode(65 + index)}`}
+                                  />
+                                  <button
+                                    className="button small danger"
+                                    type="button"
+                                    onClick={() => {
+                                      const nextOptions = draft.options.filter((_, optionIndex) => optionIndex !== index);
+                                      setDraft((current) => ({ ...current, options: nextOptions }));
+                                    }}
+                                    disabled={draft.options.length <= 1}
+                                  >
+                                    删除
+                                  </button>
                                 </div>
-                              );
-                            })}
+                              ))}
+                            </div>
+                            <label className="field">
+                              <span>解析</span>
+                              <AutoResizeTextarea
+                                className="paperReviewAdaptiveTextarea"
+                                minRows={4}
+                                value={draft.analysisText}
+                                onChange={(event) => setDraft((current) => ({ ...current, analysisText: event.target.value }))}
+                              />
+                            </label>
+                            <label className="field">
+                              <span>人工审核备注</span>
+                              <AutoResizeTextarea
+                                className="paperReviewAdaptiveTextarea"
+                                minRows={2}
+                                value={draft.reviewNote}
+                                onChange={(event) => setDraft((current) => ({ ...current, reviewNote: event.target.value }))}
+                                placeholder="记录人工判断、待补材料或入库说明"
+                              />
+                            </label>
+                            <div className="infoCard">
+                              <div className="infoCardTop">
+                                <strong>考点标注</strong>
+                                <Sparkles size={18} aria-hidden />
+                              </div>
+                              <div className="paperReviewComposeMain">
+                                <label className="field">
+                                  <span>已确认考点</span>
+                                  <select
+                                    multiple
+                                    value={draft.confirmedKnowledgePointIds.map(String)}
+                                    onChange={(event) => {
+                                      const values = Array.from(event.target.selectedOptions).map((option) => Number(option.value));
+                                      setDraft((current) => ({
+                                        ...current,
+                                        confirmedKnowledgePointIds: values,
+                                        suggestedKnowledgePointIds: current.suggestedKnowledgePointIds.filter((id) => !values.includes(id)),
+                                        primaryKnowledgePointId: values.includes(current.primaryKnowledgePointId || -1)
+                                          ? current.primaryKnowledgePointId
+                                          : values[0] || null,
+                                      }));
+                                    }}
+                                  >
+                                    {scopedKnowledgePoints.map((point) => (
+                                        <option key={point.id} value={point.id}>
+                                          {point.name}
+                                        </option>
+                                      ))}
+                                  </select>
+                                </label>
+                                <label className="field">
+                                  <span>主考点</span>
+                                  <select
+                                    value={draft.primaryKnowledgePointId ? String(draft.primaryKnowledgePointId) : ""}
+                                    onChange={(event) => setDraft((current) => ({ ...current, primaryKnowledgePointId: Number(event.target.value) || null }))}
+                                  >
+                                    <option value="">未设置</option>
+                                    {draft.confirmedKnowledgePointIds.map((id) => {
+                                      const point = scopedKnowledgePoints.find((item) => item.id === id);
+                                      return point ? (
+                                        <option key={point.id} value={point.id}>
+                                          {point.name}
+                                        </option>
+                                      ) : null;
+                                    })}
+                                  </select>
+                                </label>
+                                <label className="field">
+                                  <span>候选考点</span>
+                                  <select
+                                    multiple
+                                    value={draft.suggestedKnowledgePointIds.map(String)}
+                                    onChange={(event) => {
+                                      const values = Array.from(event.target.selectedOptions).map((option) => Number(option.value));
+                                      setDraft((current) => ({
+                                        ...current,
+                                        suggestedKnowledgePointIds: values.filter((id) => !current.confirmedKnowledgePointIds.includes(id)),
+                                      }));
+                                    }}
+                                  >
+                                    {scopedKnowledgePoints.map((point) => (
+                                      <option key={point.id} value={point.id}>
+                                        {point.name}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                                <div className="tagList">
+                                  {activeQuestion.confirmed_knowledge_points.map((point) => (
+                                    <span key={`confirmed-${point.knowledge_point_id}`}>
+                                      已确认: {point.name}{point.relation_type === "primary" ? " · 主考点" : ""}
+                                    </span>
+                                  ))}
+                                  {activeQuestion.suggested_knowledge_points.map((point) => (
+                                    <span key={`suggested-${point.knowledge_point_id}`}>
+                                      候选: {point.name}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
                           </div>
-                        </>
-                      )}
-                    </div>
-                  ) : null}
+                        </div>
+                      </div>
+                    </section>
+
+                    <aside className="paperReviewAside">
+                      <div className="paperReviewInsightCard">
+                        <div className="paperReviewInsightTop">
+                          <strong>质量线索</strong>
+                          <Sparkles size={16} aria-hidden />
+                        </div>
+                        {!!activeQuestion.quality_issues_json?.length ? (
+                          <div className="tagList">
+                            {activeQuestion.quality_issues_json.map((issue, index) => (
+                              <span key={`${issue}-${index}`}>{issue}</span>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="muted">暂无明显结构化风险。</p>
+                        )}
+                      </div>
+
+                      <div className="paperReviewInsightCard">
+                        <div className="paperReviewInsightTop">
+                          <strong>AI 补全与标准化</strong>
+                          <Wand2 size={16} aria-hidden />
+                        </div>
+                        <p>{activeQuestion.ai_standardization_note || "尚未执行 AI 标准化。"}</p>
+                        <small className="muted">{formatTime(activeQuestion.last_ai_standardized_at)}</small>
+                      </div>
+
+                      <div className="paperReviewInsightCard">
+                        <div className="paperReviewInsightTop">
+                          <strong>答案解析审核</strong>
+                          <ShieldCheck size={16} aria-hidden />
+                        </div>
+                        <p>{activeQuestion.ai_review_note || "尚未执行 AI 审核。"}</p>
+                        <small className="muted">{formatTime(activeQuestion.last_ai_reviewed_at)}</small>
+                      </div>
+
+                      <div className="paperReviewInsightCard">
+                        <div className="paperReviewInsightTop">
+                          <strong>切题原文</strong>
+                          <Bot size={16} aria-hidden />
+                        </div>
+                        <div
+                          className="paperReviewRawBlock paperPreviewHtml"
+                          dangerouslySetInnerHTML={{ __html: renderDocumentPreviewHtml(activeQuestion.source_raw_text) }}
+                        />
+                      </div>
+                    </aside>
+                  </div>
                 </div>
-              </>
+              </div>
             )}
           </div>
-        </div>
+        </article>
       </section>
-    </>
+    </div>
   );
 }
 
-async function loadQuestions(
-  filters: {
-    reviewStatus: ReviewStatusFilter;
-    questionType: QuestionTypeFilter;
-    paperId?: number | null;
-    subjectId?: number | null;
-    categoryId?: number | null;
-    year?: number | null;
-  },
-): Promise<QuestionSummary[]> {
-  const params = new URLSearchParams();
-  if (filters.paperId) {
-    params.set("paper_id", String(filters.paperId));
-  }
-  if (filters.subjectId) {
-    params.set("subject_id", String(filters.subjectId));
-  }
-  if (filters.categoryId) {
-    params.set("category_id", String(filters.categoryId));
-  }
-  if (filters.year) {
-    params.set("year", String(filters.year));
-  }
-  if (filters.reviewStatus !== "all") {
-    params.set("review_status", filters.reviewStatus);
-  }
-  if (filters.questionType !== "all") {
-    params.set("question_type", filters.questionType);
-  }
-  const query = params.toString();
-  return apiFetch<QuestionSummary[]>(`/api/questions${query ? `?${query}` : ""}`);
-}
-
-function questionReviewLabel(reviewStatus: string): string {
-  if (reviewStatus === "approved") return "已通过";
-  if (reviewStatus === "rejected") return "已退回";
-  if (reviewStatus === "needs_revision") return "待修订";
-  return "待复核";
-}
-
-function questionTone(reviewStatus: string): "good" | "warn" | "danger" | "info" {
-  if (reviewStatus === "approved") return "good";
-  if (reviewStatus === "rejected") return "danger";
-  if (reviewStatus === "needs_revision") return "info";
-  return "warn";
-}
-
-function knowledgeReviewLabel(reviewStatus: string): string {
-  if (reviewStatus === "approved") return "已确认";
-  if (reviewStatus === "rejected") return "已退回";
-  return "待审核";
-}
-
-function knowledgeTone(reviewStatus: string): "good" | "warn" | "danger" {
-  if (reviewStatus === "approved") return "good";
-  if (reviewStatus === "rejected") return "danger";
-  return "warn";
-}
-
-function questionTypeLabel(questionType: string): string {
-  if (questionType === "single_choice") return "单选题";
-  if (questionType === "multiple_choice") return "多选题";
-  if (questionType === "judge") return "判断题";
-  if (questionType === "fill_blank") return "填空题";
-  if (questionType === "short_answer") return "简答题";
-  if (questionType === "calculation") return "计算题";
-  if (questionType === "case_analysis") return "案例分析题";
-  if (questionType === "material_analysis") return "材料分析题";
-  if (questionType === "composite") return "综合题";
-  return questionType || "未分类";
-}
-
-async function runConcurrentQuestionAction<T>(
-  ids: number[],
-  concurrency: number,
-  runBatch: (batchIds: number[]) => Promise<T>,
-): Promise<{
-  results: T[];
-  updatedCount: number;
-  completedCount: number;
-  unchangedCount: number;
-  failedCount: number;
-  approvedCount: number;
-  needsRevisionCount: number;
-  rejectedCount: number;
-  taggedQuestionCount: number;
-  createdLinkCount: number;
-}> {
-  const queue = [...ids];
-  const results: T[] = [];
-  let updatedCount = 0;
-  let completedCount = 0;
-  let unchangedCount = 0;
-  let failedCount = 0;
-  let approvedCount = 0;
-  let needsRevisionCount = 0;
-  let rejectedCount = 0;
-  let taggedQuestionCount = 0;
-  let createdLinkCount = 0;
-
-  async function worker() {
-    while (queue.length) {
-      const nextId = queue.shift();
-      if (nextId == null) return;
-      const result = await runBatch([nextId]);
-      results.push(result);
-      const payload = result as Record<string, unknown>;
-      updatedCount += Number(payload.updated_count || 0);
-      completedCount += Number(payload.completed_count || 0);
-      unchangedCount += Number(payload.unchanged_count || 0);
-      failedCount += Number(payload.failed_count || 0);
-      approvedCount += Number(payload.approved_count || 0);
-      needsRevisionCount += Number(payload.needs_revision_count || 0);
-      rejectedCount += Number(payload.rejected_count || 0);
-      taggedQuestionCount += Number(payload.tagged_question_count || 0);
-      createdLinkCount += Number(payload.created_link_count || 0);
-    }
-  }
-
-  await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, ids.length)) }, () => worker()));
+function buildDraft(question: PaperReviewQuestionResponse): DraftState {
+  const confirmedKnowledgePointIds = question.confirmed_knowledge_points.map((point) => point.knowledge_point_id);
   return {
-    results,
-    updatedCount,
-    completedCount,
-    unchangedCount,
-    failedCount,
-    approvedCount,
-    needsRevisionCount,
-    rejectedCount,
-    taggedQuestionCount,
-    createdLinkCount,
+    questionType: question.question_type,
+    stemText: question.stem_text,
+    options: [...(question.options_json || [])],
+    answerText: question.answer_text || "",
+    analysisText: question.analysis_text || "",
+    reviewStatus: (question.review_status as DraftState["reviewStatus"]) || "pending",
+    reviewNote: question.review_note || "",
+    suggestedKnowledgePointIds: question.suggested_knowledge_points.map((point) => point.knowledge_point_id),
+    confirmedKnowledgePointIds,
+    primaryKnowledgePointId:
+      question.confirmed_knowledge_points.find((point) => point.relation_type === "primary")?.knowledge_point_id
+      || confirmedKnowledgePointIds[0]
+      || null,
   };
 }
 
-function parseConcurrency(value: string): number {
-  const numeric = Number(value || 3);
-  if (!Number.isFinite(numeric)) return 3;
-  return Math.max(1, Math.min(20, Math.floor(numeric)));
+function summarizeQuestions(questions: PaperReviewQuestionResponse[]): PaperReviewSummaryResponse {
+  return questions.reduce<PaperReviewSummaryResponse>(
+    (summary, question) => {
+      summary.total_questions += 1;
+      if (question.review_status === "approved") summary.approved_count += 1;
+      else if (question.review_status === "needs_revision") summary.needs_revision_count += 1;
+      else if (question.review_status === "rejected") summary.rejected_count += 1;
+      else summary.pending_count += 1;
+
+      if (question.ai_review_status === "needs_revision" || question.ai_review_status === "rejected") {
+        summary.ai_flagged_count += 1;
+      }
+      if (question.last_ai_reviewed_at) summary.ai_reviewed_count += 1;
+      if (!question.answer_text || !question.analysis_text) summary.missing_solution_count += 1;
+      return summary;
+    },
+    {
+      total_questions: 0,
+      pending_count: 0,
+      approved_count: 0,
+      needs_revision_count: 0,
+      rejected_count: 0,
+      ai_flagged_count: 0,
+      ai_reviewed_count: 0,
+      missing_solution_count: 0,
+    },
+  );
+}
+
+function reviewStatusLabel(status?: string | null) {
+  if (status === "approved") return "人工通过";
+  if (status === "needs_revision") return "待修订";
+  if (status === "rejected") return "已驳回";
+  return "待审核";
+}
+
+function reviewTone(status?: string | null) {
+  if (status === "approved") return "good" as const;
+  if (status === "needs_revision") return "warn" as const;
+  if (status === "rejected") return "danger" as const;
+  return "info" as const;
+}
+
+function aiTone(status?: string | null) {
+  if (status === "approved") return "good" as const;
+  if (status === "needs_revision") return "warn" as const;
+  if (status === "rejected") return "danger" as const;
+  return "info" as const;
+}
+
+function questionTypeLabel(questionType?: string | null) {
+  const labels: Record<string, string> = {
+    single_choice: "单选题",
+    multiple_choice: "多选题",
+    judge: "判断题",
+    fill_blank: "填空题",
+    short_answer: "简答题",
+    calculation: "计算题",
+    case_analysis: "案例分析题",
+    material_analysis: "材料分析题",
+    composite: "综合题",
+    mixed: "混合题型",
+  };
+  return labels[questionType || ""] || questionType || "未识别题型";
+}
+
+function formatScore(score?: number | null) {
+  if (score == null || Number.isNaN(score)) return "-";
+  return Number(score).toFixed(2);
+}
+
+function formatRate(summary?: PaperReviewSummaryResponse | null) {
+  if (!summary?.total_questions) return "0%";
+  return `${Math.round((summary.approved_count / summary.total_questions) * 100)}%`;
+}
+
+function formatTime(value?: string | null) {
+  if (!value) return "尚无时间记录";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function AutoResizeTextarea({
+  minRows = 3,
+  value,
+  ...props
+}: { minRows?: number; value: string } & TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    element.style.height = "auto";
+    element.style.height = `${element.scrollHeight}px`;
+  }, [minRows, value]);
+
+  return <textarea {...props} ref={ref} rows={minRows} value={value} />;
 }

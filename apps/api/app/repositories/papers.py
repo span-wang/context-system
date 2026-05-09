@@ -6,12 +6,8 @@ from app.models import (
     AnalysisJob,
     Asset,
     ExamPaper,
-    ExamQuestion,
     KnowledgePoint,
     PaperSection,
-    QuestionBankItem,
-    QuestionKnowledgeLink,
-    QuestionSourceLink,
     ReviewTask,
     Subject,
     SubjectCategory,
@@ -49,6 +45,9 @@ class PaperRepository(Repository):
 
     def list_parse_jobs(self, paper_id: int) -> list[AnalysisJob]:
         return self.list_jobs(paper_id, job_type="paper_parse")
+
+    def get_job(self, job_id: int) -> AnalysisJob | None:
+        return self.session.get(AnalysisJob, job_id)
 
     def list_jobs(self, paper_id: int, job_type: str | None = None) -> list[AnalysisJob]:
         stmt = select(AnalysisJob).where(AnalysisJob.scope_type == "paper")
@@ -139,11 +138,11 @@ class PaperRepository(Repository):
         self.session.flush()
         return category
 
-    def get_asset_by_sha(self, sha256: str) -> Asset | None:
-        return self.session.scalar(select(Asset).where(Asset.sha256 == sha256))
-
-    def get_paper_by_asset(self, asset_id: int) -> ExamPaper | None:
-        return self.session.scalar(select(ExamPaper).where(ExamPaper.asset_id == asset_id))
+    def count_assets_by_sha(self, sha256: str, *, exclude_asset_id: int | None = None) -> int:
+        stmt = select(func.count()).select_from(Asset).where(Asset.sha256 == sha256)
+        if exclude_asset_id is not None:
+            stmt = stmt.where(Asset.id != exclude_asset_id)
+        return int(self.session.scalar(stmt) or 0)
 
     def create_asset(self, asset: Asset) -> Asset:
         self.session.add(asset)
@@ -155,10 +154,6 @@ class PaperRepository(Repository):
         self.session.flush()
         return paper
 
-    def list_questions(self, paper_id: int) -> list[ExamQuestion]:
-        stmt = select(ExamQuestion).where(ExamQuestion.paper_id == paper_id).order_by(ExamQuestion.id.asc())
-        return list(self.session.scalars(stmt))
-
     def list_knowledge_points(self, subject_id: int | None = None) -> list[KnowledgePoint]:
         stmt = select(KnowledgePoint)
         if subject_id is not None:
@@ -167,19 +162,6 @@ class PaperRepository(Repository):
         return list(self.session.scalars(stmt))
 
     def delete_parse_outputs(self, paper_id: int) -> None:
-        question_ids = [
-            row[0]
-            for row in self.session.query(ExamQuestion.id)
-            .filter(ExamQuestion.paper_id == paper_id)
-            .all()
-        ]
-        if question_ids:
-            self.session.query(QuestionKnowledgeLink).filter(
-                QuestionKnowledgeLink.question_id.in_(question_ids)
-            ).delete(synchronize_session=False)
-            self.session.query(ExamQuestion).filter(
-                ExamQuestion.id.in_(question_ids)
-            ).delete(synchronize_session=False)
         self.session.query(PaperSection).filter(PaperSection.paper_id == paper_id).delete(synchronize_session=False)
 
     def create_section(self, section: PaperSection) -> PaperSection:
@@ -187,52 +169,29 @@ class PaperRepository(Repository):
         self.session.flush()
         return section
 
-    def create_questions(self, questions: list[ExamQuestion]) -> list[ExamQuestion]:
-        self.session.add_all(questions)
-        self.session.flush()
-        return questions
-
-    def count_source_links(self, paper_id: int) -> int:
-        stmt = select(func.count()).select_from(QuestionSourceLink).where(QuestionSourceLink.paper_id == paper_id)
+    def count_papers_by_asset(self, asset_id: int, *, exclude_paper_id: int | None = None) -> int:
+        stmt = select(func.count()).select_from(ExamPaper).where(ExamPaper.asset_id == asset_id)
+        if exclude_paper_id is not None:
+            stmt = stmt.where(ExamPaper.id != exclude_paper_id)
         return int(self.session.scalar(stmt) or 0)
 
+    def delete_asset(self, asset_id: int) -> None:
+        self.session.query(Asset).filter(Asset.id == asset_id).delete(synchronize_session=False)
+
     def delete_paper(self, paper_id: int) -> None:
-        question_ids = [
-            row[0]
-            for row in self.session.query(ExamQuestion.id)
-            .filter(ExamQuestion.paper_id == paper_id)
-            .all()
-        ]
-        source_links = list(
-            self.session.query(QuestionSourceLink)
-            .filter(QuestionSourceLink.paper_id == paper_id)
-            .all()
+        paper = self.get_paper(paper_id)
+        asset_id = paper.asset_id if paper else None
+        should_delete_asset = (
+            asset_id is not None
+            and self.count_papers_by_asset(asset_id, exclude_paper_id=paper_id) == 0
         )
-        if source_links:
-            source_counts: dict[int, int] = {}
-            for link in source_links:
-                source_counts[link.bank_question_id] = source_counts.get(link.bank_question_id, 0) + 1
-            for bank_question_id, removed_count in source_counts.items():
-                bank_item = self.session.get(QuestionBankItem, bank_question_id)
-                if bank_item:
-                    bank_item.source_count = max(0, bank_item.source_count - removed_count)
-            self.session.query(QuestionSourceLink).filter(
-                QuestionSourceLink.paper_id == paper_id
-            ).delete(synchronize_session=False)
-        if question_ids:
-            self.session.query(QuestionKnowledgeLink).filter(
-                QuestionKnowledgeLink.question_id.in_(question_ids)
-            ).delete(synchronize_session=False)
-            self.session.query(ReviewTask).filter(
-                ReviewTask.target_type.in_(("exam_question", "question")),
-                ReviewTask.target_id.in_([str(question_id) for question_id in question_ids]),
-            ).delete(synchronize_session=False)
-            self.session.query(ExamQuestion).filter(
-                ExamQuestion.id.in_(question_ids)
-            ).delete(synchronize_session=False)
+        for job in self.list_jobs(paper_id):
+            self.session.delete(job)
         self.session.query(ReviewTask).filter(
             ReviewTask.target_type.in_(("paper", "exam_paper")),
             ReviewTask.target_id == str(paper_id),
         ).delete(synchronize_session=False)
         self.session.query(PaperSection).filter(PaperSection.paper_id == paper_id).delete(synchronize_session=False)
         self.session.query(ExamPaper).filter(ExamPaper.id == paper_id).delete(synchronize_session=False)
+        if should_delete_asset and asset_id is not None:
+            self.delete_asset(asset_id)

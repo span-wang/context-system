@@ -7,6 +7,7 @@ from app.db.session import SessionLocal
 from app.db.bootstrap import initialize_database
 from app.job_recovery import fail_interrupted_analysis_jobs, sync_paper_parse_job_statuses
 from app.middleware.audit import FailedRequestAuditMiddleware
+from app.services.ocr_cache_sweeper import ocr_cache_sweep_service
 
 
 settings = get_settings()
@@ -36,3 +37,9 @@ def on_startup() -> None:
         fail_interrupted_analysis_jobs(session)
     with SessionLocal() as session:
         sync_paper_parse_job_statuses(session)
+    ocr_cache_sweep_service.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    ocr_cache_sweep_service.stop()

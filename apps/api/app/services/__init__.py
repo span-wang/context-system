@@ -4,15 +4,10 @@ from importlib import import_module
 
 
 _SERVICE_EXPORTS = {
-    "AnalysisToTopicService": ("app.services.workflow", "AnalysisToTopicService"),
     "AuditService": ("app.services.audit", "AuditService"),
     "AuthService": ("app.services.auth", "AuthService"),
-    "FrequencyAnalysisService": ("app.services.analysis", "FrequencyAnalysisService"),
     "KnowledgeTreeService": ("app.services.knowledge", "KnowledgeTreeService"),
     "PaperService": ("app.services.papers", "PaperService"),
-    "PracticeSessionService": ("app.services.learning", "PracticeSessionService"),
-    "QuestionBankService": ("app.services.question_bank", "QuestionBankService"),
-    "QuestionExtractionService": ("app.services.questions", "QuestionExtractionService"),
     "SystemService": ("app.services.system", "SystemService"),
 }
 
