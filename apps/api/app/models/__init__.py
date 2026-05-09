@@ -9,6 +9,7 @@ from .legacy import (
     LegacyWorkflowTopic,
 )
 from .paper_review import PaperReviewQuestion, PaperReviewQuestionKnowledgePoint
+from .question_bank import QuestionBankItem, QuestionBankSourceLink
 from .review import AuditLog, ReviewTask
 from .subject import Chapter, KnowledgePoint, KnowledgePointAlias, KnowledgePointRelation, Subject, SubjectCategory
 from .tenant import Tenant
@@ -33,6 +34,8 @@ __all__ = [
     "PaperReviewQuestion",
     "PaperReviewQuestionKnowledgePoint",
     "PaperSection",
+    "QuestionBankItem",
+    "QuestionBankSourceLink",
     "ReviewTask",
     "Role",
     "Subject",
