@@ -13,6 +13,7 @@ from app.schemas.papers import PaperSectionResponse
 ReviewStatus = Literal["pending", "approved", "needs_revision", "rejected"]
 KnowledgePointTagStatus = Literal["suggested", "confirmed", "rejected"]
 KnowledgePointRelationType = Literal["primary", "secondary"]
+QuestionNodeRole = Literal["standalone", "group", "subquestion"]
 
 
 class PaperReviewQuestionKnowledgePointResponse(BaseModel):
@@ -35,13 +36,17 @@ class PaperReviewQuestionResponse(ORMModel):
     id: int
     paper_id: int
     section_id: int | None = None
+    parent_question_id: int | None = None
     question_uid: str
     content_fingerprint: str
     sort_order: int
     question_no: str
+    node_role: QuestionNodeRole = "standalone"
     question_type: str
     source_section_name: str
     source_raw_text: str
+    group_stem: str | None = None
+    material_text: str | None = None
     stem_text: str
     options_json: list[str] | None = None
     answer_text: str | None = None
@@ -64,10 +69,13 @@ class PaperReviewQuestionResponse(ORMModel):
     updated_at: datetime
     suggested_knowledge_points: list[PaperReviewQuestionKnowledgePointResponse] = Field(default_factory=list)
     confirmed_knowledge_points: list[PaperReviewQuestionKnowledgePointResponse] = Field(default_factory=list)
+    subquestions: list["PaperReviewQuestionResponse"] = Field(default_factory=list)
 
 
 class PaperReviewSummaryResponse(BaseModel):
     total_questions: int
+    leaf_question_count: int = 0
+    group_question_count: int = 0
     pending_count: int = 0
     approved_count: int = 0
     needs_revision_count: int = 0
@@ -86,6 +94,8 @@ class PaperReviewPaperResponse(BaseModel):
     review_status: str
     total_question_count: int = 0
     question_review_count: int = 0
+    leaf_question_count: int = 0
+    group_question_count: int = 0
 
 
 class PaperReviewWorkspaceResponse(BaseModel):
@@ -95,7 +105,29 @@ class PaperReviewWorkspaceResponse(BaseModel):
     questions: list[PaperReviewQuestionResponse] = Field(default_factory=list)
 
 
+class PaperReviewRebuildResponse(BaseModel):
+    paper_id: int
+    imported_count: int
+    replaced_count: int
+    section_count: int
+    message: str
+
+
 class PaperReviewQuestionUpdateRequest(BaseModel):
+    question_type: str | None = None
+    group_stem: str | None = None
+    material_text: str | None = None
+    stem_text: str | None = None
+    options_json: list[str] | None = None
+    answer_text: str | None = None
+    analysis_text: str | None = None
+    review_status: ReviewStatus | None = None
+    review_note: str | None = None
+    subquestions: list["PaperReviewSubquestionUpdateRequest"] = Field(default_factory=list)
+
+
+class PaperReviewSubquestionUpdateRequest(BaseModel):
+    id: int
     question_type: str | None = None
     stem_text: str | None = None
     options_json: list[str] | None = None
@@ -119,14 +151,6 @@ class PaperReviewQuestionKnowledgePointUpdateRequest(BaseModel):
     confirmed: list[PaperReviewQuestionKnowledgePointUpsertItem] = Field(default_factory=list)
 
 
-class PaperReviewRebuildResponse(BaseModel):
-    paper_id: int
-    imported_count: int
-    replaced_count: int
-    section_count: int
-    message: str
-
-
 class PaperReviewAutoTagResponse(BaseModel):
     paper_id: int
     status: str = "pending"
@@ -145,8 +169,82 @@ class PaperReviewAutoTagJobResponse(ORMModel):
     progress: int
 
 
+class PaperReviewAIStandardizeJobItemResponse(BaseModel):
+    job_id: int
+    paper_id: int
+    status: str
+    progress: int
+    requested_count: int
+    batch_index: int = 1
+    batch_count: int = 1
+    question_ids: list[int] = Field(default_factory=list)
+
+
+class PaperReviewAIStandardizeJobSubmitResponse(BaseModel):
+    paper_id: int
+    requested_count: int
+    job_count: int
+    jobs: list[PaperReviewAIStandardizeJobItemResponse] = Field(default_factory=list)
+    message: str
+
+
+class PaperReviewAIStandardizeJobResponse(BaseModel):
+    job_id: int
+    paper_id: int
+    status: str = "pending"
+    progress: int = 0
+    requested_count: int = 0
+    success_count: int = 0
+    failed_count: int = 0
+    changed_count: int = 0
+    used_ai_count: int = 0
+    batch_index: int = 1
+    batch_count: int = 1
+    question_ids: list[int] = Field(default_factory=list)
+    message: str
+
+
 class PaperReviewAIActionResponse(BaseModel):
     message: str
     changed: bool = False
     used_ai: bool = False
     question: PaperReviewQuestionResponse
+
+
+class PaperReviewAIBatchActionRequest(BaseModel):
+    question_ids: list[int] = Field(default_factory=list, min_length=1)
+
+
+class PaperReviewBatchReviewRequest(BaseModel):
+    question_ids: list[int] = Field(default_factory=list, min_length=1)
+    review_status: ReviewStatus
+    review_note: str | None = None
+
+
+class PaperReviewAIBatchFailureResponse(BaseModel):
+    question_id: int
+    message: str
+
+
+class PaperReviewBatchReviewResponse(BaseModel):
+    message: str
+    requested_count: int
+    success_count: int
+    failed_count: int
+    questions: list[PaperReviewQuestionResponse] = Field(default_factory=list)
+    failures: list[PaperReviewAIBatchFailureResponse] = Field(default_factory=list)
+
+
+class PaperReviewAIBatchActionResponse(BaseModel):
+    message: str
+    requested_count: int
+    success_count: int
+    failed_count: int
+    changed_count: int = 0
+    used_ai_count: int = 0
+    questions: list[PaperReviewQuestionResponse] = Field(default_factory=list)
+    failures: list[PaperReviewAIBatchFailureResponse] = Field(default_factory=list)
+
+
+PaperReviewQuestionResponse.model_rebuild()
+PaperReviewQuestionUpdateRequest.model_rebuild()

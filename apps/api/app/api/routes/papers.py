@@ -8,6 +8,7 @@ from app.schemas.papers import (
     AnalysisJobResponse,
     PaperDeleteResponse,
     PaperParseJobResponse,
+    PaperParseExecutionMode,
     PaperDetailResponse,
     PaperParseResponse,
     PaperSummary,
@@ -16,7 +17,13 @@ from app.schemas.papers import (
 from app.services.audit import AuditService
 from app.services.paper_parse_jobs import start_paper_parse_job
 from app.services.papers import PaperService
-from library.parse_options import DocumentParseOptions, ParseMode, ParseOutputFormat, ParsePreset
+from library.parse_options import (
+    DEFAULT_PARSE_OUTPUT_FORMAT,
+    DEFAULT_PARSE_PRESET,
+    ParseOutputFormat,
+    ParsePreset,
+    build_document_parse_options,
+)
 
 
 router = APIRouter(prefix="/api/papers", tags=["papers"])
@@ -71,9 +78,11 @@ async def upload_paper(
 @router.post("/{paper_id}/parse", response_model=PaperParseResponse)
 def parse_paper(
     paper_id: int,
-    preset: ParsePreset = Form("auto"),
-    parse_mode: ParseMode = Form("rules"),
-    output_format: ParseOutputFormat = Form("markdown"),
+    preset: ParsePreset = Form(DEFAULT_PARSE_PRESET),
+    output_format: ParseOutputFormat = Form(DEFAULT_PARSE_OUTPUT_FORMAT),
+    execution_mode: PaperParseExecutionMode = Form("full_chain"),
+    raw_ocr_mode: bool | None = Form(None),
+    preserve_pdf_image_content: bool | None = Form(None),
     force_ocr: bool | None = Form(None),
     render_dpi: int | None = Form(None),
     crop_header_ratio: float | None = Form(None),
@@ -85,10 +94,11 @@ def parse_paper(
     pdf_page_chunk_size: int | None = Form(None, ge=1, le=50),
     session: Session = Depends(get_session),
 ) -> PaperParseResponse:
-    options = DocumentParseOptions(
+    options = build_document_parse_options(
         preset=preset,
-        parse_mode=parse_mode,
         output_format=output_format,
+        raw_ocr_mode=raw_ocr_mode,
+        preserve_pdf_image_content=preserve_pdf_image_content,
         force_ocr=force_ocr,
         render_dpi=render_dpi,
         crop_header_ratio=crop_header_ratio,
@@ -99,7 +109,7 @@ def parse_paper(
         enable_formula_recognition=enable_formula_recognition,
         pdf_page_chunk_size=pdf_page_chunk_size,
     )
-    result = PaperService(session).parse_paper(paper_id, options=options)
+    result = PaperService(session).parse_paper(paper_id, options=options, execution_mode=execution_mode)
     AuditService(session).log(
         None,
         module="papers",
@@ -107,10 +117,12 @@ def parse_paper(
         target_type="paper",
         target_id=paper_id,
         payload={
+            "execution_mode": execution_mode,
             "question_count": result.question_count,
             "tagged_count": result.tagged_count,
             "parse_options": result.parse_options,
             "provider": result.provider,
+            "parse_runtime": result.parse_runtime,
         },
     )
     return result
@@ -119,9 +131,10 @@ def parse_paper(
 @router.get("/{paper_id}/preview")
 def preview_paper(
     paper_id: int,
-    preset: ParsePreset = Query("accurate"),
-    parse_mode: ParseMode = Query("rules"),
-    output_format: ParseOutputFormat = Query("markdown"),
+    preset: ParsePreset = Query(DEFAULT_PARSE_PRESET),
+    output_format: ParseOutputFormat = Query(DEFAULT_PARSE_OUTPUT_FORMAT),
+    raw_ocr_mode: bool | None = Query(None),
+    preserve_pdf_image_content: bool | None = Query(None),
     force_ocr: bool | None = Query(None),
     render_dpi: int | None = Query(None, ge=96, le=360),
     crop_header_ratio: float | None = Query(None, ge=0.0, le=0.2),
@@ -133,10 +146,11 @@ def preview_paper(
     pdf_page_chunk_size: int | None = Query(None, ge=1, le=50),
     session: Session = Depends(get_session),
 ):
-    options = DocumentParseOptions(
+    options = build_document_parse_options(
         preset=preset,
-        parse_mode=parse_mode,
         output_format=output_format,
+        raw_ocr_mode=raw_ocr_mode,
+        preserve_pdf_image_content=preserve_pdf_image_content,
         force_ocr=force_ocr,
         render_dpi=render_dpi,
         crop_header_ratio=crop_header_ratio,
@@ -153,9 +167,11 @@ def preview_paper(
 @router.post("/{paper_id}/parse-jobs", response_model=PaperParseJobResponse)
 def start_parse_paper_job(
     paper_id: int,
-    preset: ParsePreset = Form("auto"),
-    parse_mode: ParseMode = Form("rules"),
-    output_format: ParseOutputFormat = Form("markdown"),
+    preset: ParsePreset = Form(DEFAULT_PARSE_PRESET),
+    output_format: ParseOutputFormat = Form(DEFAULT_PARSE_OUTPUT_FORMAT),
+    execution_mode: PaperParseExecutionMode = Form("full_chain"),
+    raw_ocr_mode: bool | None = Form(None),
+    preserve_pdf_image_content: bool | None = Form(None),
     force_ocr: bool | None = Form(None),
     render_dpi: int | None = Form(None),
     crop_header_ratio: float | None = Form(None),
@@ -167,10 +183,11 @@ def start_parse_paper_job(
     pdf_page_chunk_size: int | None = Form(None, ge=1, le=50),
     session: Session = Depends(get_session),
 ) -> PaperParseJobResponse:
-    options = DocumentParseOptions(
+    options = build_document_parse_options(
         preset=preset,
-        parse_mode=parse_mode,
         output_format=output_format,
+        raw_ocr_mode=raw_ocr_mode,
+        preserve_pdf_image_content=preserve_pdf_image_content,
         force_ocr=force_ocr,
         render_dpi=render_dpi,
         crop_header_ratio=crop_header_ratio,
@@ -181,7 +198,7 @@ def start_parse_paper_job(
         enable_formula_recognition=enable_formula_recognition,
         pdf_page_chunk_size=pdf_page_chunk_size,
     )
-    job = start_paper_parse_job(session, paper_id, options)
+    job = start_paper_parse_job(session, paper_id, options, execution_mode=execution_mode)
     job_id = job.id
     job_status = job.status
     job_progress = job.progress
@@ -191,9 +208,15 @@ def start_parse_paper_job(
         action="parse_job_start",
         target_type="paper",
         target_id=paper_id,
-        payload={"job_id": job_id, "parse_options": options.normalized_dump()},
+        payload={"job_id": job_id, "execution_mode": execution_mode, "parse_options": options.normalized_dump()},
     )
-    return PaperParseJobResponse(job_id=job_id, paper_id=paper_id, status=job_status, progress=job_progress)
+    return PaperParseJobResponse(
+        job_id=job_id,
+        paper_id=paper_id,
+        status=job_status,
+        progress=job_progress,
+        execution_mode=execution_mode,
+    )
 
 
 @router.get("/parse-jobs/{job_id}", response_model=AnalysisJobResponse)

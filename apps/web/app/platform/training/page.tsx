@@ -17,6 +17,7 @@ type TrainingSampleSummary = {
   gold_exists: boolean;
   label_status: string;
   source_text_length: number;
+  ai_source_text_length: number;
   updated_at: string | null;
 };
 
@@ -37,8 +38,9 @@ type TrainingDatasetSummary = {
 type TrainingSampleDetail = {
   sample: TrainingSampleSummary;
   meta: Record<string, unknown>;
-  source_text: string;
-  prediction_text: string;
+  raw_source_text: string;
+  ai_source_text: string;
+  ai_prediction_text: string;
   gold_template_text: string;
   gold_text: string;
 };
@@ -77,6 +79,8 @@ type TrainingSectionTab = {
 };
 
 type TrainingWorkbenchView = "fields" | "json";
+
+const JUDGE_OPTION_VALUES = ["正确", "错误"] as const;
 
 export default function TrainingPage() {
   const [summary, setSummary] = useState<TrainingDatasetSummary | null>(null);
@@ -122,15 +126,16 @@ export default function TrainingPage() {
     });
   }, [search, summary]);
 
-  const predictionDoc = useMemo(() => parseTrainingDocument(detail?.prediction_text || ""), [detail?.prediction_text]);
+  const aiPredictionDoc = useMemo(() => parseTrainingDocument(detail?.ai_prediction_text || ""), [detail?.ai_prediction_text]);
   const templateDoc = useMemo(
-    () => parseTrainingDocument(detail?.gold_template_text || "", predictionDoc),
-    [detail?.gold_template_text, predictionDoc]
+    () => parseTrainingDocument(detail?.gold_template_text || "", aiPredictionDoc),
+    [detail?.gold_template_text, aiPredictionDoc]
   );
   const editableDoc = goldDoc || templateDoc;
-  const sectionTabs = useMemo(
-    () => buildSectionTabs(editableDoc.sections, predictionDoc.sections),
-    [editableDoc.sections, predictionDoc.sections]
+  const sectionTabs = useMemo(() => buildSectionTabs(aiPredictionDoc.sections), [aiPredictionDoc.sections]);
+  const aiPredictionQuestionCount = useMemo(
+    () => aiPredictionDoc.sections.reduce((count, section) => count + section.questions.length, 0),
+    [aiPredictionDoc.sections]
   );
 
   useEffect(() => {
@@ -145,7 +150,7 @@ export default function TrainingPage() {
     }
   }, [activeSectionIndex, sectionTabs]);
 
-  const activePredictionSection = predictionDoc.sections[activeSectionIndex] || null;
+  const activeAiPredictionSection = aiPredictionDoc.sections[activeSectionIndex] || null;
   const activeGoldSection = editableDoc.sections[activeSectionIndex] || null;
   const activeSection = sectionTabs[activeSectionIndex] || null;
   const unlabeledCount = (summary?.samples || []).filter((sample) => isPendingLabelStatus(sample.label_status)).length;
@@ -184,8 +189,8 @@ export default function TrainingPage() {
         throw new Error(String(payload.detail || "读取训练样本详情失败"));
       }
       const nextDetail = payload as TrainingSampleDetail;
-      const nextPrediction = parseTrainingDocument(nextDetail.prediction_text || "");
-      const nextTemplate = parseTrainingDocument(nextDetail.gold_template_text || "", nextPrediction);
+      const nextAiPrediction = parseTrainingDocument(nextDetail.ai_prediction_text || "");
+      const nextTemplate = parseTrainingDocument(nextDetail.gold_template_text || "", nextAiPrediction);
       setDetail(nextDetail);
       setGoldDoc(parseTrainingDocument(nextDetail.gold_text || "", nextTemplate));
       setGoldJsonText(nextDetail.gold_text || serializeTrainingDocument(nextTemplate));
@@ -228,8 +233,8 @@ export default function TrainingPage() {
         throw new Error(String(payload.detail || "保存 gold.json 失败"));
       }
       const nextDetail = payload as TrainingSampleDetail;
-      const nextPrediction = parseTrainingDocument(nextDetail.prediction_text || "");
-      const nextTemplate = parseTrainingDocument(nextDetail.gold_template_text || "", nextPrediction);
+      const nextAiPrediction = parseTrainingDocument(nextDetail.ai_prediction_text || "");
+      const nextTemplate = parseTrainingDocument(nextDetail.gold_template_text || "", nextAiPrediction);
       setDetail(nextDetail);
       setGoldDoc(parseTrainingDocument(nextDetail.gold_text || "", nextTemplate));
       setGoldJsonText(nextDetail.gold_text || serializeTrainingDocument(nextTemplate));
@@ -246,7 +251,7 @@ export default function TrainingPage() {
 
   async function deleteSelectedSample() {
     if (!detail) return;
-    const confirmed = window.confirm(`确定删除样本“${detail.sample.paper_name}”吗？会连同当前样本目录下的 source、prediction、gold 文件一起删除。`);
+    const confirmed = window.confirm(`确定删除样本“${detail.sample.paper_name}”吗？会连同当前样本目录下的 OCR 原文、AI 输出和 gold 文件一起删除。`);
     if (!confirmed) return;
     setDeleting(true);
     setMessage("");
@@ -280,11 +285,11 @@ export default function TrainingPage() {
   }
 
   function replaceEditorWithPrediction() {
-    const nextDoc = parseTrainingDocument(detail?.prediction_text || "", predictionDoc);
+    const nextDoc = parseTrainingDocument(detail?.ai_prediction_text || "", aiPredictionDoc);
     setGoldDoc(nextDoc);
     setGoldJsonText(serializeTrainingDocument(nextDoc));
     setGoldJsonError("");
-    setMessage("已把标注填写区切成当前 prediction.json，适合从预测结果开始修。");
+    setMessage("已把标注填写区切成当前 ai_prediction.json，适合从 AI 切题结果开始修。");
   }
 
   function switchWorkbenchView(nextView: TrainingWorkbenchView) {
@@ -343,7 +348,13 @@ export default function TrainingPage() {
           return {
             ...section,
             questions: section.questions.map((question, currentQuestionIndex) =>
-              currentQuestionIndex === questionIndex ? { ...question, [field]: value } : question
+              currentQuestionIndex === questionIndex
+                ? {
+                    ...question,
+                    [field]: value,
+                    options: field === "question_type" ? normalizeQuestionOptions(value, question.options) : question.options,
+                  }
+                : question
             ),
           };
         }),
@@ -365,6 +376,9 @@ export default function TrainingPage() {
             questions: section.questions.map((question, currentQuestionIndex) => {
               if (currentQuestionIndex !== questionIndex) {
                 return question;
+              }
+              if (isJudgeQuestionType(question.question_type)) {
+                return { ...question, options: getFixedJudgeOptions() };
               }
               return {
                 ...question,
@@ -392,7 +406,9 @@ export default function TrainingPage() {
             ...section,
             questions: section.questions.map((question, currentQuestionIndex) =>
               currentQuestionIndex === questionIndex
-                ? { ...question, options: [...question.options, ""] }
+                ? isJudgeQuestionType(question.question_type)
+                  ? { ...question, options: getFixedJudgeOptions() }
+                  : { ...question, options: [...question.options, ""] }
                 : question
             ),
           };
@@ -520,8 +536,8 @@ export default function TrainingPage() {
                   <h2>标注工作台</h2>
                   <p>
                     {workbenchView === "json"
-                      ? "左侧看 source.txt，中间直接查看 prediction.json，右侧直接编辑和保存 gold.json。"
-                      : "左侧看 source.txt，中间看 prediction 切分结果，右侧直接按题型、题干、选项、答案、解析填写 gold。"}
+                      ? "左侧查看 ai_source.txt、OCR 解析原文与 ai_prediction.json，右侧编辑和保存 gold.json。"
+                      : "左侧查看 ai_source.txt、OCR 解析原文与 AI 切题预览，右侧直接按题型、题干、选项、答案、解析填写 gold。"}
                   </p>
                 </div>
                 <div className="trainingEditorActions">
@@ -559,7 +575,7 @@ export default function TrainingPage() {
                       </div>
                       <div className="detailRow">
                         <span>题目数</span>
-                        <strong>{detail.sample.predicted_question_count}</strong>
+                        <strong>{aiPredictionQuestionCount}</strong>
                       </div>
                       <div className="detailRow">
                         <span>当前视图</span>
@@ -591,30 +607,38 @@ export default function TrainingPage() {
 
                     <div className="trainingEditorSection">
                       <div className="trainingEditorHeader">
-                        <strong>source.txt</strong>
-                        <span className="muted">原始切题文本</span>
+                        <strong>ai_source.txt</strong>
+                        <span className="muted">本地大模型清噪输出</span>
                       </div>
-                      <textarea className="trainingTextarea trainingReadonly trainingSourceTextarea" value={detail.source_text} readOnly spellCheck={false} />
+                      <textarea className="trainingTextarea trainingReadonly trainingSourceTextarea" value={detail.ai_source_text || ""} readOnly spellCheck={false} />
                     </div>
 
                     <div className="trainingEditorSection">
                       <div className="trainingEditorHeader">
-                        <strong>{workbenchView === "json" ? "prediction.json" : "prediction 切分预览"}</strong>
-                        <span className="muted">{workbenchView === "json" ? "整份预测结果，只读查看" : "按字段只读查看当前 section"}</span>
+                        <strong>ocr 解析原文</strong>
+                        <span className="muted">OCR 解析内容，未作任何处理</span>
+                      </div>
+                      <textarea className="trainingTextarea trainingReadonly trainingSourceTextarea" value={detail.raw_source_text} readOnly spellCheck={false} />
+                    </div>
+
+                    <div className="trainingEditorSection">
+                      <div className="trainingEditorHeader">
+                        <strong>{workbenchView === "json" ? "ai_prediction.json" : "AI 切题预览"}</strong>
+                        <span className="muted">{workbenchView === "json" ? "本地大模型一次性清噪切题结果" : "按字段只读查看当前 section"}</span>
                       </div>
                       {workbenchView === "json" ? (
                         <textarea
                           className="trainingTextarea trainingReadonly trainingEditorTextarea"
-                          value={detail.prediction_text || "{}"}
+                          value={detail.ai_prediction_text || "{}"}
                           readOnly
                           spellCheck={false}
                         />
                       ) : (
                         <div className="trainingStructuredPanel trainingStructuredReadonly">
-                          {activePredictionSection ? (
-                            <TrainingReadonlySection section={activePredictionSection} sampleId={detail.sample.id} />
+                          {activeAiPredictionSection ? (
+                            <TrainingReadonlySection section={activeAiPredictionSection} sampleId={detail.sample.id} />
                           ) : (
-                            <div className="empty compact">prediction 中暂无切分结果</div>
+                            <div className="empty compact">AI prediction 中暂无切分结果</div>
                           )}
                         </div>
                       )}
@@ -780,79 +804,89 @@ function TrainingEditableSection({
       </div>
 
       <div className="trainingQuestionList">
-        {section.questions.map((question, questionIndex) => (
-          <article key={`gold-${questionIndex}`} className="trainingQuestionCard">
-            <div className="trainingQuestionCardHead">
-              <strong>{question.question_no ? `第 ${question.question_no} 题` : `题目 ${questionIndex + 1}`}</strong>
-              <span className="muted">按字段填写后会自动保存成 JSON</span>
-            </div>
-            <div className="trainingQuestionGrid">
-              <label className="trainingField">
-                <span>题号</span>
-                <input
-                  className="input"
-                  value={question.question_no}
-                  onChange={(event) => onQuestionFieldChange(sectionIndex, questionIndex, "question_no", event.target.value)}
-                />
-              </label>
-              <label className="trainingField">
-                <span>题型</span>
-                <input
-                  className="input"
-                  value={question.question_type}
-                  onChange={(event) => onQuestionFieldChange(sectionIndex, questionIndex, "question_type", event.target.value)}
-                />
-              </label>
-              <label className="trainingField">
-                <span>答案</span>
-                <input
-                  className="input"
-                  value={question.answer_text}
-                  onChange={(event) => onQuestionFieldChange(sectionIndex, questionIndex, "answer_text", event.target.value)}
-                />
-              </label>
-              <label className="trainingField trainingFieldFull">
-                <span>题干</span>
-                <textarea
-                  className="trainingFormTextarea"
-                  value={question.stem_text}
-                  onChange={(event) => onQuestionFieldChange(sectionIndex, questionIndex, "stem_text", event.target.value)}
-                  spellCheck={false}
-                />
-              </label>
-              <div className="trainingField trainingFieldFull">
-                <div className="trainingFieldLabelRow">
-                  <span>选项</span>
-                  <button className="button small" type="button" onClick={() => onAddOption(sectionIndex, questionIndex)}>
-                    新增选项
-                  </button>
-                </div>
-                <div className="trainingOptionList">
-                  {question.options.map((option, optionIndex) => (
-                    <div key={`option-${optionIndex}`} className="trainingOptionRow">
-                      <textarea
-                        className="trainingFormTextarea trainingOptionTextarea"
-                        value={option}
-                        onChange={(event) => onOptionChange(sectionIndex, questionIndex, optionIndex, event.target.value)}
-                        spellCheck={false}
-                      />
-                    </div>
-                  ))}
-                  {!question.options.length ? <div className="empty compact">当前没有选项，点“新增选项”开始填写。</div> : null}
-                </div>
+        {section.questions.map((question, questionIndex) => {
+          const judgeQuestion = isJudgeQuestionType(question.question_type);
+          const options = normalizeQuestionOptions(question.question_type, question.options);
+          return (
+            <article key={`gold-${questionIndex}`} className="trainingQuestionCard">
+              <div className="trainingQuestionCardHead">
+                <strong>{question.question_no ? `第 ${question.question_no} 题` : `题目 ${questionIndex + 1}`}</strong>
+                <span className="muted">按字段填写后会自动保存成 JSON</span>
               </div>
-              <label className="trainingField trainingFieldFull">
-                <span>解析</span>
-                <textarea
-                  className="trainingFormTextarea"
-                  value={question.analysis_text}
-                  onChange={(event) => onQuestionFieldChange(sectionIndex, questionIndex, "analysis_text", event.target.value)}
-                  spellCheck={false}
-                />
-              </label>
-            </div>
-          </article>
-        ))}
+              <div className="trainingQuestionGrid">
+                <label className="trainingField">
+                  <span>题号</span>
+                  <input
+                    className="input"
+                    value={question.question_no}
+                    onChange={(event) => onQuestionFieldChange(sectionIndex, questionIndex, "question_no", event.target.value)}
+                  />
+                </label>
+                <label className="trainingField">
+                  <span>题型</span>
+                  <input
+                    className="input"
+                    value={question.question_type}
+                    onChange={(event) => onQuestionFieldChange(sectionIndex, questionIndex, "question_type", event.target.value)}
+                  />
+                </label>
+                <label className="trainingField">
+                  <span>答案</span>
+                  <input
+                    className="input"
+                    value={question.answer_text}
+                    onChange={(event) => onQuestionFieldChange(sectionIndex, questionIndex, "answer_text", event.target.value)}
+                  />
+                </label>
+                <label className="trainingField trainingFieldFull">
+                  <span>题干</span>
+                  <textarea
+                    className="trainingFormTextarea"
+                    value={question.stem_text}
+                    onChange={(event) => onQuestionFieldChange(sectionIndex, questionIndex, "stem_text", event.target.value)}
+                    spellCheck={false}
+                  />
+                </label>
+                <div className="trainingField trainingFieldFull">
+                  <div className="trainingFieldLabelRow">
+                    <span>选项</span>
+                    {!judgeQuestion ? (
+                      <button className="button small" type="button" onClick={() => onAddOption(sectionIndex, questionIndex)}>
+                        新增选项
+                      </button>
+                    ) : null}
+                  </div>
+                  <div className="trainingOptionList">
+                    {options.map((option, optionIndex) => (
+                      <div key={`option-${optionIndex}`} className="trainingOptionRow">
+                        {judgeQuestion ? (
+                          <div className="trainingFieldValue">{option}</div>
+                        ) : (
+                          <textarea
+                            className="trainingFormTextarea trainingOptionTextarea"
+                            value={option}
+                            onChange={(event) => onOptionChange(sectionIndex, questionIndex, optionIndex, event.target.value)}
+                            spellCheck={false}
+                          />
+                        )}
+                      </div>
+                    ))}
+                    {!options.length ? <div className="empty compact">当前没有选项，点“新增选项”开始填写。</div> : null}
+                  </div>
+                </div>
+                <label className="trainingField trainingFieldFull">
+                  <span>解析</span>
+                  <textarea
+                    className="trainingFormTextarea"
+                    value={question.analysis_text}
+                    onChange={(event) => onQuestionFieldChange(sectionIndex, questionIndex, "analysis_text", event.target.value)}
+                    spellCheck={false}
+                  />
+                </label>
+              </div>
+            </article>
+          );
+        })}
       </div>
     </div>
   );
@@ -907,15 +941,12 @@ function ReadonlyOptions({ options, sampleId = "" }: { options: string[]; sample
   );
 }
 
-function buildSectionTabs(primarySections: TrainingSection[], secondarySections: TrainingSection[]): TrainingSectionTab[] {
-  const total = Math.max(primarySections.length, secondarySections.length);
-  return Array.from({ length: total }, (_, index) => {
-    const primary = primarySections[index];
-    const secondary = secondarySections[index];
+function buildSectionTabs(sections: TrainingSection[]): TrainingSectionTab[] {
+  return sections.map((section, index) => {
     return {
-      title: primary?.title || secondary?.title || `分区 ${index + 1}`,
-      section_type: primary?.section_type || secondary?.section_type || "",
-      question_count: primary?.questions.length || secondary?.questions.length || 0,
+      title: section.title || `分区 ${index + 1}`,
+      section_type: section.section_type || "",
+      question_count: section.questions.length,
     };
   });
 }
@@ -977,11 +1008,12 @@ function normalizeQuestions(value: unknown, fallback: TrainingQuestion[]): Train
 
 function normalizeQuestion(value: unknown, fallback?: TrainingQuestion): TrainingQuestion {
   const record = asRecord(value);
+  const questionType = asEditableString(record.question_type, fallback?.question_type || "");
   return {
     question_no: asEditableString(record.question_no, fallback?.question_no || ""),
-    question_type: asEditableString(record.question_type, fallback?.question_type || ""),
+    question_type: questionType,
     stem_text: asEditableString(record.stem_text, fallback?.stem_text || ""),
-    options: normalizeOptions(record.options, fallback?.options || []),
+    options: normalizeQuestionOptions(questionType, normalizeOptions(record.options, fallback?.options || [])),
     answer_text: asEditableString(record.answer_text, fallback?.answer_text || ""),
     analysis_text: asEditableString(record.analysis_text, fallback?.analysis_text || ""),
   };
@@ -1007,7 +1039,7 @@ function serializeTrainingDocument(document: TrainingDocument): string {
           question_no: question.question_no,
           question_type: question.question_type,
           stem_text: question.stem_text,
-          options: question.options.filter((option) => option.trim()),
+          options: serializeQuestionOptions(question),
           answer_text: question.answer_text,
           analysis_text: question.analysis_text,
         })),
@@ -1049,10 +1081,33 @@ function cloneTrainingQuestion(question: TrainingQuestion): TrainingQuestion {
     question_no: question.question_no,
     question_type: question.question_type,
     stem_text: question.stem_text,
-    options: [...question.options],
+    options: normalizeQuestionOptions(question.question_type, [...question.options]),
     answer_text: question.answer_text,
     analysis_text: question.analysis_text,
   };
+}
+
+function isJudgeQuestionType(questionType: string): boolean {
+  const trimmed = questionType.trim();
+  return trimmed.toLowerCase() === "judge" || trimmed === "判断题";
+}
+
+function getFixedJudgeOptions(): string[] {
+  return [...JUDGE_OPTION_VALUES];
+}
+
+function normalizeQuestionOptions(questionType: string, options: string[]): string[] {
+  if (isJudgeQuestionType(questionType)) {
+    return getFixedJudgeOptions();
+  }
+  return options;
+}
+
+function serializeQuestionOptions(question: TrainingQuestion): string[] {
+  if (isJudgeQuestionType(question.question_type)) {
+    return getFixedJudgeOptions();
+  }
+  return question.options.filter((option) => option.trim());
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

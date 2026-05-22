@@ -1804,7 +1804,7 @@ apps/web/app/
 - 前端请求遇到 401 时会自动尝试 refresh 一次并重试原请求
 - 前端退出登录会调用后端 logout，并清理本地 access/refresh token
 - 新增 `FailedRequestAuditMiddleware`
-- 主后端入口 `apps/api/main.py` 和新平台独立入口 `apps/api/app/main.py` 均已挂载失败请求审计中间件
+- 主后端入口 `apps/api/main.py` 已挂载失败请求审计中间件；历史 `apps/api/app/main.py` 已不再作为启动入口
 - `/api/*` 与 `/platform/api/*` 的 4xx/5xx 响应会写入 `audit_logs`，记录状态码、路径、方法和 query
 - 已通过临时 SQLite 验证：refresh/logout 生效，logout 后 refresh 会失败；401 请求可写入 `failed_request` 审计日志
 
@@ -2189,10 +2189,7 @@ apps/web/app/
     - 选择题 -> `single_choice`
     - 案例题 -> `case_analysis`
     - 案例题 `subquestion_count = 2`
-- 本次补齐了可重复执行的解析器规则回归脚本链路：
-  - `scripts/verify_paper_parser.py`
-  - `scripts/verify-paper-parser.ps1`
-  - 当前已经可以稳定输出文本样本的 `section_name / section_type / question_count / question_type / subquestion_count / stem_preview`
+- 旧的解析器规则回归脚本链路（`scripts/verify_paper_parser.py` / `scripts/verify-paper-parser.ps1`）已随规则切题退役，不再作为当前回归入口
 - 本次还做了真实 `parse_paper` 端到端回归探测，并把环境差异查清楚了：
   - 已显式绑定到当前 API 正在使用的 MySQL：
     - `mysql+pymysql://examkit:examkit123@127.0.0.1:3310/exam_kit_portsverify?charset=utf8mb4`
@@ -2221,10 +2218,7 @@ apps/web/app/
   - 这说明当前端到端回归的真实结论已经更新为：
     - 新的分区/题型规则本身可用
     - 当前主要环境差异风险不再是 `fitz` 缺失本身，而是“不要误用系统 python 去判断 API 运行环境”
-- 本次新增了回归脚本文件：
-  - `scripts/verify-paper-parser.ps1`
-  - 说明：脚本目标已明确，是给后续会话提供“文本样本 -> 分区/题型结果”的快速回归入口
-  - 当前这条脚本链路已经跑通；后续重点不再是脚本本身，而是 PDF 端到端依赖与回退策略
+- 历史回归脚本 `scripts/verify-paper-parser.ps1` 已退役；当前应以 API 端到端回归和数据集样本人工复核为准
 
 当前这一步说明：
 
@@ -2623,8 +2617,7 @@ MySQL 迁移这个功能已经完成了“配置控制 + 脚本执行 + 状态�
 - PowerShell 管道直接传中文测试脚本可能出现编码降级，集成验证建议使用 UTF-8 文件或 Unicode 转义字符串
 - 后续若继续推进专业版平台，应继续保持“不覆盖旧功能”的接入原则
 - 本次验证时还确认了一个脚本约束：`UseLocalMySql` 场景下应先完成 Web 冲突判断，再启动本地 MySQL，再启动新 API；后续若再改 `start.ps1`，不要把这个顺序改回去
-- 当前 `verify-paper-parser.ps1` 的目标和样本格式已经明确，但脚本本身仍需再做一轮 PowerShell 字符串兼容性收尾；继续推进解析器时，优先以 Python 直接调用 `_split_paper_sections / _parse_question_block` 的结果为准
-- 当前 `verify-paper-parser.ps1` 已能稳定调用 `scripts/verify_paper_parser.py`；如果后续继续补解析器，优先用这条脚本验证“文本样本 -> 分区/题型”结果
+- 历史 `verify-paper-parser.ps1` / `verify_paper_parser.py` 链路已随规则切题移除，不再维护；继续推进解析器时，优先走 API 端到端链路或直接复核已导出的 `ai_prediction`
 - 当前解析器端到端回归必须显式使用 `apps/api/.venv/Scripts/python.exe` 或直接走正在运行的 API；不要再用系统 `python` 的依赖情况误判真实联调链路
 - 当前 `.venv` 环境下应以 `fitz` 与 `paddleocr` 作为 PDF/图像解析依赖基线；后续增强结构化解析时继续围绕 PaddleOCR 能力扩展
 - 当前解析器仍然是“文本规则版”，尚未做到真正的 PDF 版面坐标分析；复杂材料题、跨页题、表格题和 OCR 噪声场景仍需要后续增强
@@ -2682,7 +2675,7 @@ MySQL 迁移这个功能已经完成了“配置控制 + 脚本执行 + 状态�
 
 后端核心新增：
 
-- `apps/api/app/main.py`
+- `apps/api/main.py`
 - `apps/api/app/core/config.py`
 - `apps/api/app/core/security.py`
 - `apps/api/app/db/session.py`
@@ -2703,8 +2696,6 @@ MySQL 迁移这个功能已经完成了“配置控制 + 脚本执行 + 状态�
 - `.env.example`
 - `scripts/start-local-mysql.ps1`
 - `scripts/verify-platform-read-apis.ps1`
-- `scripts/verify_paper_parser.py`
-- `scripts/verify-paper-parser.ps1`
 - `scripts/start.ps1`
 - `scripts/stop.ps1`
 
@@ -2743,7 +2734,7 @@ MySQL 迁移这个功能已经完成了“配置控制 + 脚本执行 + 状态�
 如果后续会话要继续开发，建议先读以下文件：
 
 1. `docs/PRO_EDU_PLATFORM_ARCHITECTURE.md`
-2. `apps/api/app/main.py`
+2. `apps/api/main.py`
 3. `apps/api/app/db/bootstrap.py`
 4. `apps/api/app/models/__init__.py`
 5. `apps/api/app/api/router.py`
@@ -2763,7 +2754,7 @@ MySQL 迁移这个功能已经完成了“配置控制 + 脚本执行 + 状态�
 - 如果回归脚本里只有 `system.status` 通过、其余查库接口失败，优先检查 `data/run/ports.json` 指向的本地 MySQL 端口是否仍在监听
 - `/platform/settings` 现在已经能同时展示数据库来源、`ports.json` 对齐状态和 API / Web / MySQL 在线探测；如果页面显示“配置存在但实例离线”，优先检查 `ports.json` 是否陈旧、以及对应进程是否已退出
 - `start.ps1 -UseLocalMySql` 现在已经补上同仓库 `apps/web` 的显式冲突提示；如果它提示不要拉第二个 Next.js dev server，优先复用现有 `3000 / 8000` 链路，或先执行 `scripts/stop.ps1 -AlsoKnownPorts`
-- 解析器第一版核心规则已经落在 `apps/api/app/services/papers.py`，且 `scripts/verify-paper-parser.ps1` 已可用于文本样本回归
+- 解析器当前应以 API 端到端链路和已导出的 `ai_prediction` 为回归基准；旧 `verify-paper-parser.ps1` 已下线
 - 真实 `parse_paper` 端到端回归已经在当前 MySQL 上跑通；继续接手解析器时，优先复用 `apps/api/.venv/Scripts/python.exe` 或直接走 API，而不是系统 `python`
 - 原始题人工复核工作台第一版代码已经落地；如果当前 `8000` 上调 `batch-review` 仍是 `405`，优先重启 API 进程并确认 MySQL 端口仍在线
 - 当前 `batch-review` 的路由顺序和 `review_note` 缺列问题都已经修完；如果下次仍调不通，优先判断的是“API 是否完成启动”，而不是继续改这两处代码

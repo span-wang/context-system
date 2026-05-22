@@ -9,7 +9,10 @@ import {
   Database,
   ExternalLink,
   FileText,
+  Pencil,
+  PlusCircle,
   RefreshCw,
+  Save,
   Send,
   ShieldCheck,
   SquareCheck,
@@ -46,6 +49,7 @@ const generationDraftKey = "context-for-xhs:generation-draft";
 const generationJobKey = "context-for-xhs:last-generation-job";
 const generationJobIdKey = "context-for-xhs:last-generation-job-id";
 const reviewModeKey = "context-for-xhs:review-mode";
+const userNotesPresetKey = "context-for-xhs:generation-user-notes-presets";
 const promptSourcePreviewChars = 200_000;
 const layoutPromptKey = "context-for-xhs:layout-prompt";
 const reviewModes = Object.keys(reviewModeLabels) as ReviewMode[];
@@ -76,7 +80,13 @@ type GenerationDraft = {
   mode: GenerationMode;
   selected: string[];
   saveUploads: boolean;
+  selectedUserNotesPresetId?: string;
   form: GenerationForm;
+};
+type UserNotesPreset = {
+  id: string;
+  name: string;
+  content: string;
 };
 
 const defaultForm: GenerationForm = {
@@ -174,6 +184,11 @@ export default function GeneratePage() {
   const [openMultiSelect, setOpenMultiSelect] = useState<"library" | "ragflow" | null>(null);
   const [reviewPanelOpen, setReviewPanelOpen] = useState(false);
   const [highlightText, setHighlightText] = useState("");
+  const [userNotesPresets, setUserNotesPresets] = useState<UserNotesPreset[]>([]);
+  const [selectedUserNotesPresetId, setSelectedUserNotesPresetId] = useState("");
+  const [userNotesPresetDraftName, setUserNotesPresetDraftName] = useState("");
+  const [userNotesPresetEditorMode, setUserNotesPresetEditorMode] = useState<"create" | "edit" | null>(null);
+  const [userNotesPresetMessage, setUserNotesPresetMessage] = useState("");
 
   async function loadFiles() {
     const data = await apiFetch<LibraryFile[]>("/api/library/files");
@@ -315,6 +330,7 @@ export default function GeneratePage() {
       setMode(draft.mode);
       setSelected(draft.selected);
       setSaveUploads(draft.saveUploads);
+      setSelectedUserNotesPresetId(draft.selectedUserNotesPresetId || "");
       setForm({ ...defaultForm, ...draft.form });
     }
     setReviewMode(readMemory<ReviewMode>(reviewModeKey) || "hybrid");
@@ -325,6 +341,7 @@ export default function GeneratePage() {
         setForm((current) => ({ ...current, layout_mode_id: layoutDraft.modeId }));
       }
     }
+    setUserNotesPresets(normalizeUserNotesPresets(readMemory<unknown>(userNotesPresetKey)));
 
     let cancelled = false;
     const rememberedJob = readMemory<GenerationJob>(generationJobKey);
@@ -361,6 +378,7 @@ export default function GeneratePage() {
       mode,
       selected,
       saveUploads,
+      selectedUserNotesPresetId,
       form,
     });
     writeMemory<ReviewMode>(reviewModeKey, reviewMode);
@@ -368,7 +386,18 @@ export default function GeneratePage() {
       enabled: useLayoutPrompt,
       modeId: form.layout_mode_id,
     });
-  }, [form, memoryReady, mode, reviewMode, saveUploads, selected, useLayoutPrompt]);
+    writeMemory<UserNotesPreset[]>(userNotesPresetKey, userNotesPresets);
+  }, [
+    form,
+    memoryReady,
+    mode,
+    reviewMode,
+    saveUploads,
+    selected,
+    selectedUserNotesPresetId,
+    useLayoutPrompt,
+    userNotesPresets,
+  ]);
 
   const selectedFiles = useMemo(() => files.filter((file) => selected.includes(file.id)), [files, selected]);
   const selectedMissingFileIds = useMemo(
@@ -395,6 +424,10 @@ export default function GeneratePage() {
   const activeLayoutMode = useMemo(
     () => layoutModes.find((layoutMode) => layoutMode.id === form.layout_mode_id) || null,
     [form.layout_mode_id, layoutModes]
+  );
+  const selectedUserNotesPreset = useMemo(
+    () => userNotesPresets.find((preset) => preset.id === selectedUserNotesPresetId) || null,
+    [selectedUserNotesPresetId, userNotesPresets]
   );
   const selectedRagflowDatasetIds = useMemo(
     () => parseDatasetIds(form.ragflow_dataset_ids),
@@ -425,6 +458,16 @@ export default function GeneratePage() {
         ? "选择 RAGFlow dataset"
         : "还没有拉取到可用 dataset";
 
+  useEffect(() => {
+    if (!selectedUserNotesPresetId) return;
+    if (userNotesPresets.some((preset) => preset.id === selectedUserNotesPresetId)) return;
+    setSelectedUserNotesPresetId("");
+    if (userNotesPresetEditorMode === "edit") {
+      setUserNotesPresetEditorMode(null);
+      setUserNotesPresetDraftName("");
+    }
+  }, [selectedUserNotesPresetId, userNotesPresetEditorMode, userNotesPresets]);
+
   function toggleFile(id: string) {
     setSelected((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
   }
@@ -435,6 +478,81 @@ export default function GeneratePage() {
       const nextIds = datasetIds.includes(id) ? datasetIds.filter((item) => item !== id) : [...datasetIds, id];
       return { ...current, ragflow_dataset_ids: nextIds.join(", ") };
     });
+  }
+
+  function applySelectedUserNotesPreset() {
+    if (!selectedUserNotesPreset) {
+      setUserNotesPresetMessage("请先选择一个补充说明预设。");
+      return;
+    }
+    setForm((current) => ({ ...current, user_notes: selectedUserNotesPreset.content }));
+    setUserNotesPresetMessage(`已套用预设：${selectedUserNotesPreset.name}`);
+  }
+
+  function startCreateUserNotesPreset() {
+    setUserNotesPresetEditorMode("create");
+    setUserNotesPresetDraftName("");
+    setUserNotesPresetMessage("保存时会使用当前补充说明内容。");
+  }
+
+  function startEditUserNotesPreset() {
+    if (!selectedUserNotesPreset) {
+      setUserNotesPresetMessage("请先选择一个补充说明预设。");
+      return;
+    }
+    setUserNotesPresetEditorMode("edit");
+    setUserNotesPresetDraftName(selectedUserNotesPreset.name);
+    setForm((current) => ({ ...current, user_notes: selectedUserNotesPreset.content }));
+    setUserNotesPresetMessage("已载入预设内容，修改下方说明后可保存覆盖。");
+  }
+
+  function cancelUserNotesPresetEdit() {
+    setUserNotesPresetEditorMode(null);
+    setUserNotesPresetDraftName("");
+    setUserNotesPresetMessage("");
+  }
+
+  function saveUserNotesPreset() {
+    const name = userNotesPresetDraftName.trim();
+    const content = form.user_notes.trim();
+    const normalizedName = normalizePresetName(name);
+    const editingPresetId = userNotesPresetEditorMode === "edit" ? selectedUserNotesPresetId : "";
+    if (!name) {
+      setUserNotesPresetMessage("请先填写预设名称。");
+      return;
+    }
+    if (!content) {
+      setUserNotesPresetMessage("补充说明还是空的，先写一点内容再保存。");
+      return;
+    }
+    if (userNotesPresets.some((preset) => normalizePresetName(preset.name) === normalizedName && preset.id !== editingPresetId)) {
+      setUserNotesPresetMessage("已有同名预设，请换个名称或直接编辑原预设。");
+      return;
+    }
+    if (userNotesPresetEditorMode === "edit") {
+      if (!selectedUserNotesPreset) {
+        setUserNotesPresetMessage("当前选中的预设不存在，请重新选择。");
+        return;
+      }
+      setUserNotesPresets((current) =>
+        current.map((preset) => (preset.id === selectedUserNotesPreset.id ? { ...preset, name, content } : preset))
+      );
+      setUserNotesPresetMessage(`已更新预设：${name}`);
+      setUserNotesPresetEditorMode(null);
+      setUserNotesPresetDraftName("");
+      return;
+    }
+
+    const nextPreset = {
+      id: createClientId("user-notes-preset"),
+      name,
+      content,
+    };
+    setUserNotesPresets((current) => [...current, nextPreset]);
+    setSelectedUserNotesPresetId(nextPreset.id);
+    setUserNotesPresetEditorMode(null);
+    setUserNotesPresetDraftName("");
+    setUserNotesPresetMessage(`已新增预设：${name}`);
   }
 
   async function loadLayoutTemplate(modeId = form.layout_mode_id) {
@@ -956,12 +1074,67 @@ export default function GeneratePage() {
             )}
 
             <div className="field">
-              <label>补充说明</label>
+              <div className="fieldHeader">
+                <label>补充说明</label>
+                <span className="badge">{userNotesPresets.length} 个预设</span>
+              </div>
+              <div className="notePresetBar">
+                <select
+                  className="notePresetSelect"
+                  value={selectedUserNotesPresetId}
+                  onChange={(event) => {
+                    setSelectedUserNotesPresetId(event.target.value);
+                    setUserNotesPresetMessage("");
+                  }}
+                >
+                  <option value="">选择预设后可套用</option>
+                  {userNotesPresets.map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {preset.name}
+                    </option>
+                  ))}
+                </select>
+                <div className="notePresetActions">
+                  <button className="button small" type="button" onClick={applySelectedUserNotesPreset}>
+                    <Clipboard size={15} />
+                    套用
+                  </button>
+                  <button className="button small" type="button" onClick={startCreateUserNotesPreset}>
+                    <PlusCircle size={15} />
+                    新增预设
+                  </button>
+                  <button className="button small" type="button" onClick={startEditUserNotesPreset}>
+                    <Pencil size={15} />
+                    编辑预设
+                  </button>
+                </div>
+              </div>
+              {userNotesPresetEditorMode && (
+                <div className="notePresetEditor">
+                  <input
+                    placeholder="例如：考前冲刺口吻 / 错题纠偏 / 高频陷阱提醒"
+                    value={userNotesPresetDraftName}
+                    onChange={(event) => setUserNotesPresetDraftName(event.target.value)}
+                  />
+                  <div className="buttonRow">
+                    <button className="button small" type="button" onClick={saveUserNotesPreset}>
+                      <Save size={15} />
+                      {userNotesPresetEditorMode === "edit" ? "保存修改" : "保存为预设"}
+                    </button>
+                    <button className="button small" type="button" onClick={cancelUserNotesPresetEdit}>
+                      取消
+                    </button>
+                  </div>
+                  <p className="muted notePresetMeta">保存预设时会直接使用下方“补充说明”的当前内容。</p>
+                </div>
+              )}
               <textarea
                 value={form.user_notes}
                 onChange={(e) => setForm({ ...form, user_notes: e.target.value })}
                 placeholder="Example: use a concise Xiaohongshu tone and focus on common mistakes before the exam."
               />
+              <p className="muted notePresetMeta">选择预设后不会自动覆盖当前内容，点击“套用”才会回填。</p>
+              {userNotesPresetMessage && <p className="muted notePresetMeta">{userNotesPresetMessage}</p>}
             </div>
 
             <div className="layoutPromptBox">
@@ -1223,6 +1396,27 @@ function parseDatasetIds(value: string) {
     .split(/[,\s，]+/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function normalizeUserNotesPresets(value: unknown): UserNotesPreset[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const preset = item as Partial<UserNotesPreset>;
+    const id = typeof preset.id === "string" ? preset.id.trim() : "";
+    const name = typeof preset.name === "string" ? preset.name.trim() : "";
+    const content = typeof preset.content === "string" ? preset.content.trim() : "";
+    if (!id || !name || !content) return [];
+    return [{ id, name, content }];
+  });
+}
+
+function normalizePresetName(value: string) {
+  return value.trim().toLocaleLowerCase();
+}
+
+function createClientId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function composeLayoutPrompt(template: string, sourceContent: string) {

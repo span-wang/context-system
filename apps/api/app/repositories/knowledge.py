@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from app.models import (
     AnalysisJob,
@@ -156,26 +157,34 @@ class KnowledgeRepository(Repository):
     def delete_chapters(self, chapter_ids: list[int]) -> int:
         if not chapter_ids:
             return 0
-        return int(
-            self.session.query(Chapter)
-            .filter(Chapter.id.in_(chapter_ids))
-            .delete(synchronize_session=False)
-        )
+        deleted = 0
+        for ids_at_level in self._entity_ids_grouped_by_level(Chapter, chapter_ids):
+            deleted += int(
+                self.session.query(Chapter)
+                .filter(Chapter.id.in_(ids_at_level))
+                .delete(synchronize_session=False)
+            )
+        return deleted
 
     def delete_knowledge_points(self, point_ids: list[int]) -> int:
         if not point_ids:
             return 0
+        self._delete_optional_rows("mastery_snapshots", "knowledge_point_id", point_ids)
+        self._delete_optional_rows("question_knowledge_links", "knowledge_point_id", point_ids)
         self.session.query(KnowledgePointAlias).filter(
             KnowledgePointAlias.knowledge_point_id.in_(point_ids)
         ).delete(synchronize_session=False)
         self.session.query(KnowledgePointRelation).filter(
             KnowledgePointRelation.from_kp_id.in_(point_ids) | KnowledgePointRelation.to_kp_id.in_(point_ids)
         ).delete(synchronize_session=False)
-        return int(
-            self.session.query(KnowledgePoint)
-            .filter(KnowledgePoint.id.in_(point_ids))
-            .delete(synchronize_session=False)
-        )
+        deleted = 0
+        for ids_at_level in self._entity_ids_grouped_by_level(KnowledgePoint, point_ids):
+            deleted += int(
+                self.session.query(KnowledgePoint)
+                .filter(KnowledgePoint.id.in_(ids_at_level))
+                .delete(synchronize_session=False)
+            )
+        return deleted
 
     def point_ids_by_chapter_ids(self, chapter_ids: list[int]) -> list[int]:
         if not chapter_ids:
@@ -213,3 +222,32 @@ class KnowledgeRepository(Repository):
             "removed_question_count": 0,
             "removed_bank_question_count": 0,
         }
+
+    def _entity_ids_grouped_by_level(self, model, entity_ids: list[int]) -> list[list[int]]:
+        rows = self.session.execute(
+            select(model.id, model.level).where(model.id.in_(entity_ids))
+        ).all()
+        ids_by_level: dict[int, list[int]] = {}
+        for entity_id, level in rows:
+            ids_by_level.setdefault(int(level or 0), []).append(int(entity_id))
+        return [ids_by_level[level] for level in sorted(ids_by_level.keys(), reverse=True)]
+
+    def _delete_optional_rows(self, table_name: str, column_name: str, entity_ids: list[int]) -> None:
+        if not entity_ids:
+            return
+        placeholders = ", ".join(f":id_{index}" for index in range(len(entity_ids)))
+        params = {f"id_{index}": entity_id for index, entity_id in enumerate(entity_ids)}
+        try:
+            self.session.execute(
+                text(f"DELETE FROM {table_name} WHERE {column_name} IN ({placeholders})"),
+                params,
+            )
+        except (OperationalError, ProgrammingError) as exc:
+            message = str(exc).lower()
+            if table_name.lower() in message and (
+                "no such table" in message
+                or "doesn't exist" in message
+                or "unknown table" in message
+            ):
+                return
+            raise

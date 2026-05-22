@@ -6,9 +6,20 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from library.trained_ocr_cleaner import should_drop_line
+
 
 _ZERO_WIDTH_PATTERN = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff]")
 _CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CIRCLED_NUMBER_PATTERN = re.compile(
+    "["
+    "\u2460-\u2473"  # circled 1-20
+    "\u24ea\u24f5-\u24ff"  # circled/double-circled 0-10
+    "\u2776-\u2793"  # dingbat circled 1-10 variants
+    "\u3251-\u325f"  # circled 21-35
+    "\u32b1-\u32bf"  # circled 36-50
+    "]"
+)
 _PAGE_NUMBER_PATTERN = re.compile(r"^(?:第\s*)?\d+\s*(?:页|頁|/+\s*\d+)?$")
 _PAGE_X_OF_Y_PATTERN = re.compile(r"^(?:page\s*)?\d+\s*/\s*\d+$", re.IGNORECASE)
 _DIGIT_ONLY_PATTERN = re.compile(r"^\d{1,3}$")
@@ -25,6 +36,10 @@ _ANSWER_INLINE_PATTERN = re.compile(r"(?:答案|参考答案|正确答案)\s*[:�
 _ANALYSIS_INLINE_PATTERN = re.compile(r"(?:解析|答案解析|【解析】)\s*[:：]?\s*")
 _ANSWER_HEADER_PATTERN = re.compile(r"^\s*(?:#+\s*)?(?:答案|参考答案|正确答案)\s*[:：]\s*", re.IGNORECASE)
 _ANALYSIS_HEADER_PATTERN = re.compile(r"^\s*(?:#+\s*)?(?:解析|答案解析|【解析】)\s*(?:[:：]\s*|\n+)", re.IGNORECASE)
+_OPTION_PREFIX_PATTERN = re.compile(r"^[A-H][\.\、．)]\s*")
+_INLINE_QUESTION_START_PATTERN = re.compile(
+    r"(?<!^)(?<!\d)(?:第\s*)?(?:\d{1,3}|[一二三四五六七八九十百]{1,6})\s*(?:题|[\.、．)])\s*(?=\S)"
+)
 _NOISE_HINTS = ("二维码", "公众号", "微信", "扫一扫", "扫描", "内部资料", "仅供参考", "版权所有")
 
 
@@ -185,6 +200,40 @@ def raw_document_snapshot(document: Any) -> dict[str, Any]:
     }
 
 
+def maybe_clean_parsed_document(
+    document: Any,
+    *,
+    raw_ocr_mode: bool = False,
+    force: bool = False,
+) -> Any:
+    if document is None:
+        return document
+    provider = str(getattr(document, "provider", "") or "").lower()
+    used_ocr = bool(getattr(document, "used_ocr", False))
+    if raw_ocr_mode and _should_clean(provider, used_ocr):
+        return _prepare_raw_ocr_document(document)
+    return clean_parsed_document(document, force=force)
+
+
+def _prepare_raw_ocr_document(document: Any) -> Any:
+    snapshot = raw_document_snapshot(document)
+    restored_text = snapshot["raw_text"]
+    restored_markdown = snapshot["raw_markdown"] or restored_text
+    for field_name, value in (
+        ("text", restored_text),
+        ("markdown", restored_markdown),
+        ("raw_text", restored_text),
+        ("raw_markdown", restored_markdown),
+        ("cleanup_report", {}),
+        ("cleanup_score", None),
+    ):
+        try:
+            setattr(document, field_name, value)
+        except Exception:
+            continue
+    return document
+
+
 def _build_page_inputs(document: Any) -> list[_PageInput]:
     pages: list[_PageInput] = []
     raw_pages = list(getattr(document, "pages", []) or [])
@@ -293,11 +342,29 @@ def _normalize_text(text: str) -> str:
     value = text.replace("\ufeff", "")
     value = _ZERO_WIDTH_PATTERN.sub("", value)
     value = _CONTROL_PATTERN.sub(" ", value)
+    value, protected_circled_numbers = _protect_circled_numbers(value)
     value = unicodedata.normalize("NFKC", value)
+    value = _restore_protected_circled_numbers(value, protected_circled_numbers)
     value = value.replace("\r\n", "\n").replace("\r", "\n")
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
+
+
+def _protect_circled_numbers(text: str) -> tuple[str, list[str]]:
+    protected: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        protected.append(match.group(0))
+        return f"\ue000OCR_CIRCLED_NUMBER_{len(protected) - 1}\ue001"
+
+    return _CIRCLED_NUMBER_PATTERN.sub(replace, text), protected
+
+
+def _restore_protected_circled_numbers(text: str, protected: list[str]) -> str:
+    for index, value in enumerate(protected):
+        text = text.replace(f"\ue000OCR_CIRCLED_NUMBER_{index}\ue001", value)
+    return text
 
 
 def _normalize_line(line: str, *, preserve_markdown: bool) -> str:
@@ -353,6 +420,8 @@ def _looks_like_noise_prefix(text: str) -> bool:
     normalized = re.sub(r"\s+", "", text.strip())
     if not normalized:
         return False
+    if _OPTION_PREFIX_PATTERN.match(text.strip()):
+        return False
     if _SYMBOL_ONLY_PATTERN.match(normalized):
         return True
     if any(hint in normalized for hint in _NOISE_HINTS):
@@ -400,6 +469,8 @@ def _is_noise_line(text: str, repeated_noise: set[str]) -> bool:
         return True
     if any(hint in normalized for hint in _NOISE_HINTS):
         return True
+    if should_drop_line(normalized):
+        return True
     if normalized.isdigit() and len(normalized) > 1:
         return False
     if len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", normalized)) <= 1 and len(normalized) <= 8:
@@ -434,6 +505,13 @@ def _is_high_signal(text: str) -> bool:
 
 
 def _expand_structural_line(text: str) -> list[str]:
+    question_segments = _split_inline_question_segments(text)
+    if len(question_segments) > 1:
+        expanded: list[str] = []
+        for segment in question_segments:
+            expanded.extend(_expand_structural_line(segment))
+        return [item for item in expanded if item]
+
     answer_match = _ANSWER_INLINE_PATTERN.search(text)
     analysis_match = _ANALYSIS_INLINE_PATTERN.search(text)
     solution_start: int | None = None
@@ -453,6 +531,56 @@ def _expand_structural_line(text: str) -> list[str]:
     if solution_part:
         parts.extend(_split_solution_segments(solution_part))
     return [item for item in parts if item] or [text]
+
+
+def _split_inline_question_segments(text: str) -> list[str]:
+    current = text.strip()
+    if not current:
+        return []
+
+    parts: list[str] = []
+    while current:
+        match = _find_inline_question_boundary(current)
+        if match is None:
+            parts.append(current.strip())
+            break
+        prefix = current[: match.start()].strip()
+        suffix = current[match.start() :].strip()
+        if prefix:
+            parts.append(prefix)
+        current = suffix
+    return [part for part in parts if part]
+
+
+def _find_inline_question_boundary(text: str) -> re.Match[str] | None:
+    for match in _INLINE_QUESTION_START_PATTERN.finditer(text):
+        prefix = text[: match.start()].strip()
+        suffix = text[match.start() :].strip()
+        if _is_inline_question_boundary(prefix, suffix):
+            return match
+    return None
+
+
+def _is_inline_question_boundary(prefix: str, suffix: str) -> bool:
+    if not prefix or not suffix:
+        return False
+    match = _QUESTION_START_PATTERN.match(suffix)
+    if match is None:
+        return False
+    body = suffix[match.end() :].strip()
+    if len(body) < 2 or _looks_like_numeric_fragment(body):
+        return False
+    if _SECTION_HEADER_PATTERN.match(prefix):
+        return True
+    if _OPTION_LINE_PATTERN.match(prefix):
+        return True
+    if len(_OPTION_LABEL_PATTERN.findall(prefix)) >= 2:
+        return True
+    if _ANSWER_INLINE_PATTERN.search(prefix) or _ANALYSIS_INLINE_PATTERN.search(prefix):
+        return True
+    if prefix.endswith(("。", "！", "？", "；", ";", ")", "）", "]", "】")):
+        return True
+    return False
 
 
 def _split_dense_option_line(line: str) -> list[str]:
@@ -543,12 +671,46 @@ def _should_merge(previous: str, current: str) -> bool:
         return False
     if len(previous) > 64 and previous.endswith(("。", "！", "？", ")", "）")):
         return False
+    if _looks_like_wrapped_text_line(previous, current):
+        return True
     return len(previous) <= 32 or previous.endswith(("：", ":", "，", ",", "（", "(", "、"))
 
 
 def _is_numeric_amount_line(text: str) -> bool:
     compact = re.sub(r"\s+", "", text.strip())
     return compact.isdigit() and 1 <= len(compact) <= 3
+
+
+def _looks_like_wrapped_text_line(previous: str, current: str) -> bool:
+    if len(previous) < 18 or len(current) < 2:
+        return False
+    if previous.endswith(("。", "！", "？", "；", ";")):
+        return False
+    if current.startswith(("答案", "解析", "正确答案", "参考答案")):
+        return False
+    if _looks_like_numeric_fragment(previous) or _looks_like_numeric_fragment(current):
+        return False
+    signal_chars = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", current)
+    if len(signal_chars) < 2:
+        return False
+    if re.match(r"^[，,。．、；;：:）)\]】%]", current):
+        return True
+    if re.search(r"[\u4e00-\u9fffA-Za-z0-9]$", previous) and re.match(r"^[\u4e00-\u9fffA-Za-z0-9]", current):
+        return True
+    return False
+
+
+def _looks_like_numeric_fragment(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text.strip())
+    if not compact:
+        return False
+    if re.fullmatch(r"\d+(?:\.\d+)+", compact):
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+)?(?:万元|元|分|%)", compact):
+        return True
+    if re.fullmatch(r"[\d+\-*/=.()（）万元元分%]+", compact) and any(char.isdigit() for char in compact):
+        return True
+    return False
 
 
 def _estimate_quality_score(text: str, report: OCRCleanupReport) -> float:

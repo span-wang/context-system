@@ -1,5 +1,6 @@
 from .analysis import AnalysisJob
 from .asset import Asset, ExamPaper, PaperSection
+from .learning import MasterySnapshot, PracticeAnswer, PracticeSession, PracticeSessionItem, WrongBookItem
 from .legacy import (
     LegacyBackgroundTask,
     LegacyGenerationJob,
@@ -31,9 +32,13 @@ __all__ = [
     "LegacyLibraryParseResult",
     "LegacyWorkflowEvent",
     "LegacyWorkflowTopic",
+    "MasterySnapshot",
     "PaperReviewQuestion",
     "PaperReviewQuestionKnowledgePoint",
     "PaperSection",
+    "PracticeAnswer",
+    "PracticeSession",
+    "PracticeSessionItem",
     "QuestionBankItem",
     "QuestionBankSourceLink",
     "ReviewTask",
@@ -43,4 +48,5 @@ __all__ = [
     "Tenant",
     "User",
     "UserRole",
+    "WrongBookItem",
 ]

@@ -17,6 +17,8 @@ _RUNTIME_PAPER_STATUSES = {
     "ocr_running",
     "layout_analyzing",
     "ocr_fallback_running",
+    "vl15_running",
+    "ai_cleaning",
     "splitting_questions",
     "building_sections",
     "tagging",
@@ -29,6 +31,8 @@ _RUNTIME_ASSET_STATUSES = {
     "ocr_running",
     "layout_analyzing",
     "ocr_fallback_running",
+    "vl15_running",
+    "ai_cleaning",
     "splitting_questions",
     "building_sections",
     "tagging",
@@ -103,10 +107,13 @@ def _sync_paper_parse_job_status(session: Session, paper_id: int, job: AnalysisJ
         return False
 
     changed = False
+    execution_mode = _paper_parse_execution_mode(job)
     if job.job_type == "paper_parse":
-        if job.status == "completed" and paper.status != "parsed":
-            paper.status = "parsed"
-            changed = True
+        if job.status == "completed":
+            target_status = "source_ready" if execution_mode == "ocr_only" else "parsed"
+            if paper.status not in {"parsed", target_status}:
+                paper.status = target_status
+                changed = True
         elif job.status == "failed" and paper.status in _RUNTIME_PAPER_STATUSES:
             paper.status = "parse_failed"
             changed = True
@@ -117,8 +124,9 @@ def _sync_paper_parse_job_status(session: Session, paper_id: int, job: AnalysisJ
 
     if job.job_type == "paper_parse":
         if job.status == "completed":
-            if asset.parse_status != "parsed":
-                asset.parse_status = "parsed"
+            target_status = "source_ready" if execution_mode == "ocr_only" else "parsed"
+            if asset.parse_status not in {"parsed", target_status}:
+                asset.parse_status = target_status
                 changed = True
             if asset.ocr_status != "completed":
                 asset.ocr_status = "completed"
@@ -158,3 +166,9 @@ def _paper_id_from_scope(scope: dict[str, object]) -> int | None:
     except (TypeError, ValueError):
         return None
     return paper_id if paper_id > 0 else None
+
+
+def _paper_parse_execution_mode(job: AnalysisJob) -> str:
+    summary = job.result_summary_json or {}
+    scope = job.scope_config_json or {}
+    return str(summary.get("execution_mode") or scope.get("execution_mode") or "full_chain")

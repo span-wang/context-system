@@ -13,7 +13,7 @@ from sqlalchemy import select
 from app.db.session import SessionLocal
 from app.models import Asset, ExamPaper
 from app.services.papers import PaperService
-from library.ocr_cleaner import clean_parsed_document
+from library.ocr_cleaner import maybe_clean_parsed_document
 from library.ocr_cleaner import raw_document_snapshot
 from library.parse_options import DocumentParseOptions
 from library.parser import (
@@ -151,7 +151,7 @@ class LibraryService:
         if not force_reparse and structured_cache_path.exists():
             parsed = deserialize_parsed_document(structured_cache_path.read_text(encoding="utf-8"))
             if parsed is not None:
-                parsed = clean_parsed_document(parsed, force=True)
+                parsed = maybe_clean_parsed_document(parsed, raw_ocr_mode=options.use_raw_ocr_mode(), force=True)
                 if _is_stale_parse_cache(parsed):
                     structured_cache_path.unlink(missing_ok=True)
                     text_cache_path.unlink(missing_ok=True)
@@ -165,7 +165,16 @@ class LibraryService:
 
         if not force_reparse and text_cache_path.exists():
             text = text_cache_path.read_text(encoding="utf-8")
-            parsed = clean_parsed_document(ParsedDocument(text=text, markdown=text, provider="legacy_cache"), force=True)
+            parsed = maybe_clean_parsed_document(
+                ParsedDocument(
+                    text=text,
+                    markdown=text,
+                    provider="legacy_ocr_cache" if options.use_raw_ocr_mode() else "legacy_cache",
+                    used_ocr=options.use_raw_ocr_mode(),
+                ),
+                raw_ocr_mode=options.use_raw_ocr_mode(),
+                force=True,
+            )
             structured_cache_path.write_text(serialize_parsed_document(parsed), encoding="utf-8")
             self._remember_parse_result(file.id, parsed, options=options, preview=preview)
             if progress_callback is not None:
@@ -186,7 +195,7 @@ class LibraryService:
             )
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"文件解析失败：{exc}") from exc
-        parsed = clean_parsed_document(parsed)
+        parsed = maybe_clean_parsed_document(parsed, raw_ocr_mode=options.use_raw_ocr_mode())
         text_cache_path.write_text(parsed.text, encoding="utf-8")
         structured_cache_path.write_text(serialize_parsed_document(parsed), encoding="utf-8")
         self._remember_parse_result(file.id, parsed, options=options, preview=preview)
@@ -195,6 +204,20 @@ class LibraryService:
     async def to_context_source(self, file_id: str, options: DocumentParseOptions | None = None) -> ContextSource:
         file = self.get_file(file_id)
         options = options or DocumentParseOptions()
+        stored_result = self.db.get_latest_library_parse_result(file.id)
+        if stored_result is not None:
+            self._sync_file_with_stored_result(file.id, stored_result)
+            self.db.mark_library_used(file_id)
+            source_label = f"素材库:{file.source_title or file.filename}"
+            if file.chapter:
+                source_label += f"::{file.chapter}"
+            return ContextSource(
+                text=_selected_stored_output(stored_result, options),
+                source_label=source_label,
+                source_type=file.source_type,
+                authority=file.source_authority,
+                file_id=file.id,
+            )
         parsed = await self.parse_and_cache(file, options=options)
         self.db.mark_library_used(file_id)
         source_label = f"素材库:{file.source_title or file.filename}"
@@ -231,7 +254,7 @@ class LibraryService:
             )
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"文件解析失败：{exc}") from exc
-        parsed = clean_parsed_document(parsed)
+        parsed = maybe_clean_parsed_document(parsed, raw_ocr_mode=options.use_raw_ocr_mode())
         source_title = self._display_source_title(metadata.source_title, filename)
         label = f"本次上传:{source_title}"
         if metadata.chapter:
@@ -257,12 +280,11 @@ class LibraryService:
         file = self.get_file(file_id)
         options = options or DocumentParseOptions()
         stored_result = self.db.get_latest_library_parse_result(file.id)
-        if not compare and stored_result is not None and (
-            stored_result.get("raw_text") is not None or stored_result.get("cleanup_report") is not None
-        ):
-            preview_markdown = str(stored_result.get("markdown") or stored_result.get("parsed_text") or "")
-            preview_text = str(stored_result.get("parsed_text") or preview_markdown)
-            preview_content = options.select_output(text=preview_text, markdown=preview_markdown)
+        if not compare and stored_result is not None:
+            self._sync_file_with_stored_result(file.id, stored_result)
+            preview_markdown = _stored_markdown(stored_result)
+            preview_text = _stored_text(stored_result)
+            preview_content = _selected_stored_output(stored_result, options)
             token_count = int(stored_result.get("token_count") or estimate_tokens(preview_markdown or preview_text))
             warnings = [str(item) for item in (stored_result.get("warnings") or []) if str(item).strip()]
             max_chars = max(1, min(max_chars, MAX_PREVIEW_CHARS))
@@ -273,8 +295,8 @@ class LibraryService:
                 "filename": file.filename,
                 "token_count": token_count,
                 "provider": str(stored_result.get("provider") or "stored_parse"),
-                "raw_text": str(stored_result.get("raw_text") or stored_result.get("parsed_text") or ""),
-                "raw_markdown": str(stored_result.get("raw_markdown") or stored_result.get("markdown") or preview_markdown),
+                "raw_text": str(stored_result.get("raw_text") or preview_text),
+                "raw_markdown": str(stored_result.get("raw_markdown") or preview_markdown),
                 "text": preview_text[:max_chars],
                 "markdown": preview_markdown[:max_chars],
                 "content": preview_content[:max_chars],
@@ -399,6 +421,14 @@ class LibraryService:
         persisted_markdown = parsed.markdown or parsed.text
         self.db.set_parsed_text(file_id, persisted_markdown, estimate_tokens(persisted_markdown))
 
+    def _sync_file_with_stored_result(self, file_id: str, stored_result: dict[str, object]) -> None:
+        persisted_markdown = _stored_markdown(stored_result)
+        self.db.set_parsed_text(
+            file_id,
+            persisted_markdown,
+            int(stored_result.get("token_count") or estimate_tokens(persisted_markdown)),
+        )
+
     def _parse_cache_paths(
         self,
         file: LibraryFile,
@@ -477,6 +507,19 @@ def _preview_payload(parsed: ParsedDocument, options: DocumentParseOptions) -> t
 
 def _selected_output(parsed: ParsedDocument, options: DocumentParseOptions) -> str:
     return options.select_output(text=parsed.text, markdown=parsed.markdown)
+
+
+def _stored_text(stored_result: dict[str, object]) -> str:
+    markdown = _stored_markdown(stored_result)
+    return str(stored_result.get("parsed_text") or markdown)
+
+
+def _stored_markdown(stored_result: dict[str, object]) -> str:
+    return str(stored_result.get("markdown") or stored_result.get("parsed_text") or "")
+
+
+def _selected_stored_output(stored_result: dict[str, object], options: DocumentParseOptions) -> str:
+    return options.select_output(text=_stored_text(stored_result), markdown=_stored_markdown(stored_result))
 
 
 def _is_stale_parse_cache(parsed: ParsedDocument) -> bool:

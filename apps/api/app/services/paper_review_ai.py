@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from llm.providers import get_llm_provider
+from settings import LLMEndpointConfig
 from settings import get_settings as get_llm_settings
 from settings import resolve_llm_api_key
 
@@ -37,8 +38,9 @@ _MISSING_VALUES = {
 }
 _ANSWER_PREFIX_PATTERN = re.compile(r"^(?:参考答案|正确答案|答案|answer)\s*[:：]?\s*", re.IGNORECASE)
 _ANALYSIS_PREFIX_PATTERN = re.compile(r"^(?:答案解析|解析|analysis)\s*[:：]?\s*", re.IGNORECASE)
-_OPTION_LABEL_PATTERN = re.compile(r"^\s*([A-Ha-h])\s*[\.\、．\)]?\s*(.+)$", re.S)
+_OPTION_LABEL_PATTERN = re.compile(r"^\s*([A-Ha-h])(?:[\.\、．\)]\s*|\s+(?=[^A-Za-z]))(.+)$", re.S)
 _OBJECTIVE_TYPES = {"single_choice", "multiple_choice", "judge"}
+_JUDGE_OPTIONS = ("正确", "错误")
 
 
 @dataclass(slots=True)
@@ -65,7 +67,7 @@ def normalize_question_fields(question: Any) -> bool:
         question.stem_text = stem
         changed = True
 
-    options = normalize_options(getattr(question, "options_json", None))
+    options = normalize_options(getattr(question, "options_json", None), getattr(question, "question_type", None))
     if options != (getattr(question, "options_json", None) or []):
         question.options_json = options
         changed = True
@@ -89,14 +91,16 @@ def normalize_question_text(value: str | None) -> str:
     return _clean_text(value, strip_noise_lines=True)
 
 
-def normalize_options(options: list[str] | None) -> list[str]:
+def normalize_options(options: list[str] | None, question_type: str | None = None) -> list[str]:
+    if _is_judge_question_type(question_type):
+        return list(_JUDGE_OPTIONS)
     normalized: list[str] = []
     seen: set[str] = set()
     for option in options or []:
         text = _clean_text(str(option), strip_noise_lines=True).replace("\n", " ")
         match = _OPTION_LABEL_PATTERN.match(text)
         if match:
-            text = f"{match.group(1).upper()}. {match.group(2).strip()}"
+            text = match.group(2).strip()
         text = re.sub(r"\s+", " ", text).strip()
         if not text or _is_missing_text(text) or _looks_like_noise_line(text):
             continue
@@ -130,8 +134,8 @@ def normalize_answer(value: str | None, question_type: str | None = None) -> str
     return text
 
 
-def normalize_analysis(value: str | None) -> str | None:
-    text = _clean_text(value, strip_noise_lines=True)
+def normalize_analysis(value: Any) -> str | None:
+    text = _normalize_analysis_content(value)
     if not text:
         return None
     text = _ANALYSIS_PREFIX_PATTERN.sub("", text).strip()
@@ -140,10 +144,43 @@ def normalize_analysis(value: str | None) -> str | None:
     return text
 
 
-def standardize_question_with_ai(question: Any, *, subject_name: str | None = None) -> AIQuestionResult:
-    provider, endpoint = _get_reviewer_provider()
+def _normalize_analysis_content(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for raw_label, raw_body in value.items():
+            label = _clean_text(str(raw_label), strip_noise_lines=True).replace("\n", " ").strip("：: ")
+            body = _normalize_analysis_content(raw_body)
+            if not body:
+                continue
+            if label:
+                parts.append(f"{label}：\n{body}" if "\n" in body else f"{label}：{body}")
+            else:
+                parts.append(body)
+        return "\n\n".join(part for part in parts if part).strip()
+    if isinstance(value, (list, tuple)):
+        rows: list[str] = []
+        for index, item in enumerate(value, start=1):
+            body = _normalize_analysis_content(item)
+            if not body:
+                continue
+            body_lines = body.splitlines() or [body]
+            rows.append(f"{index}. {body_lines[0]}")
+            rows.extend(f"   {line}" for line in body_lines[1:] if line.strip())
+        return "\n".join(rows).strip()
+    return _clean_text(str(value), strip_noise_lines=True)
+
+
+def standardize_question_with_ai(
+    question: Any,
+    *,
+    subject_name: str | None = None,
+    category_name: str | None = None,
+) -> AIQuestionResult:
+    provider, endpoint = _get_local_standardizer_provider()
     if provider is None or endpoint is None:
-        return AIQuestionResult(error="reviewer_llm_unavailable")
+        return AIQuestionResult(error="question_ai_standardizer_unavailable")
 
     try:
         payload = _run_async(
@@ -151,7 +188,8 @@ def standardize_question_with_ai(question: Any, *, subject_name: str | None = No
                 provider,
                 question=question,
                 subject_name=subject_name,
-                max_tokens=min(endpoint.max_tokens, 1800),
+                category_name=category_name,
+                max_tokens=min(endpoint.max_tokens, 4800),
             )
         )
     except Exception as exc:
@@ -196,6 +234,7 @@ async def _request_question_standardization(
     *,
     question: Any,
     subject_name: str | None,
+    category_name: str | None,
     max_tokens: int,
 ) -> dict[str, Any]:
     prompt = (
@@ -203,10 +242,16 @@ async def _request_question_standardization(
         "要求：\n"
         "1. 清除 OCR 噪音、页眉页脚、水印、网址、公众号、乱码和重复残片。\n"
         "2. 规范题干、选项、答案、解析的表达，保留原意，不要擅自改题。\n"
-        "3. 若答案或解析缺失，可根据题干和选项尽量补全；不确定时保持为空。\n"
-        "4. 客观题答案只返回选项字母；判断题返回“正确”或“错误”。\n"
-        "5. 只输出 JSON，不要 Markdown 代码块。\n\n"
+        "3. 若答案或解析缺失，必须先根据题干、选项、共用材料完成解题，再补全答案和解析；除非题干、选项或材料本身严重缺失到无法作答，否则不允许留空。\n"
+        "4. 补全出的答案与解析必须彼此一致；解析需要先说明正确答案为何成立，不能只重复答案结论。\n"
+        "5. 若题目有选项，解析必须逐项覆盖每个选项，明确写出每个选项为什么对或为什么错；错误选项要点明错在概念、条件、公式、法条、因果或适用范围的哪一点，不能只写“不符合题意”。\n"
+        "6. 答案与解析的依据只允许来自当前学科类目的教材或教辅中的通行结论、定义、公式、法条、例题方法；不要引入教材体系外的经验常识、网络资料、超纲延伸或主观猜测。\n"
+        "7. `analysis` 必须结构化组织，并根据题目实际情况选择适用模块，不适用的不要硬写：优先列出“考察知识点（考察的是什么）”；计算题要拆成步骤，把常识转成动作流，引导此类题如何下手；遇到易混概念要做辨析；能抽出通用做法时再给套路，但不能脱离本题空泛套模板。\n"
+        "8. 客观题答案只返回选项字母；判断题返回“正确”或“错误”。\n"
+        "9. 如果题目带有共用材料或题组导语，要结合它们理解子问，但不要把整段材料重复写进答案或解析。\n"
+        "10. 只输出 JSON，不要 Markdown 代码块。\n\n"
         f"学科：{subject_name or '未填写'}\n"
+        f"类目：{category_name or '未填写'}\n"
         f"题型：{getattr(question, 'question_type', '')}\n"
         f"题目：\n{_format_question(question)}"
     )
@@ -222,7 +267,14 @@ async def _request_question_standardization(
     }
     return await _chat_json(
         provider,
-        system_prompt="你是严谨的中文考试题目清洗与补全助手。",
+        system_prompt=(
+            "你是严谨的中文考试题目清洗、解题与补全助手。"
+            "若原题缺失答案或解析，你必须基于题干、选项、共用材料先完成作答，"
+            "再输出可直接入库的答案与解析。"
+            "你的答案与解析只能依据当前学科类目的教材或教辅中的通行内容，"
+            "不得引用教材体系外的经验、网文说法或主观臆断。"
+            "解析要结构化表达，并按题目实际情况选择知识点、步骤、辨析、套路等模块。"
+        ),
         user_prompt=prompt,
         schema=schema,
         max_tokens=max_tokens,
@@ -244,7 +296,8 @@ async def _request_question_review(
         "3. 如果无法完全确认正确性，但发现缺漏、歧义、依据不足，给 needs_revision。\n"
         "4. review_status 只能是 approved、needs_revision、rejected 三选一。\n"
         "5. review_note 用简短中文说明主要问题，适合直接给人工审核员看。\n"
-        "6. 只输出 JSON，不要 Markdown 代码块。\n\n"
+        "6. 如果题目来自材料题/阅读题，要结合共用材料理解子问，不要忽略材料上下文。\n"
+        "7. 只输出 JSON，不要 Markdown 代码块。\n\n"
         f"学科：{subject_name or '未填写'}\n"
         f"题型：{getattr(question, 'question_type', '')}\n"
         f"题目：\n{_format_question(question)}"
@@ -306,7 +359,7 @@ def _apply_standardization_payload(question: Any, payload: dict[str, Any]) -> bo
 
     raw_options = payload.get("normalized_options")
     if isinstance(raw_options, list):
-        options = normalize_options([str(item) for item in raw_options])
+        options = normalize_options([str(item) for item in raw_options], getattr(question, "question_type", None))
         if options and options != (getattr(question, "options_json", None) or []):
             question.options_json = options
             changed = True
@@ -316,11 +369,16 @@ def _apply_standardization_payload(question: Any, payload: dict[str, Any]) -> bo
         question.answer_text = answer
         changed = True
 
-    analysis = normalize_analysis(str(payload.get("analysis") or ""))
+    analysis = normalize_analysis(payload.get("analysis"))
     if analysis and analysis != getattr(question, "analysis_text", None):
         question.analysis_text = analysis
         changed = True
     return changed
+
+
+def _is_judge_question_type(question_type: str | None) -> bool:
+    normalized = str(question_type or "").strip()
+    return normalized.lower() == "judge" or normalized == "判断题"
 
 
 def _clean_text(value: str | None, *, strip_noise_lines: bool) -> str:
@@ -410,13 +468,32 @@ def _is_missing_text(value: str | None) -> bool:
 
 
 def _format_question(question: Any) -> str:
-    parts = [
-        f"题干：{getattr(question, 'stem_text', '')}",
-        "选项：" + ("\n".join(getattr(question, "options_json", None) or []) if getattr(question, "options_json", None) else "无"),
-        f"答案：{getattr(question, 'answer_text', None) or '缺失'}",
-        f"解析：{getattr(question, 'analysis_text', None) or '缺失'}",
-    ]
+    parts = [f"节点角色：{getattr(question, 'node_role', '') or 'standalone'}"]
+    if getattr(question, "group_stem", None):
+        parts.append(f"题组导语：{getattr(question, 'group_stem', '')}")
+    if getattr(question, "material_text", None):
+        parts.append(f"共用材料：\n{getattr(question, 'material_text', '')}")
+    parts.extend(
+        [
+            f"题干：{getattr(question, 'stem_text', '')}",
+            "选项：" + _format_options_for_prompt(getattr(question, "options_json", None)),
+            f"答案：{getattr(question, 'answer_text', None) or '缺失'}",
+            f"解析：{getattr(question, 'analysis_text', None) or '缺失'}",
+        ]
+    )
+    subquestions = getattr(question, "subquestions", None) or []
+    if subquestions:
+        parts.append("子问：")
+        for index, child in enumerate(subquestions, start=1):
+            parts.append(f"{index}. {_format_question(child)}")
     return "\n".join(parts)[:12000]
+
+
+def _format_options_for_prompt(options: list[str] | None) -> str:
+    normalized = normalize_options(options)
+    if not normalized:
+        return "无"
+    return "\n".join(f"{chr(65 + index)}. {option}" for index, option in enumerate(normalized))
 
 
 def _get_reviewer_provider() -> tuple[Any | None, Any | None]:
@@ -426,11 +503,41 @@ def _get_reviewer_provider() -> tuple[Any | None, Any | None]:
         provider_name = endpoint.provider.strip()
         if provider_name not in _REMOTE_LLM_PROVIDERS:
             return None, endpoint
-        if not resolve_llm_api_key(endpoint, "reviewer"):
+        if not _allows_missing_api_key(endpoint) and not resolve_llm_api_key(endpoint, "reviewer"):
             return None, endpoint
         return get_llm_provider(endpoint, target="reviewer"), endpoint
     except Exception:
         return None, None
+
+
+def _get_local_standardizer_provider() -> tuple[Any | None, LLMEndpointConfig | None]:
+    try:
+        endpoint = get_llm_settings().question_ai_standardizer
+        if not getattr(endpoint, "enabled", True):
+            return None, endpoint
+        provider_name = endpoint.provider.strip()
+        if provider_name not in _REMOTE_LLM_PROVIDERS:
+            return None, endpoint
+        if not _allows_missing_api_key(endpoint) and not resolve_llm_api_key(endpoint, "reviewer"):
+            return None, endpoint
+        return get_llm_provider(endpoint, target="reviewer"), endpoint
+    except Exception:
+        return None, None
+
+
+def _allows_missing_api_key(endpoint: LLMEndpointConfig) -> bool:
+    if endpoint.provider.strip() != "openai_compat":
+        return False
+    normalized = (endpoint.base_url or "").strip().lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "127.0.0.1:11434",
+            "localhost:11434",
+            "0.0.0.0:11434",
+            "::1:11434",
+        )
+    )
 
 
 def _run_async(coro: Any) -> Any:

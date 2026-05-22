@@ -71,51 +71,76 @@ def is_pending_label_status(status: str | None) -> bool:
 
 
 def build_paper_parser_prediction(text: str) -> dict[str, Any]:
-    from app.services.papers import _parse_question_block, _split_paper_sections
+    raise RuntimeError("规则切题已移除，请直接使用 AI 结构化 prediction 数据")
 
-    normalized = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    document = ParsedDocument(
-        text=normalized,
-        markdown=normalized,
-        provider="dataset_source_text",
-        pages=[ParsedPage(page_number=1, text=normalized, markdown=normalized)],
-    )
-    sections = _split_paper_sections(document, normalized)
+
+def build_prediction_from_section_payloads(section_payloads: list[dict[str, Any]] | None) -> dict[str, Any]:
     payload_sections: list[dict[str, Any]] = []
     total_question_count = 0
-
-    for section in sections:
-        payload_questions: list[dict[str, Any]] = []
-        for order, block in enumerate(section.blocks, start=1):
-            parsed = _parse_question_block(block, section)
-            payload_questions.append(
+    for index, section in enumerate(section_payloads or [], start=1):
+        if not isinstance(section, dict):
+            continue
+        title = str(section.get("title") or "").strip() or f"分区 {index}"
+        section_type = str(section.get("section_type") or "mixed").strip() or "mixed"
+        questions_payload: list[dict[str, Any]] = []
+        for order, question in enumerate(section.get("questions") or [], start=1):
+            if not isinstance(question, dict):
+                continue
+            node_role = str(question.get("node_role") or "").strip() or (
+                "group" if isinstance(question.get("subquestions"), list) and (question.get("subquestions") or []) else "standalone"
+            )
+            subquestions_payload: list[dict[str, object]] = []
+            for child_order, child in enumerate(question.get("subquestions") or [], start=1):
+                if not isinstance(child, dict):
+                    continue
+                subquestions_payload.append(
+                    {
+                        "order": child_order,
+                        "question_no": str(child.get("question_no") or "").strip(),
+                        "node_role": "subquestion",
+                        "question_type": str(child.get("question_type") or "").strip(),
+                        "stem_text": normalize_lines(child.get("stem_text")),
+                        "options": normalize_options(child.get("options") or []),
+                        "answer_text": normalize_lines(child.get("answer_text")),
+                        "analysis_text": normalize_lines(child.get("analysis_text")),
+                        "subquestion_count": 0,
+                        "quality_score": float(child.get("quality_score") or 0.0),
+                        "quality_issues": [str(item) for item in (child.get("quality_issues") or []) if str(item).strip()],
+                        "source_raw_text": normalize_lines(child.get("source_raw_text")),
+                    }
+                )
+            questions_payload.append(
                 {
                     "order": order,
-                    "question_no": parsed.question_no,
-                    "question_type": parsed.question_type,
-                    "stem_text": normalize_lines(parsed.stem_text),
-                    "options": normalize_options(parsed.options_json),
-                    "answer_text": normalize_lines(parsed.answer_text),
-                    "analysis_text": normalize_lines(parsed.analysis_text),
-                    "subquestion_count": parsed.subquestion_count,
-                    "quality_score": parsed.quality_score,
-                    "quality_issues": parsed.quality_issues,
+                    "question_no": str(question.get("question_no") or "").strip(),
+                    "node_role": node_role,
+                    "question_type": str(question.get("question_type") or "").strip(),
+                    "group_stem": normalize_lines(question.get("group_stem")),
+                    "material_text": normalize_lines(question.get("material_text")),
+                    "stem_text": normalize_lines(question.get("stem_text")),
+                    "options": normalize_options(question.get("options") or []),
+                    "answer_text": normalize_lines(question.get("answer_text")),
+                    "analysis_text": normalize_lines(question.get("analysis_text")),
+                    "subquestion_count": int(question.get("subquestion_count") or len(subquestions_payload) or 0),
+                    "quality_score": float(question.get("quality_score") or 0.0),
+                    "quality_issues": [str(item) for item in (question.get("quality_issues") or []) if str(item).strip()],
+                    "source_raw_text": normalize_lines(question.get("source_raw_text")),
+                    "subquestions": subquestions_payload,
                 }
             )
-        total_question_count += len(payload_questions)
+            total_question_count += len(subquestions_payload) if node_role == "group" and subquestions_payload else 1
         payload_sections.append(
             {
-                "title": section.title,
-                "section_type": section.section_type,
-                "sort_order": section.sort_order,
-                "question_count": len(payload_questions),
-                "questions": payload_questions,
+                "title": title,
+                "section_type": section_type,
+                "sort_order": int(section.get("sort_order") or index),
+                "question_count": len(questions_payload),
+                "questions": questions_payload,
             }
         )
-
     return {
-        "version": 1,
-        "source_format": "parsed_text",
+        "version": 2,
+        "source_format": "ai_structured_question_groups",
         "section_count": len(payload_sections),
         "question_count": total_question_count,
         "sections": payload_sections,
@@ -131,14 +156,33 @@ def build_gold_template(prediction: dict[str, object]) -> dict[str, object]:
         for question in section.get("questions") or []:
             if not isinstance(question, dict):
                 continue
+            subquestions_payload: list[dict[str, object]] = []
+            for child in question.get("subquestions") or []:
+                if not isinstance(child, dict):
+                    continue
+                subquestions_payload.append(
+                    {
+                        "question_no": child.get("question_no"),
+                        "node_role": child.get("node_role"),
+                        "question_type": child.get("question_type"),
+                        "stem_text": child.get("stem_text"),
+                        "options": child.get("options") or [],
+                        "answer_text": child.get("answer_text"),
+                        "analysis_text": child.get("analysis_text"),
+                    }
+                )
             question_payload.append(
                 {
                     "question_no": question.get("question_no"),
+                    "node_role": question.get("node_role"),
                     "question_type": question.get("question_type"),
+                    "group_stem": question.get("group_stem"),
+                    "material_text": question.get("material_text"),
                     "stem_text": question.get("stem_text"),
                     "options": question.get("options") or [],
                     "answer_text": question.get("answer_text"),
                     "analysis_text": question.get("analysis_text"),
+                    "subquestions": subquestions_payload,
                 }
             )
         sections_payload.append(
@@ -161,6 +205,10 @@ def export_paper_parser_sample(
     paper_id: int,
     paper_name: str,
     source_text: str,
+    ai_source_text: str | None = None,
+    ai_prediction: dict[str, Any] | None = None,
+    ai_cleanup_debug: dict[str, Any] | None = None,
+    raw_source_text: str | None = None,
     markdown_image_roots: list[str] | None = None,
     paper_status: str | None = None,
     paper_review_status: str | None = None,
@@ -188,10 +236,17 @@ def export_paper_parser_sample(
 ) -> Path:
     dataset_root = output_root or resolve_paper_dataset_root()
     sample_dir = resolve_paper_dataset_sample_dir(paper_id, paper_name, output_root=dataset_root)
+    _delete_older_paper_dataset_sample_dirs(dataset_root, paper_id, keep_dir=sample_dir)
     sample_dir.mkdir(parents=True, exist_ok=True)
 
-    prediction = build_paper_parser_prediction(source_text)
+    normalized_ai_source = normalize_lines(ai_source_text) if ai_source_text is not None else ""
+    normalized_ai_prediction = ai_prediction if isinstance(ai_prediction, dict) else {}
+    if not normalized_ai_prediction.get("sections"):
+        raise ValueError("导出训练样本时缺少 ai_prediction，规则切题已移除")
+    prediction = normalized_ai_prediction
+    normalized_ai_cleanup_debug = ai_cleanup_debug if isinstance(ai_cleanup_debug, dict) else {}
     gold_template = build_gold_template(prediction)
+    raw_source = normalize_lines(raw_source_text)
     meta = {
         "version": 1,
         "paper_id": paper_id,
@@ -212,6 +267,13 @@ def export_paper_parser_sample(
         "asset_parse_status": asset_parse_status,
         "asset_ocr_status": asset_ocr_status,
         "source_text_length": len(source_text),
+        "ai_source_text_length": len(normalized_ai_source),
+        "has_ai_source_text": bool(normalized_ai_source),
+        "prediction_source_file": "ai_source.txt" if normalized_ai_source else "source.txt",
+        "has_ai_prediction": bool(normalized_ai_prediction.get("sections")),
+        "has_ai_cleanup_debug": bool(normalized_ai_cleanup_debug),
+        "raw_source_text_length": len(raw_source),
+        "has_raw_source_text": bool(raw_source),
         "stored_section_count": stored_section_count,
         "stored_question_count": stored_question_count,
         "stored_needs_review_count": stored_needs_review_count,
@@ -223,11 +285,31 @@ def export_paper_parser_sample(
     }
 
     (sample_dir / "source.txt").write_text(source_text, encoding="utf-8")
+    if normalized_ai_source:
+        (sample_dir / "ai_source.txt").write_text(normalized_ai_source, encoding="utf-8")
+    else:
+        (sample_dir / "ai_source.txt").unlink(missing_ok=True)
+    if raw_source:
+        (sample_dir / "raw_source.txt").write_text(raw_source, encoding="utf-8")
     (sample_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     (sample_dir / "prediction.json").write_text(
         json.dumps(prediction, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    if normalized_ai_prediction:
+        (sample_dir / "ai_prediction.json").write_text(
+            json.dumps(normalized_ai_prediction, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    else:
+        (sample_dir / "ai_prediction.json").unlink(missing_ok=True)
+    if normalized_ai_cleanup_debug:
+        (sample_dir / "ai_cleanup_debug.json").write_text(
+            json.dumps(normalized_ai_cleanup_debug, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    else:
+        (sample_dir / "ai_cleanup_debug.json").unlink(missing_ok=True)
     (sample_dir / "gold.template.json").write_text(
         json.dumps(gold_template, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -327,6 +409,15 @@ def resolve_paper_dataset_sample_dir(
 ) -> Path:
     dataset_root = output_root or resolve_paper_dataset_root()
     return dataset_root / f"paper_{paper_id:06d}_{safe_name(paper_name or '', 'paper')}"
+
+
+def _delete_older_paper_dataset_sample_dirs(dataset_root: Path, paper_id: int, *, keep_dir: Path) -> None:
+    for candidate in dataset_root.glob(f"paper_{paper_id:06d}_*"):
+        if not candidate.is_dir():
+            continue
+        if candidate == keep_dir:
+            continue
+        shutil.rmtree(candidate, ignore_errors=True)
 
 
 def _resolve_storage_path(storage_path: str) -> Path:

@@ -15,6 +15,7 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ApiDir = Join-Path $Root "apps\api"
 $WebDir = Join-Path $Root "apps\web"
 $DataDir = Join-Path $Root "data"
+$PaddleXCacheDir = Join-Path $DataDir "cache\paddlex"
 $CacheDir = Join-Path $DataDir "cache"
 $LogDir = Join-Path $DataDir "logs"
 $RunDir = Join-Path $DataDir "run"
@@ -40,6 +41,7 @@ $LocalMySqlInfoPath = Join-Path $RunDir "mysql-local-$MySqlPort.json"
 $LocalMySqlDbUrl = $null
 
 New-Item -ItemType Directory -Force -Path $CacheDir, $LogDir, $RunDir, $PipCacheDir | Out-Null
+New-Item -ItemType Directory -Force -Path $PaddleXCacheDir | Out-Null
 
 function Write-Step([string]$Message) {
   Write-Host "==> $Message" -ForegroundColor Cyan
@@ -54,10 +56,41 @@ function Test-Http([string]$Url) {
   }
 }
 
-function Wait-Http([string]$Url, [int]$TimeoutSeconds = 45) {
+function Get-LogTail([string]$Path, [int]$LineCount = 40) {
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+    return $null
+  }
+  $tail = Get-Content -LiteralPath $Path -Tail $LineCount -ErrorAction SilentlyContinue | Out-String
+  $tail = $tail.Trim()
+  if (-not $tail) {
+    return $null
+  }
+  return $tail
+}
+
+function Wait-Http(
+  [string]$Url,
+  [int]$TimeoutSeconds = 45,
+  [System.Diagnostics.Process]$Process = $null,
+  [string]$ErrorLogPath = "",
+  [string]$ServiceName = "Service"
+) {
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
     if (Test-Http $Url) { return $true }
+    if ($Process) {
+      $Process.Refresh()
+      if ($Process.HasExited) {
+        $message = "$ServiceName exited before becoming healthy (exit code $($Process.ExitCode))."
+        $tail = Get-LogTail $ErrorLogPath
+        if ($tail) {
+          $message += " Check log: $ErrorLogPath`n$tail"
+        } elseif ($ErrorLogPath) {
+          $message += " Check log: $ErrorLogPath"
+        }
+        throw $message
+      }
+    }
     Start-Sleep -Milliseconds 800
   }
   return $false
@@ -74,6 +107,22 @@ function Find-FreePort([int]$StartPort) {
     if (-not (Get-ListenProcessId $port)) { return $port }
   }
   throw "No free port found from $StartPort to $($StartPort + 49)."
+}
+
+function Get-ShortWindowsPath([string]$PathValue) {
+  if (-not $PathValue) { return $PathValue }
+  if ($IsLinux -or $IsMacOS) { return $PathValue }
+  $resolved = (Resolve-Path -LiteralPath $PathValue).Path
+  $code = @'
+import sys
+from ctypes import create_unicode_buffer, windll
+
+path = sys.argv[1]
+buffer = create_unicode_buffer(4096)
+result = windll.kernel32.GetShortPathNameW(path, buffer, len(buffer))
+print(buffer.value if result > 0 and buffer.value else path)
+'@
+  return (($code | & $PythonExe - $resolved) | Select-Object -Last 1).Trim()
 }
 
 function Get-ProjectNextDevProcesses {
@@ -295,8 +344,12 @@ if (-not (Test-Http $ApiHealth)) {
   $apiOut = Join-Path $LogDir "api.out.log"
   $apiErr = Join-Path $LogDir "api.err.log"
   $oldDbUrl = $env:DB_URL
+  $oldPaddleXCacheHome = $env:PADDLE_PDX_CACHE_HOME
   if ($UseLocalMySql) {
     $env:DB_URL = $LocalMySqlDbUrl
+  }
+  if (-not $env:PADDLE_PDX_CACHE_HOME) {
+    $env:PADDLE_PDX_CACHE_HOME = Get-ShortWindowsPath $PaddleXCacheDir
   }
   try {
     $apiProc = Start-Process -FilePath $PythonExe `
@@ -307,11 +360,16 @@ if (-not (Test-Http $ApiHealth)) {
       -RedirectStandardError $apiErr `
       -PassThru
     Save-Pid "api" $apiProc.Id
-    if (-not (Wait-Http $ApiHealth 60)) {
+    if (-not (Wait-Http $ApiHealth 60 $apiProc $apiErr "API")) {
+      $tail = Get-LogTail $apiErr
+      if ($tail) {
+        throw "API startup timed out. Check log: $apiErr`n$tail"
+      }
       throw "API startup timed out. Check log: $apiErr"
     }
   } finally {
     $env:DB_URL = $oldDbUrl
+    $env:PADDLE_PDX_CACHE_HOME = $oldPaddleXCacheHome
   }
 }
 
@@ -336,10 +394,10 @@ if ((-not $ReuseExistingWeb) -and (-not (Test-Http $WebUrl))) {
   $oldPublicWebUrl = $env:PUBLIC_WEB_URL
   $env:API_PROXY_TARGET = "http://127.0.0.1:$ApiPort"
   if (-not $env:LAYOUT_PROXY_TARGET) {
-    $env:LAYOUT_PROXY_TARGET = "https://context.panspan.cloud"
+    $env:LAYOUT_PROXY_TARGET = "http://127.0.0.1:3210"
   }
   if (-not $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL) {
-    $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL = "https://context.panspan.cloud"
+    $env:NEXT_PUBLIC_LAYOUT_PUBLIC_URL = "http://127.0.0.1:3210"
   }
   if ($TunnelHosts.Count -gt 0) {
     $env:NEXT_ALLOWED_DEV_ORIGINS = ($TunnelHosts -join ",")
@@ -365,7 +423,11 @@ if ((-not $ReuseExistingWeb) -and (-not (Test-Http $WebUrl))) {
     $env:PUBLIC_WEB_ORIGIN = $oldPublicWebOrigin
     $env:PUBLIC_WEB_URL = $oldPublicWebUrl
   }
-  if (-not (Wait-Http $WebUrl 90)) {
+  if (-not (Wait-Http $WebUrl 90 $webProc $webErr "Web")) {
+    $tail = Get-LogTail $webErr
+    if ($tail) {
+      throw "Web startup timed out. Check log: $webErr`n$tail"
+    }
     throw "Web startup timed out. Check log: $webErr"
   }
 }

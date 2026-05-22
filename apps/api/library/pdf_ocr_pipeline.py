@@ -51,7 +51,7 @@ OCRProgressCallback = Callable[[int, int, dict[str, object] | None], None]
 
 @dataclass
 class OCRPipelineOptions:
-    force_ocr: bool = False
+    force_ocr: bool = True
     render_dpi: int = DEFAULT_RENDER_DPI
     max_pages: int | None = None
     cache_namespace: str | None = None
@@ -135,22 +135,32 @@ def _run_pdf_ocr_pipeline(
 ) -> OCRDocumentResult:
     options = options or OCRPipelineOptions()
 
-    if not options.force_ocr and _looks_like_text_pdf(pdf_bytes):
-        direct = _extract_pdf_text(pdf_bytes, filename)
-        if direct is not None and _has_meaningful_text(direct.text):
-            return direct
+    document_warnings: list[str] = []
+    page_batch_size = _get_pdf_page_batch_size(options)
+    checkpoint_dir = _get_pdf_ocr_checkpoint_dir(
+        pdf_bytes,
+        options,
+        _get_pdf_ocr_checkpoint_root(),
+    )
+    cached_pages_by_number = _load_pdf_ocr_checkpoint_pages(checkpoint_dir, options.max_pages)
 
     try:
         total_page_count = _get_pdf_page_count(pdf_bytes)
     except Exception as exc:
-        return OCRDocumentResult(
-            filename=filename,
-            provider="pdf_ocr_pipeline",
-            used_ocr=False,
-            text="",
-            markdown="",
-            warnings=[f"Unable to render PDF pages: {exc}"],
-            metadata={"filename": filename},
+        if not cached_pages_by_number:
+            return OCRDocumentResult(
+                filename=filename,
+                provider="pdf_ocr_pipeline",
+                used_ocr=False,
+                text="",
+                markdown="",
+                warnings=[f"Unable to render PDF pages: {exc}"],
+                metadata={"filename": filename},
+            )
+        total_page_count = len(cached_pages_by_number)
+        document_warnings.append(f"Unable to render PDF pages: {exc}")
+        document_warnings.append(
+            f"OCR resumed from {len(cached_pages_by_number)} cached pages without page rendering."
         )
 
     target_page_count = min(total_page_count, options.max_pages) if options.max_pages is not None else total_page_count
@@ -165,17 +175,10 @@ def _run_pdf_ocr_pipeline(
             metadata={"filename": filename},
         )
 
-    document_warnings: list[str] = []
-    page_batch_size = _get_pdf_page_batch_size(options)
-    checkpoint_dir = _get_pdf_ocr_checkpoint_dir(
-        pdf_bytes,
-        options,
-        _get_pdf_ocr_checkpoint_root(),
-    )
     cached_pages_by_number = {
         page_number: cached_page
-        for page_number in range(1, target_page_count + 1)
-        if (cached_page := _load_pdf_ocr_checkpoint_page(checkpoint_dir, page_number)) is not None
+        for page_number, cached_page in cached_pages_by_number.items()
+        if page_number <= target_page_count
     }
     total_chunks = _count_pdf_chunks(target_page_count, page_batch_size)
     resumed_pages = len(cached_pages_by_number)
@@ -704,6 +707,32 @@ def _load_pdf_ocr_checkpoint_page(checkpoint_dir: Path, page_number: int) -> OCR
     if not isinstance(raw, dict):
         return None
     return _ocr_page_result_from_dict(raw)
+
+
+def _load_pdf_ocr_checkpoint_pages(
+    checkpoint_dir: Path,
+    max_pages: int | None,
+) -> dict[int, OCRPageResult]:
+    cached: dict[int, OCRPageResult] = {}
+    for path in sorted(checkpoint_dir.glob("page_*.json")):
+        match = re.match(r"page_(\d+)\.json$", path.name)
+        if match is None:
+            continue
+        page_number = int(match.group(1))
+        if page_number <= 0:
+            continue
+        if max_pages is not None and page_number > max_pages:
+            continue
+        page = _load_pdf_ocr_checkpoint_page(checkpoint_dir, page_number)
+        if page is not None:
+            cached[page_number] = page
+
+    contiguous: dict[int, OCRPageResult] = {}
+    for page_number in sorted(cached):
+        if page_number != len(contiguous) + 1:
+            break
+        contiguous[page_number] = cached[page_number]
+    return contiguous
 
 
 def _save_pdf_ocr_checkpoint_page(checkpoint_dir: Path, page_result: OCRPageResult) -> None:
@@ -1391,7 +1420,10 @@ def _remove_repeated_noise(page_results: list[OCRPageResult], min_pages: int) ->
     repeated = {
         line
         for line, count in line_counter.items()
-        if count >= min_pages and len(NOISE_TEXT_PATTERN.findall(line)) > 0 and len(line) <= 80
+        if count >= min_pages
+        and len(NOISE_TEXT_PATTERN.findall(line)) > 0
+        and len(line) <= 80
+        and _looks_like_repeated_noise_line(line)
     }
     if not repeated:
         for page in page_results:
@@ -1418,6 +1450,32 @@ def _normalize_noise_line(text: str) -> str:
     normalized = re.sub(r"\s+", " ", text.strip())
     normalized = re.sub(r"\d+", "#", normalized)
     return normalized
+
+
+def _looks_like_repeated_noise_line(line: str) -> bool:
+    normalized = line.strip()
+    if not normalized:
+        return False
+    if _looks_like_structural_exam_line(normalized):
+        return False
+    return True
+
+
+def _looks_like_structural_exam_line(line: str) -> bool:
+    compact = re.sub(r"\s+", "", line)
+    if re.search(r"第#小题", compact):
+        return True
+    if re.search(r"根据资料[#一二三四五六七八九十①②③④⑤⑥⑦⑧⑨⑩]", compact):
+        return True
+    if re.search(r"答案与解析|答案解析|正确答案|参考答案", compact):
+        return True
+    if re.search(r"^[A-H][\\.、．)]", line):
+        return True
+    if re.search(r"[A-H][\\.、．)].*[B-H][\\.、．)]", line):
+        return True
+    if "不定项选择题" in compact:
+        return True
+    return False
 
 
 def _finalize_page_text(page_result: OCRPageResult) -> None:

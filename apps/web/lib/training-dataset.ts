@@ -2,6 +2,7 @@ import { promises as fs } from "fs";
 import path from "path";
 
 const CHECKPOINT_NAMESPACE_FILENAME = "cache.namespace";
+const JUDGE_OPTION_VALUES = ["正确", "错误"] as const;
 
 export type TrainingSampleSummary = {
   id: string;
@@ -14,6 +15,7 @@ export type TrainingSampleSummary = {
   gold_exists: boolean;
   label_status: string;
   source_text_length: number;
+  ai_source_text_length: number;
   updated_at: string | null;
 };
 
@@ -34,8 +36,9 @@ export type TrainingDatasetSummary = {
 export type TrainingSampleDetail = {
   sample: TrainingSampleSummary;
   meta: Record<string, unknown>;
-  source_text: string;
-  prediction_text: string;
+  raw_source_text: string;
+  ai_source_text: string;
+  ai_prediction_text: string;
   gold_template_text: string;
   gold_text: string;
 };
@@ -97,18 +100,20 @@ export async function readTrainingSample(sampleId: string): Promise<TrainingSamp
   const samplePath = resolveSamplePath(sampleId);
   await ensureGoldFile(samplePath);
   const sample = await buildSampleSummary(sampleId, samplePath);
-  let [metaText, sourceText, predictionText, goldTemplateText, goldText] = await Promise.all([
+  let [metaText, rawSourceText, aiSourceText, aiPredictionText, goldTemplateText, goldText] = await Promise.all([
     readTextOrDefault(path.join(samplePath, "meta.json"), "{}"),
-    readTextOrDefault(path.join(samplePath, "source.txt"), ""),
-    readTextOrDefault(path.join(samplePath, "prediction.json"), "{}"),
+    readTextOrDefault(path.join(samplePath, "raw_source.txt"), ""),
+    readTextOrDefault(path.join(samplePath, "ai_source.txt"), ""),
+    readTextOrDefault(path.join(samplePath, "ai_prediction.json"), "{}"),
     readTextOrDefault(path.join(samplePath, "gold.template.json"), "{}"),
     readTextOrDefault(path.join(samplePath, "gold.json"), ""),
   ]);
   const meta = parseJsonObject(metaText);
   const imageRoots = await resolveTrainingImageRoots(samplePath, meta);
-  [sourceText, predictionText, goldTemplateText, goldText] = await Promise.all([
-    inlineSampleImages(sourceText, imageRoots),
-    inlineSampleImages(predictionText, imageRoots),
+  [rawSourceText, aiSourceText, aiPredictionText, goldTemplateText, goldText] = await Promise.all([
+    inlineSampleImages(rawSourceText, imageRoots),
+    inlineSampleImages(aiSourceText, imageRoots),
+    inlineSampleImages(aiPredictionText, imageRoots),
     inlineSampleImages(goldTemplateText, imageRoots),
     inlineSampleImages(goldText, imageRoots),
   ]);
@@ -116,8 +121,9 @@ export async function readTrainingSample(sampleId: string): Promise<TrainingSamp
   return {
     sample,
     meta,
-    source_text: sourceText,
-    prediction_text: predictionText,
+    raw_source_text: rawSourceText,
+    ai_source_text: aiSourceText,
+    ai_prediction_text: aiPredictionText,
     gold_template_text: goldTemplateText,
     gold_text: goldText || goldTemplateText,
   };
@@ -179,6 +185,7 @@ async function buildSampleSummary(sampleId: string, samplePath: string): Promise
     gold_exists: goldExists,
     label_status: asNullableString(gold.label_status) || "draft",
     source_text_length: asNumber(meta.source_text_length),
+    ai_source_text_length: asNumber(meta.ai_source_text_length),
     updated_at: stat.mtime.toISOString(),
   };
 }
@@ -255,7 +262,57 @@ function parseJsonObject(text: string): Record<string, unknown> {
 
 function formatJsonText(text: string): string {
   const payload = JSON.parse(text);
-  return `${JSON.stringify(payload, null, 2)}\n`;
+  return `${JSON.stringify(normalizeTrainingDocumentPayload(payload), null, 2)}\n`;
+}
+
+function normalizeTrainingDocumentPayload(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record.sections)) {
+    return record;
+  }
+  return {
+    ...record,
+    sections: record.sections.map((section) => normalizeTrainingSectionPayload(section)),
+  };
+}
+
+function normalizeTrainingSectionPayload(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record.questions)) {
+    return record;
+  }
+  return {
+    ...record,
+    questions: record.questions.map((question) => normalizeTrainingQuestionPayload(question)),
+  };
+}
+
+function normalizeTrainingQuestionPayload(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  if (!isJudgeQuestionType(record.question_type)) {
+    return record;
+  }
+  return {
+    ...record,
+    options: [...JUDGE_OPTION_VALUES],
+  };
+}
+
+function isJudgeQuestionType(value: unknown): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const trimmed = value.trim();
+  return trimmed.toLowerCase() === "judge" || trimmed === "判断题";
 }
 
 function asNullableString(value: unknown): string | null {

@@ -28,6 +28,29 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   return (await response.json()) as T;
 }
 
+export async function apiTextFetch(path: string, init?: RequestInit): Promise<string> {
+  const response = await platformFetch(path, init);
+
+  if (response.status === 401 && path !== "/api/auth/login" && path !== "/api/auth/refresh") {
+    const refreshed = await refreshPlatformToken();
+    if (refreshed) {
+      const retry = await platformFetch(path, init);
+      if (!retry.ok) {
+        const text = await retry.text();
+        throw new Error(formatApiError(retry.status, text || retry.statusText));
+      }
+      return await retry.text();
+    }
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(formatApiError(response.status, text || response.statusText));
+  }
+
+  return await response.text();
+}
+
 async function platformFetch(path: string, init?: RequestInit): Promise<Response> {
   const token = getPlatformToken();
   return fetch(`${API_BASE}${path}`, {
@@ -122,6 +145,14 @@ function formatApiError(status: number, text: string): string {
     const payload = JSON.parse(text) as { detail?: unknown };
     if (typeof payload.detail === "string") {
       return payload.detail;
+    }
+    if (payload.detail && typeof payload.detail === "object") {
+      const detail = payload.detail as { message?: unknown; reasons?: unknown };
+      const message = typeof detail.message === "string" ? detail.message : "";
+      const reasons = Array.isArray(detail.reasons) ? detail.reasons.map(String).join("；") : "";
+      if (message || reasons) {
+        return [message, reasons].filter(Boolean).join("：");
+      }
     }
   } catch {
     // Keep the original response text when it is not JSON.
@@ -269,9 +300,9 @@ export type SubjectBatchDeleteResponse = {
   message: string;
 };
 
-export type ParsePreset = "auto" | "fast" | "balanced" | "accurate" | "formula";
+export type ParsePreset = "vl15" | "v3";
 export type ParseOutputFormat = "markdown" | "text";
-export type ParseMode = "rules";
+export type PaperParseExecutionMode = "ocr_only" | "ai_cleanup_split" | "full_chain";
 
 export type SubjectCategoryResponse = {
   id: number;
@@ -396,13 +427,18 @@ export type PaperParseResponse = {
   tagged_count: number;
   preview?: string | null;
   provider?: string | null;
-  parse_mode: ParseMode;
   output_format: ParseOutputFormat;
   warnings: string[];
   parse_options: Record<string, unknown>;
+  parse_runtime: Record<string, unknown>;
+  execution_mode: PaperParseExecutionMode;
+  token_count?: number | null;
   dataset_sample_path?: string | null;
   dataset_auto_exported?: boolean;
   dataset_export_error?: string | null;
+  ai_standardize_job_count?: number;
+  ai_standardize_requested_count?: number;
+  ai_standardize_job_ids?: number[];
 };
 
 export type PaperParseJobResponse = {
@@ -410,6 +446,7 @@ export type PaperParseJobResponse = {
   paper_id: number;
   status: string;
   progress: number;
+  execution_mode: PaperParseExecutionMode;
 };
 
 export type PaperUploadResponse = {
@@ -462,13 +499,17 @@ export type PaperReviewQuestionResponse = {
   id: number;
   paper_id: number;
   section_id?: number | null;
+  parent_question_id?: number | null;
   question_uid: string;
   content_fingerprint: string;
   sort_order: number;
   question_no: string;
+  node_role: "standalone" | "group" | "subquestion";
   question_type: string;
   source_section_name: string;
   source_raw_text: string;
+  group_stem?: string | null;
+  material_text?: string | null;
   stem_text: string;
   options_json?: string[] | null;
   answer_text?: string | null;
@@ -491,6 +532,7 @@ export type PaperReviewQuestionResponse = {
   updated_at: string;
   suggested_knowledge_points: PaperReviewQuestionKnowledgePointResponse[];
   confirmed_knowledge_points: PaperReviewQuestionKnowledgePointResponse[];
+  subquestions: PaperReviewQuestionResponse[];
 };
 
 export type PaperReviewQuestionKnowledgePointResponse = {
@@ -511,6 +553,8 @@ export type PaperReviewQuestionKnowledgePointResponse = {
 
 export type PaperReviewSummaryResponse = {
   total_questions: number;
+  leaf_question_count: number;
+  group_question_count: number;
   pending_count: number;
   approved_count: number;
   needs_revision_count: number;
@@ -529,6 +573,8 @@ export type PaperReviewPaperResponse = {
   review_status: string;
   total_question_count: number;
   question_review_count: number;
+  leaf_question_count: number;
+  group_question_count: number;
 };
 
 export type PaperReviewWorkspaceResponse = {
@@ -540,12 +586,24 @@ export type PaperReviewWorkspaceResponse = {
 
 export type PaperReviewQuestionUpdateRequest = {
   question_type?: string | null;
+  group_stem?: string | null;
+  material_text?: string | null;
   stem_text?: string | null;
   options_json?: string[] | null;
   answer_text?: string | null;
   analysis_text?: string | null;
   review_status?: "pending" | "approved" | "needs_revision" | "rejected" | null;
   review_note?: string | null;
+  subquestions?: {
+    id: number;
+    question_type?: string | null;
+    stem_text?: string | null;
+    options_json?: string[] | null;
+    answer_text?: string | null;
+    analysis_text?: string | null;
+    review_status?: "pending" | "approved" | "needs_revision" | "rejected" | null;
+    review_note?: string | null;
+  }[];
 };
 
 export type PaperReviewQuestionKnowledgePointUpsertItem = {
@@ -588,11 +646,452 @@ export type PaperReviewAutoTagJobResponse = {
   progress: number;
 };
 
+export type PaperReviewAIStandardizeJobItemResponse = {
+  job_id: number;
+  paper_id: number;
+  status: string;
+  progress: number;
+  requested_count: number;
+  batch_index: number;
+  batch_count: number;
+  question_ids: number[];
+};
+
+export type PaperReviewAIStandardizeJobSubmitResponse = {
+  paper_id: number;
+  requested_count: number;
+  job_count: number;
+  jobs: PaperReviewAIStandardizeJobItemResponse[];
+  message: string;
+};
+
+export type PaperReviewAIStandardizeJobResponse = {
+  job_id: number;
+  paper_id: number;
+  status: string;
+  progress: number;
+  requested_count: number;
+  success_count: number;
+  failed_count: number;
+  changed_count: number;
+  used_ai_count: number;
+  batch_index: number;
+  batch_count: number;
+  question_ids: number[];
+  message: string;
+};
+
 export type PaperReviewAIActionResponse = {
   message: string;
   changed: boolean;
   used_ai: boolean;
   question: PaperReviewQuestionResponse;
+};
+
+export type PaperReviewAIBatchActionRequest = {
+  question_ids: number[];
+};
+
+export type PaperReviewBatchReviewRequest = {
+  question_ids: number[];
+  review_status: "pending" | "approved" | "needs_revision" | "rejected";
+  review_note?: string | null;
+};
+
+export type PaperReviewAIBatchFailureResponse = {
+  question_id: number;
+  message: string;
+};
+
+export type PaperReviewBatchReviewResponse = {
+  message: string;
+  requested_count: number;
+  success_count: number;
+  failed_count: number;
+  questions: PaperReviewQuestionResponse[];
+  failures: PaperReviewAIBatchFailureResponse[];
+};
+
+export type PaperReviewAIBatchActionResponse = {
+  message: string;
+  requested_count: number;
+  success_count: number;
+  failed_count: number;
+  changed_count: number;
+  used_ai_count: number;
+  questions: PaperReviewQuestionResponse[];
+  failures: PaperReviewAIBatchFailureResponse[];
+};
+
+export type QuestionBankKnowledgePointResponse = {
+  id: number;
+  name: string;
+  path: string;
+  relation_type: string;
+  status: string;
+};
+
+export type QuestionBankItemResponse = {
+  id: number;
+  subject_id?: number | null;
+  subject_name?: string | null;
+  category_id?: number | null;
+  category_name?: string | null;
+  parent_question_id?: number | null;
+  question_no?: string | null;
+  question_uid: string;
+  content_fingerprint: string;
+  node_role: "standalone" | "group" | "subquestion";
+  question_type: string;
+  group_stem?: string | null;
+  material_text?: string | null;
+  stem_text: string;
+  options_json?: string[] | null;
+  answer_text?: string | null;
+  analysis_text?: string | null;
+  difficulty_level?: number | null;
+  quality_score?: number | null;
+  subquestion_count: number;
+  status: string;
+  source_count: number;
+  first_source_question_id?: number | null;
+  first_source_paper_name?: string | null;
+  created_at: string;
+  updated_at: string;
+  knowledge_points: QuestionBankKnowledgePointResponse[];
+  subquestions: QuestionBankItemResponse[];
+};
+
+export type QuestionBankListResponse = {
+  total: number;
+  items: QuestionBankItemResponse[];
+  status_counts: Record<string, number>;
+};
+
+export type QuestionBankExportSolutionMode = "inline" | "appendix";
+
+export type QuestionBankExportPaperOptionResponse = {
+  paper_id: number;
+  paper_name: string;
+  subject_name?: string | null;
+  category_name?: string | null;
+  question_count: number;
+};
+
+export type QuestionBankPaperExportRequest = {
+  paper_id: number;
+  solution_mode: QuestionBankExportSolutionMode;
+  subject_id?: number | null;
+  category_id?: number | null;
+  status?: "draft" | "active" | "inactive" | "archived" | null;
+  question_type?: string | null;
+  keyword?: string | null;
+};
+
+export type QuestionBankSourceResponse = {
+  id: number;
+  source_type: string;
+  source_question_id: number;
+  paper_id?: number | null;
+  paper_name?: string | null;
+  section_id?: number | null;
+  question_no?: string | null;
+  status: string;
+  created_at: string;
+};
+
+export type QuestionBankDeleteResponse = {
+  id: number;
+  question_uid: string;
+  deleted: boolean;
+  removed_source_link_count: number;
+  message: string;
+};
+
+export type QuestionBankAnalysisSummaryResponse = {
+  paper_count: number;
+  bank_question_count: number;
+  source_question_count: number;
+  tagged_source_question_count: number;
+  point_count: number;
+  chapter_count: number;
+  year_count: number;
+  primary_coverage_rate: number;
+  top_point_concentration_rate: number;
+};
+
+export type QuestionBankAnalysisYearOverviewResponse = {
+  year: number;
+  paper_count: number;
+  source_question_count: number;
+  tagged_source_question_count: number;
+};
+
+export type QuestionBankAnalysisDistributionItemResponse = {
+  key: string;
+  name: string;
+  path?: string | null;
+  total_frequency: number;
+  paper_count: number;
+  yearly_frequency: number[];
+  share: number;
+  last_frequency: number;
+  recent_average: number;
+  slope: number;
+  trend_label: string;
+  prediction_frequency: number;
+  confidence: number;
+  appearance_year_count: number;
+};
+
+export type QuestionBankAnalysisPointItemResponse = QuestionBankAnalysisDistributionItemResponse & {
+  knowledge_point_id?: number | null;
+  chapter_name?: string | null;
+};
+
+export type QuestionBankAnalysisChapterItemResponse = QuestionBankAnalysisDistributionItemResponse & {
+  chapter_key: string;
+};
+
+export type QuestionBankAnalysisPredictionItemResponse = {
+  key: string;
+  name: string;
+  prediction_frequency: number;
+  confidence: number;
+  trend_label: string;
+  evidence: string;
+};
+
+export type QuestionBankAnalysisReportResponse = {
+  overview: string;
+  point_insight: string;
+  chapter_insight: string;
+  forecast: string;
+  disclaimer: string;
+};
+
+export type QuestionBankKnowledgeAnalysisResponse = {
+  data_scope: string;
+  subject_id?: number | null;
+  subject_name?: string | null;
+  category_id?: number | null;
+  category_name?: string | null;
+  start_year?: number | null;
+  end_year?: number | null;
+  years: number[];
+  prediction_year?: number | null;
+  summary: QuestionBankAnalysisSummaryResponse;
+  yearly_overview: QuestionBankAnalysisYearOverviewResponse[];
+  point_distribution: QuestionBankAnalysisPointItemResponse[];
+  chapter_distribution: QuestionBankAnalysisChapterItemResponse[];
+  top_predicted_points: QuestionBankAnalysisPredictionItemResponse[];
+  top_predicted_chapters: QuestionBankAnalysisPredictionItemResponse[];
+  report: QuestionBankAnalysisReportResponse;
+};
+
+export type PracticeSessionType = "chapter" | "random" | "paper" | "wrong_book";
+export type PracticeAnswerMode = "memorize" | "exam";
+
+export type PracticeQuestionKnowledgePointResponse = {
+  id: number;
+  name: string;
+  path: string;
+  relation_type: string;
+  status: string;
+};
+
+export type PracticeQuestionSnapshotResponse = {
+  bank_question_id?: number | null;
+  question_uid: string;
+  node_role: string;
+  question_type: string;
+  group_stem?: string | null;
+  material_text?: string | null;
+  stem_text: string;
+  options_json?: string[] | null;
+  difficulty_level?: number | null;
+  source_paper_name?: string | null;
+  source_question_no?: string | null;
+  knowledge_points: PracticeQuestionKnowledgePointResponse[];
+  answer_text?: string | null;
+  analysis_text?: string | null;
+};
+
+export type PracticeSessionItemResponse = {
+  id: number;
+  sort_order: number;
+  score: number;
+  question: PracticeQuestionSnapshotResponse;
+  user_answer?: string | null;
+  is_answered: boolean;
+  is_correct?: boolean | null;
+  marked: boolean;
+  spent_seconds?: number | null;
+  show_result: boolean;
+};
+
+export type PracticeSessionSummaryResponse = {
+  id: number;
+  title: string;
+  session_type: PracticeSessionType;
+  answer_mode: PracticeAnswerMode;
+  status: string;
+  total_count: number;
+  answered_count: number;
+  correct_count: number;
+  accuracy_rate?: number | null;
+  created_at: string;
+  started_at?: string | null;
+  submitted_at?: string | null;
+};
+
+export type PracticeSessionDetailResponse = PracticeSessionSummaryResponse & {
+  subject_id?: number | null;
+  category_id?: number | null;
+  chapter_id?: number | null;
+  paper_id?: number | null;
+  duration_seconds?: number | null;
+  can_show_solutions: boolean;
+  can_submit: boolean;
+  incomplete_count: number;
+  today_review_count: number;
+  retry_wrong_count: number;
+  similar_practice_available: boolean;
+  weak_points: MasterySnapshotResponse[];
+  items: PracticeSessionItemResponse[];
+};
+
+export type PracticeSessionCreateRequest = {
+  session_type: PracticeSessionType;
+  answer_mode: PracticeAnswerMode;
+  subject_id?: number | null;
+  category_id?: number | null;
+  chapter_id?: number | null;
+  paper_id?: number | null;
+  question_type?: string | null;
+  question_count: number;
+};
+
+export type PracticeAnswerSubmitRequest = {
+  item_id: number;
+  answer?: string | null;
+  spent_seconds?: number | null;
+  marked?: boolean;
+};
+
+export type PracticeAnswerReflectionRequest = {
+  item_id: number;
+  wrong_reason_tags: Array<
+    "concept_unclear" | "memory_unstable" | "misread_question" | "calculation_error" | "careless" | "method_unfamiliar"
+  >;
+  reflection_note?: string | null;
+};
+
+export type PracticeDerivedSessionRequest = {
+  answer_mode: PracticeAnswerMode;
+  question_count: number;
+};
+
+export type MasterySnapshotResponse = {
+  knowledge_point_id: number;
+  name: string;
+  path: string;
+  chapter_id?: number | null;
+  mastery_score: number;
+  answered_count: number;
+  correct_count: number;
+  snapshot_date?: string | null;
+  last_practiced_at?: string | null;
+};
+
+export type ReviewDueItemResponse = {
+  id: number;
+  bank_question_id?: number | null;
+  question_type: string;
+  stem_text: string;
+  source_paper_name?: string | null;
+  knowledge_points: PracticeQuestionKnowledgePointResponse[];
+  wrong_count: number;
+  correct_streak: number;
+  due_at: string;
+  due_reason: string;
+};
+
+export type PracticeWrongReasonCountResponse = {
+  reason_code: "concept_unclear" | "memory_unstable" | "misread_question" | "calculation_error" | "careless" | "method_unfamiliar";
+  reason_label: string;
+  count: number;
+};
+
+export type PracticeResultItemResponse = {
+  id: number;
+  sort_order: number;
+  score: number;
+  question: PracticeQuestionSnapshotResponse;
+  user_answer?: string | null;
+  is_correct?: boolean | null;
+  marked: boolean;
+  spent_seconds?: number | null;
+  wrong_reason_tags: Array<
+    "concept_unclear" | "memory_unstable" | "misread_question" | "calculation_error" | "careless" | "method_unfamiliar"
+  >;
+  reflection_note?: string | null;
+};
+
+export type PracticeResultResponse = {
+  id: number;
+  title: string;
+  session_type: PracticeSessionType;
+  answer_mode: PracticeAnswerMode;
+  total_count: number;
+  correct_count: number;
+  wrong_count: number;
+  accuracy_rate?: number | null;
+  duration_seconds?: number | null;
+  submitted_at?: string | null;
+  today_review_count: number;
+  retry_wrong_count: number;
+  similar_practice_available: boolean;
+  weak_points: MasterySnapshotResponse[];
+  wrong_reason_counts: PracticeWrongReasonCountResponse[];
+  review_suggestions: string[];
+  items: PracticeResultItemResponse[];
+};
+
+export type DailyPlanTaskResponse = {
+  task_id: string;
+  task_type: string;
+  title: string;
+  description: string;
+  priority: string;
+  question_count: number;
+  action_type?: string | null;
+  session_create_payload?: PracticeSessionCreateRequest | null;
+  derived_session_payload?: PracticeDerivedSessionRequest | null;
+};
+
+export type DailyPlanResponse = {
+  headline: string;
+  summary: string;
+  review_today_count: number;
+  weak_points: MasterySnapshotResponse[];
+  tasks: DailyPlanTaskResponse[];
+};
+
+export type WrongBookItemResponse = {
+  id: number;
+  bank_question_id?: number | null;
+  question_type: string;
+  stem_text: string;
+  source_paper_name?: string | null;
+  knowledge_points: PracticeQuestionKnowledgePointResponse[];
+  wrong_count: number;
+  correct_streak: number;
+  mastered: boolean;
+  last_wrong_at?: string | null;
+  last_practiced_at?: string | null;
+  due_at?: string | null;
+  due_reason?: string | null;
 };
 
 export type AnalysisJobResponse = {
@@ -603,6 +1102,7 @@ export type AnalysisJobResponse = {
   scope_config_json?: {
     stage?: string;
     detail?: Record<string, unknown>;
+    execution_mode?: string;
     [key: string]: unknown;
   } | null;
   status: string;
@@ -616,7 +1116,8 @@ export type AnalysisJobResponse = {
 
 export const moduleLabelMap: Record<string, string> = {
   auth: "认证与权限",
+  learning: "刷题练习",
   papers: "试卷中心",
-  paper_review: "题目解析",
+  paper_review: "审核工作台",
   knowledge: "学科中心",
 };

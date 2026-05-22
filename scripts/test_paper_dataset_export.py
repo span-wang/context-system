@@ -25,11 +25,13 @@ class PaperDatasetExportTests(unittest.TestCase):
                 paper_id=123,
                 paper_name="Sample Paper",
                 source_text="1. 下列说法正确的是？\nA. 选项一\n答案：A\n解析：示例解析",
+                raw_source_text="第1页\n1. 下列说法正确的是？\nA. 选项一\n答案：A\n解析：示例解析\n版权所有",
                 output_root=output_root,
             )
 
             self.assertEqual(sample_dir.parent, output_root)
             self.assertTrue((sample_dir / "source.txt").exists())
+            self.assertTrue((sample_dir / "raw_source.txt").exists())
             self.assertTrue((sample_dir / "meta.json").exists())
             self.assertTrue((sample_dir / "prediction.json").exists())
             self.assertTrue((sample_dir / "gold.template.json").exists())
@@ -37,6 +39,31 @@ class PaperDatasetExportTests(unittest.TestCase):
 
             meta = json.loads((sample_dir / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(Path(str(meta["export_root"])).resolve(), output_root.resolve())
+            self.assertTrue(meta["has_raw_source_text"])
+
+    def test_export_sample_uses_ai_source_for_prediction_when_present(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output_root = Path(temp_dir)
+            sample_dir = export_paper_parser_sample(
+                paper_id=125,
+                paper_name="AI Source Paper",
+                source_text="1. 规则清噪题干\nA. 规则选项",
+                ai_source_text="1. AI清噪题干\nA. AI选项\n答案：A\n解析：AI解析",
+                output_root=output_root,
+            )
+
+            self.assertEqual((sample_dir / "source.txt").read_text(encoding="utf-8"), "1. 规则清噪题干\nA. 规则选项")
+            self.assertEqual((sample_dir / "ai_source.txt").read_text(encoding="utf-8"), "1. AI清噪题干\nA. AI选项\n答案：A\n解析：AI解析")
+            self.assertTrue((sample_dir / "ai_prediction.json").exists())
+            prediction = json.loads((sample_dir / "prediction.json").read_text(encoding="utf-8"))
+            first_question = prediction["sections"][0]["questions"][0]
+            self.assertIn("AI清噪题干", first_question["stem_text"])
+            self.assertEqual(first_question["answer_text"], "A")
+            ai_prediction = json.loads((sample_dir / "ai_prediction.json").read_text(encoding="utf-8"))
+            self.assertEqual(ai_prediction["question_count"], prediction["question_count"])
+            meta = json.loads((sample_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["prediction_source_file"], "ai_source.txt")
+            self.assertTrue(meta["has_ai_source_text"])
 
     def test_export_sample_copies_markdown_images(self) -> None:
         with TemporaryDirectory() as temp_dir:

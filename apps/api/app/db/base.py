@@ -14,9 +14,13 @@ from app.models import (
     LegacyLibraryParseResult,
     LegacyWorkflowEvent,
     LegacyWorkflowTopic,
+    MasterySnapshot,
     PaperReviewQuestion,
     PaperReviewQuestionKnowledgePoint,
     PaperSection,
+    PracticeAnswer,
+    PracticeSession,
+    PracticeSessionItem,
     QuestionBankItem,
     QuestionBankSourceLink,
     ReviewTask,
@@ -26,6 +30,7 @@ from app.models import (
     Tenant,
     User,
     UserRole,
+    WrongBookItem,
 )
 from app.models.base import Base
 
@@ -46,9 +51,13 @@ __all__ = [
     "LegacyLibraryParseResult",
     "LegacyWorkflowEvent",
     "LegacyWorkflowTopic",
+    "MasterySnapshot",
     "PaperReviewQuestion",
     "PaperReviewQuestionKnowledgePoint",
     "PaperSection",
+    "PracticeAnswer",
+    "PracticeSession",
+    "PracticeSessionItem",
     "QuestionBankItem",
     "QuestionBankSourceLink",
     "ReviewTask",
@@ -58,4 +67,5 @@ __all__ = [
     "Tenant",
     "User",
     "UserRole",
+    "WrongBookItem",
 ]

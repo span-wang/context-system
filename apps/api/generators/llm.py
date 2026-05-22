@@ -24,6 +24,12 @@ CONTENT_GUIDANCE = {
     "compare_table": "用表格对比易混概念、适用场景、判断口诀和错误提醒。",
     "exam_review": "围绕真题串讲知识点、题眼和解题步骤。",
 }
+LAYOUT_PROMPT_SELF_CONTAINED_MARKERS = (
+    "[Library Sources]",
+    "[New Uploads]",
+    "[Source Content]",
+    "Source content:",
+)
 
 
 class LLMContentGenerator(BaseGenerator):
@@ -167,23 +173,27 @@ def _user_prompt(context: GenerationContext, title: str) -> str:
 
 
 def _layout_user_prompt(context: GenerationContext, title: str, layout_prompt: str) -> str:
+    self_contained = _layout_prompt_is_self_contained(layout_prompt)
     parts = [
         f"标题：{title}",
-        f"学科：{context.subject}",
-        f"类目：{context.category or '未填写'}",
-        f"章节：{context.chapter or '未填写'}",
-        f"排版模式：{context.options.get('layout_mode_name') or context.options.get('layout_mode_id') or 'Layout_For_Xhs'}",
+        "请严格按照下面的 Layout_For_Xhs 提示词生成 Markdown。最终回答只输出 Markdown 正文。",
         "",
-        "请严格按照下面的 Layout_For_Xhs 完整提示词生成 Markdown。最终回答只输出 Markdown 正文。",
-        "",
-        layout_prompt,
+        layout_prompt.strip(),
     ]
-    source_block = _format_sources(context)
-    if source_block and source_block != "无可用素材正文。":
+    if context.user_notes and not self_contained:
         parts.extend(
             [
                 "",
-                "后端已解析/检索到的完整素材如下。如与上方预览资料重复，以本段完整素材为准：",
+                "补充说明：",
+                context.user_notes.strip(),
+            ]
+        )
+    source_block = _format_sources(context)
+    if source_block and source_block != "无可用素材正文。" and not self_contained:
+        parts.extend(
+            [
+                "",
+                "后端已解析/检索到的完整素材如下，请据此生成：",
                 source_block,
             ]
         )
@@ -195,6 +205,11 @@ def _layout_user_prompt(context: GenerationContext, title: str, layout_prompt: s
             ]
         )
     return "\n".join(parts)
+
+
+def _layout_prompt_is_self_contained(layout_prompt: str) -> bool:
+    text = layout_prompt.strip()
+    return any(marker in text for marker in LAYOUT_PROMPT_SELF_CONTAINED_MARKERS)
 
 
 def _format_sources(context: GenerationContext) -> str:

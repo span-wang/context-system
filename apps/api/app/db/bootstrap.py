@@ -31,8 +31,11 @@ from app.models import (
 
 
 def _get_alembic_config() -> Config:
-    config_path = PROJECT_ROOT / "apps" / "api" / "alembic.ini"
-    script_location = PROJECT_ROOT / "apps" / "api" / "alembic"
+    api_root = PROJECT_ROOT / "apps" / "api"
+    if not api_root.exists():
+        api_root = PROJECT_ROOT
+    config_path = api_root / "alembic.ini"
+    script_location = api_root / "alembic"
     alembic_config = Config(str(config_path))
     alembic_config.set_main_option("script_location", str(script_location))
     return alembic_config
@@ -407,7 +410,6 @@ def seed_demo_data(session) -> None:
             "section_count": 2,
             "tagged_count": 0,
             "provider": "seed_data",
-            "parse_mode": "rules",
             "output_format": "markdown",
             "warnings": [],
             "parse_options": {},

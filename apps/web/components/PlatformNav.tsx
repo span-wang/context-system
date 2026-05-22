@@ -5,9 +5,12 @@ import { usePathname } from "next/navigation";
 
 const links = [
   { href: "/analysis/papers", label: "试卷中心" },
-  { href: "/analysis/questions", label: "题目解析" },
+  { href: "/question-bank", label: "正式题库" },
+  { href: "/question-bank/analysis", label: "考点分析" },
+  { href: "/practice", label: "刷题练习" },
   { href: "/knowledge", label: "学科中心" },
   { href: "/training", label: "模型训练" },
+  { href: "/settings", label: "模型配置" },
 ];
 
 export function PlatformNav() {

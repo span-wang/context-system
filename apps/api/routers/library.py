@@ -4,7 +4,13 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
 from deps import get_library_service
 from library.parse_jobs import get_library_parse_job, start_library_parse_job
-from library.parse_options import DocumentParseOptions, ParseOutputFormat, ParsePreset
+from library.parse_options import (
+    DEFAULT_PARSE_OUTPUT_FORMAT,
+    DEFAULT_PARSE_PRESET,
+    ParseOutputFormat,
+    ParsePreset,
+    build_document_parse_options,
+)
 from schemas.library import (
     LibraryFile,
     LibraryFilePatch,
@@ -60,8 +66,10 @@ async def preview_file(
     file_id: str,
     max_chars: int = Query(4000, ge=1, le=500_000),
     compare: bool = Query(False),
-    preset: ParsePreset = Query("auto"),
-    output_format: ParseOutputFormat = Query("markdown"),
+    preset: ParsePreset = Query(DEFAULT_PARSE_PRESET),
+    output_format: ParseOutputFormat = Query(DEFAULT_PARSE_OUTPUT_FORMAT),
+    raw_ocr_mode: bool | None = Query(None),
+    preserve_pdf_image_content: bool | None = Query(None),
     force_ocr: bool | None = Query(None),
     render_dpi: int | None = Query(None, ge=96, le=360),
     crop_header_ratio: float | None = Query(None, ge=0.0, le=0.2),
@@ -72,9 +80,11 @@ async def preview_file(
     enable_formula_recognition: bool | None = Query(None),
     pdf_page_chunk_size: int | None = Query(None, ge=1, le=50),
 ) -> LibraryFilePreview:
-    options = DocumentParseOptions(
+    options = build_document_parse_options(
         preset=preset,
         output_format=output_format,
+        raw_ocr_mode=raw_ocr_mode,
+        preserve_pdf_image_content=preserve_pdf_image_content,
         force_ocr=force_ocr,
         render_dpi=render_dpi,
         crop_header_ratio=crop_header_ratio,
@@ -98,8 +108,10 @@ def start_parse_file_job(
     file_id: str,
     mode: LibraryParseMode = Query("preview"),
     max_chars: int = Query(4000, ge=1, le=500_000),
-    preset: ParsePreset = Query("auto"),
-    output_format: ParseOutputFormat = Query("markdown"),
+    preset: ParsePreset = Query(DEFAULT_PARSE_PRESET),
+    output_format: ParseOutputFormat = Query(DEFAULT_PARSE_OUTPUT_FORMAT),
+    raw_ocr_mode: bool | None = Query(None),
+    preserve_pdf_image_content: bool | None = Query(None),
     force_ocr: bool | None = Query(None),
     render_dpi: int | None = Query(None, ge=96, le=360),
     crop_header_ratio: float | None = Query(None, ge=0.0, le=0.2),
@@ -110,9 +122,11 @@ def start_parse_file_job(
     enable_formula_recognition: bool | None = Query(None),
     pdf_page_chunk_size: int | None = Query(None, ge=1, le=50),
 ) -> LibraryParseJobResponse:
-    options = DocumentParseOptions(
+    options = build_document_parse_options(
         preset=preset,
         output_format=output_format,
+        raw_ocr_mode=raw_ocr_mode,
+        preserve_pdf_image_content=preserve_pdf_image_content,
         force_ocr=force_ocr,
         render_dpi=render_dpi,
         crop_header_ratio=crop_header_ratio,
@@ -142,8 +156,10 @@ def get_parse_file_job(job_id: int) -> LibraryParseJobStatus:
 async def reparse_file(
     file_id: str,
     max_chars: int = Query(4000, ge=1, le=500_000),
-    preset: ParsePreset = Query("auto"),
-    output_format: ParseOutputFormat = Query("markdown"),
+    preset: ParsePreset = Query(DEFAULT_PARSE_PRESET),
+    output_format: ParseOutputFormat = Query(DEFAULT_PARSE_OUTPUT_FORMAT),
+    raw_ocr_mode: bool | None = Query(None),
+    preserve_pdf_image_content: bool | None = Query(None),
     force_ocr: bool | None = Query(None),
     render_dpi: int | None = Query(None, ge=96, le=360),
     crop_header_ratio: float | None = Query(None, ge=0.0, le=0.2),
@@ -154,9 +170,11 @@ async def reparse_file(
     enable_formula_recognition: bool | None = Query(None),
     pdf_page_chunk_size: int | None = Query(None, ge=1, le=50),
 ) -> LibraryReparseResponse:
-    options = DocumentParseOptions(
+    options = build_document_parse_options(
         preset=preset,
         output_format=output_format,
+        raw_ocr_mode=raw_ocr_mode,
+        preserve_pdf_image_content=preserve_pdf_image_content,
         force_ocr=force_ocr,
         render_dpi=render_dpi,
         crop_header_ratio=crop_header_ratio,

@@ -11,6 +11,7 @@ if str(API_ROOT) not in sys.path:
     sys.path.insert(0, str(API_ROOT))
 
 from library.ocr_cleaner import clean_parsed_document  # noqa: E402
+from library.pdf_ocr_pipeline import OCRPageResult, OCRTextBlock, _remove_repeated_noise  # noqa: E402
 from library.parser import ParsedBlock, ParsedDocument, ParsedPage  # noqa: E402
 
 
@@ -83,6 +84,27 @@ class OcrCleanerTests(unittest.TestCase):
         self.assertIn("贷:原材料85", cleaned.text)
         self.assertNotIn("微信扫描二维码", cleaned.text)
 
+    def test_preserves_circled_numbers_during_nfkc_cleanup(self) -> None:
+        document = ParsedDocument(
+            text="根据资料①和资料②，下列说法正确的是（）。\nA. 事项③正确\nB. 事项④错误",
+            markdown="根据资料①和资料②，下列说法正确的是（）。\nA. 事项③正确\nB. 事项④错误",
+            provider="pp_structure_v3",
+            used_ocr=True,
+            pages=[
+                ParsedPage(
+                    page_number=1,
+                    text="根据资料①和资料②，下列说法正确的是（）。\nA. 事项③正确\nB. 事项④错误",
+                )
+            ],
+        )
+
+        cleaned = clean_parsed_document(document, force=True)
+
+        self.assertIn("资料①和资料②", cleaned.text)
+        self.assertIn("事项③正确", cleaned.text)
+        self.assertIn("事项④错误", cleaned.text)
+        self.assertNotIn("资料1和资料2", cleaned.text)
+
     def test_keeps_block_order_when_bbox_is_missing(self) -> None:
         document = ParsedDocument(
             text="",
@@ -105,6 +127,88 @@ class OcrCleanerTests(unittest.TestCase):
 
         self.assertTrue(cleaned.text.startswith("1. 第一题"))
         self.assertIn("2. 第二题", cleaned.text)
+
+    def test_repairs_unexpected_and_missing_structural_newlines(self) -> None:
+        document = ParsedDocument(
+            text=(
+                "单项选择题\n"
+                "1. 下列各项中，关于会计主体假设的说法\n"
+                "正确的是（）。A. 法律主体必然是会计主体B. 会计主体可以是企业内部部门"
+                "C. 会计主体只能是法人D. 会计主体不能独立核算答案：B解析：会计主体限定核算空间。"
+                "2. 下列处理正确的是（）。A. 甲B. 乙C. 丙D. 丁答案：A解析：解析二。"
+            ),
+            markdown=(
+                "单项选择题\n"
+                "1. 下列各项中，关于会计主体假设的说法\n"
+                "正确的是（）。A. 法律主体必然是会计主体B. 会计主体可以是企业内部部门"
+                "C. 会计主体只能是法人D. 会计主体不能独立核算答案：B解析：会计主体限定核算空间。"
+                "2. 下列处理正确的是（）。A. 甲B. 乙C. 丙D. 丁答案：A解析：解析二。"
+            ),
+            provider="pp_structure_v3",
+            used_ocr=True,
+            pages=[
+                ParsedPage(
+                    page_number=1,
+                    text=(
+                        "单项选择题\n"
+                        "1. 下列各项中，关于会计主体假设的说法\n"
+                        "正确的是（）。A. 法律主体必然是会计主体B. 会计主体可以是企业内部部门"
+                        "C. 会计主体只能是法人D. 会计主体不能独立核算答案：B解析：会计主体限定核算空间。"
+                        "2. 下列处理正确的是（）。A. 甲B. 乙C. 丙D. 丁答案：A解析：解析二。"
+                    ),
+                )
+            ],
+        )
+
+        cleaned = clean_parsed_document(document, force=True)
+
+        self.assertIn("1. 下列各项中,关于会计主体假设的说法 正确的是()。", cleaned.text)
+        self.assertIn("\nA. 法律主体必然是会计主体", cleaned.text)
+        self.assertIn("\n答案:B", cleaned.text)
+        self.assertIn("\n解析:会计主体限定核算空间。", cleaned.text)
+        self.assertIn("\n2. 下列处理正确的是()。", cleaned.text)
+        self.assertGreaterEqual(cleaned.cleanup_report.get("merged_lines", 0), 1)
+        self.assertGreaterEqual(cleaned.cleanup_report.get("split_lines", 0), 9)
+
+    def test_repeated_noise_filter_keeps_question_structure_lines(self) -> None:
+        pages = [
+            OCRPageResult(
+                page_number=1,
+                width=100,
+                height=100,
+                text="",
+                markdown="",
+                blocks=[
+                    OCRTextBlock(page_number=1, block_id="p1-b1", text="第1小题"),
+                    OCRTextBlock(page_number=1, block_id="p1-b2", text="A.495"),
+                    OCRTextBlock(page_number=1, block_id="p1-b3", text="答案与解析"),
+                    OCRTextBlock(page_number=1, block_id="p1-b4", text="答案解析"),
+                    OCRTextBlock(page_number=1, block_id="p1-b5", text="慢炖知识铺"),
+                ],
+            ),
+            OCRPageResult(
+                page_number=2,
+                width=100,
+                height=100,
+                text="",
+                markdown="",
+                blocks=[
+                    OCRTextBlock(page_number=2, block_id="p2-b1", text="第1小题"),
+                    OCRTextBlock(page_number=2, block_id="p2-b2", text="A.495"),
+                    OCRTextBlock(page_number=2, block_id="p2-b3", text="答案与解析"),
+                    OCRTextBlock(page_number=2, block_id="p2-b4", text="答案解析"),
+                    OCRTextBlock(page_number=2, block_id="p2-b5", text="慢炖知识铺"),
+                ],
+            ),
+        ]
+
+        _remove_repeated_noise(pages, 2)
+
+        self.assertIn("第1小题", pages[0].text)
+        self.assertIn("A.495", pages[0].text)
+        self.assertIn("答案与解析", pages[0].text)
+        self.assertIn("答案解析", pages[0].text)
+        self.assertNotIn("慢炖知识铺", pages[0].text)
 
 
 if __name__ == "__main__":

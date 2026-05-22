@@ -6,6 +6,7 @@ from datetime import datetime
 from pydantic import BaseModel
 
 from app.schemas.common import HealthResponse
+from library.parse_options import ParseOutputFormat, ParsePreset
 
 
 class PlatformSummary(BaseModel):
@@ -43,6 +44,39 @@ class OCRCapabilityResponse(BaseModel):
     current_settings: dict[str, object]
     warnings: list[str]
     checks: dict[str, object]
+
+
+class ParsePresetDefaultsResponse(BaseModel):
+    render_dpi: int
+    trim_margins: bool
+    remove_repeated_lines: bool
+    watermark_detection: bool
+    enable_formula_recognition: bool
+
+
+class ParsePresetCapabilityResponse(BaseModel):
+    value: ParsePreset
+    label: str
+    short_label: str
+    engine: str
+    description: str
+    dpi_hint: str
+    primary: bool
+    defaults: ParsePresetDefaultsResponse
+
+
+class ParseOutputFormatOptionResponse(BaseModel):
+    value: ParseOutputFormat
+    label: str
+
+
+class ParseCapabilityResponse(BaseModel):
+    default_preset: ParsePreset
+    default_output_format: ParseOutputFormat
+    force_ocr_locked: bool
+    default_page_chunk_size: int
+    presets: list[ParsePresetCapabilityResponse]
+    output_formats: list[ParseOutputFormatOptionResponse]
 
 
 class AuditLogResponse(BaseModel):

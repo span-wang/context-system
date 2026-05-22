@@ -6,7 +6,8 @@ import subprocess
 from app.core.config import get_settings
 from app.db.bootstrap import get_migration_status
 from app.schemas.common import HealthResponse
-from app.schemas.system import OCRCapabilityResponse, PlatformSummary, SystemStatusResponse
+from app.schemas.system import OCRCapabilityResponse, ParseCapabilityResponse, PlatformSummary, SystemStatusResponse
+from library.parse_options import get_parse_capability_payload
 from library.pdf_ocr_pipeline import _get_paddle_ocr_settings
 
 
@@ -89,7 +90,7 @@ class SystemService:
             cuda_available=cuda_available,
             paddle_version=paddle_info.get("paddle_version"),
             paddle_cuda_device_count=paddle_info.get("cuda_device_count"),
-            recommended_pipeline="PP-OCRv5 server + PP-StructureV3 layout; PaddleOCR-VL 仅用于低置信复杂页兜底",
+            recommended_pipeline="PP-OCRv5 server + PP-StructureV3 layout；PaddleOCR-VL1.5 用于复杂图文页 / 整卷 PDF 解析",
             current_settings=current_settings,
             warnings=warnings,
             checks={
@@ -102,6 +103,9 @@ class SystemService:
                 "paddleocr_vl_mode": "available_fallback" if vl_available else "reserved_fallback",
             },
         )
+
+    def get_parse_capability(self) -> ParseCapabilityResponse:
+        return ParseCapabilityResponse.model_validate(get_parse_capability_payload())
 
 
 def _detect_nvidia_gpu() -> dict[str, object]:

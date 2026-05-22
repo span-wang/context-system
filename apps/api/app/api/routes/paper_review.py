@@ -7,15 +7,26 @@ from app.api.deps import get_session
 from app.services.audit import AuditService
 from app.schemas.paper_review import (
     PaperReviewAIActionResponse,
+    PaperReviewAIBatchActionRequest,
+    PaperReviewAIBatchActionResponse,
+    PaperReviewAIStandardizeJobResponse,
+    PaperReviewAIStandardizeJobSubmitResponse,
+    PaperReviewBatchReviewRequest,
+    PaperReviewBatchReviewResponse,
     PaperReviewAutoTagResponse,
     PaperReviewAutoTagJobResponse,
     PaperReviewQuestionKnowledgePointUpdateRequest,
     PaperReviewQuestionResponse,
     PaperReviewQuestionUpdateRequest,
-    PaperReviewRebuildResponse,
     PaperReviewWorkspaceResponse,
 )
 from app.services.paper_review import PaperReviewService
+from app.services.paper_review_standardize_jobs import (
+    build_paper_review_ai_standardize_job_response,
+    build_paper_review_ai_standardize_job_submit_response,
+    get_paper_review_ai_standardize_job,
+    start_paper_review_ai_standardize_jobs,
+)
 from app.services.paper_review_tag_jobs import get_paper_review_auto_tag_job, start_paper_review_auto_tag_job
 
 
@@ -25,20 +36,6 @@ router = APIRouter(prefix="/api/paper-review", tags=["paper-review"])
 @router.get("/papers/{paper_id}", response_model=PaperReviewWorkspaceResponse)
 def get_paper_review_workspace(paper_id: int, session: Session = Depends(get_session)) -> PaperReviewWorkspaceResponse:
     return PaperReviewService(session).get_workspace(paper_id)
-
-
-@router.post("/papers/{paper_id}/rebuild", response_model=PaperReviewRebuildResponse)
-def rebuild_paper_review_questions(paper_id: int, session: Session = Depends(get_session)) -> PaperReviewRebuildResponse:
-    result = PaperReviewService(session).rebuild_questions(paper_id)
-    AuditService(session).log(
-        None,
-        module="paper_review",
-        action="rebuild",
-        target_type="paper",
-        target_id=paper_id,
-        payload=result.model_dump(),
-    )
-    return result
 
 
 @router.post("/papers/{paper_id}/auto-tag", response_model=PaperReviewAutoTagJobResponse)
@@ -99,6 +96,66 @@ def get_paper_review_auto_tagging_job(job_id: int, session: Session = Depends(ge
     )
 
 
+@router.post("/papers/{paper_id}/ai-standardize-jobs", response_model=PaperReviewAIStandardizeJobSubmitResponse)
+def start_paper_review_ai_standardize_jobs_for_paper(
+    paper_id: int,
+    session: Session = Depends(get_session),
+) -> PaperReviewAIStandardizeJobSubmitResponse:
+    jobs = start_paper_review_ai_standardize_jobs(
+        session,
+        paper_id=paper_id,
+        only_missing_solutions=True,
+    )
+    response = build_paper_review_ai_standardize_job_submit_response(paper_id, jobs)
+    AuditService(session).log(
+        None,
+        module="paper_review",
+        action="ai_standardize_jobs_start",
+        target_type="paper",
+        target_id=paper_id,
+        payload={
+            "job_count": response.job_count,
+            "requested_count": response.requested_count,
+            "job_ids": [item.job_id for item in response.jobs],
+        },
+    )
+    return response
+
+
+@router.get("/ai-standardize-jobs/{job_id}", response_model=PaperReviewAIStandardizeJobResponse)
+def get_paper_review_ai_standardize_job_status(
+    job_id: int,
+    session: Session = Depends(get_session),
+) -> PaperReviewAIStandardizeJobResponse:
+    job = get_paper_review_ai_standardize_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return build_paper_review_ai_standardize_job_response(job)
+
+
+@router.post("/questions/batch-review", response_model=PaperReviewBatchReviewResponse)
+def batch_review_paper_review_questions(
+    payload: PaperReviewBatchReviewRequest,
+    session: Session = Depends(get_session),
+) -> PaperReviewBatchReviewResponse:
+    result = PaperReviewService(session).batch_update_review(payload.question_ids, payload.review_status, payload.review_note)
+    AuditService(session).log(
+        None,
+        module="paper_review",
+        action="batch_review",
+        target_type="paper_review_question",
+        payload={
+            "question_ids": payload.question_ids,
+            "review_status": payload.review_status,
+            "review_note": payload.review_note,
+            "requested_count": result.requested_count,
+            "success_count": result.success_count,
+            "failed_count": result.failed_count,
+        },
+    )
+    return result
+
+
 @router.patch("/questions/{question_id}", response_model=PaperReviewQuestionResponse)
 def update_paper_review_question(
     question_id: int,
@@ -149,6 +206,28 @@ def standardize_paper_review_question(question_id: int, session: Session = Depen
     return result
 
 
+@router.post("/questions/ai-standardize", response_model=PaperReviewAIBatchActionResponse)
+def standardize_paper_review_questions(
+    payload: PaperReviewAIBatchActionRequest,
+    session: Session = Depends(get_session),
+) -> PaperReviewAIBatchActionResponse:
+    result = PaperReviewService(session).batch_standardize_questions(payload.question_ids)
+    AuditService(session).log(
+        None,
+        module="paper_review",
+        action="ai_standardize_batch",
+        target_type="paper_review_question",
+        payload={
+            "question_ids": payload.question_ids,
+            "requested_count": result.requested_count,
+            "success_count": result.success_count,
+            "failed_count": result.failed_count,
+            "changed_count": result.changed_count,
+        },
+    )
+    return result
+
+
 @router.post("/questions/{question_id}/ai-review", response_model=PaperReviewAIActionResponse)
 def review_paper_review_question(question_id: int, session: Session = Depends(get_session)) -> PaperReviewAIActionResponse:
     result = PaperReviewService(session).review_question(question_id)
@@ -162,6 +241,28 @@ def review_paper_review_question(question_id: int, session: Session = Depends(ge
             "used_ai": result.used_ai,
             "message": result.message,
             "ai_review_status": result.question.ai_review_status,
+        },
+    )
+    return result
+
+
+@router.post("/questions/ai-review", response_model=PaperReviewAIBatchActionResponse)
+def review_paper_review_questions(
+    payload: PaperReviewAIBatchActionRequest,
+    session: Session = Depends(get_session),
+) -> PaperReviewAIBatchActionResponse:
+    result = PaperReviewService(session).batch_review_questions(payload.question_ids)
+    AuditService(session).log(
+        None,
+        module="paper_review",
+        action="ai_review_batch",
+        target_type="paper_review_question",
+        payload={
+            "question_ids": payload.question_ids,
+            "requested_count": result.requested_count,
+            "success_count": result.success_count,
+            "failed_count": result.failed_count,
+            "used_ai_count": result.used_ai_count,
         },
     )
     return result

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from functools import lru_cache
@@ -30,6 +31,14 @@ _DOTENV_FILENAMES = (".evn", ".env", ".env.local")
 LLMTarget = Literal["generator", "reviewer"]
 _INITIAL_ENV_KEYS = set(os.environ)
 _DOTENV_MANAGED_KEYS: set[str] = set()
+
+_MODEL_LIBRARY_FEATURE_LABELS = {
+    "generator": "生成模型",
+    "reviewer": "审查模型",
+    "paper_ai_cleanup": "试卷 AI 切题",
+    "question_ai_standardizer": "题目补全与标准化",
+    "question_auto_tagger": "题目自动考点标注",
+}
 
 
 def _parse_dotenv_file(path: Path) -> dict[str, str]:
@@ -112,18 +121,58 @@ class LLMEndpointConfig(BaseModel):
     max_tokens: int = 8192
     base_url: str | None = None
     api_key: str | None = None
+    disable_thinking: bool = False
 
 
-class LLMPresetConfig(LLMEndpointConfig):
+class ModelLibraryItemConfig(LLMEndpointConfig):
+    id: str
     name: str
 
 
-class LLMConfig(BaseModel):
-    generator: LLMEndpointConfig = Field(default_factory=LLMEndpointConfig)
-    reviewer: LLMEndpointConfig = Field(
-        default_factory=lambda: LLMEndpointConfig(provider="local_rules", model="local-rules")
+class LLMEndpointSelectionConfig(LLMEndpointConfig):
+    model_id: str | None = None
+
+
+class PaperAICleanupConfig(LLMEndpointSelectionConfig):
+    enabled: bool = True
+    provider: str = "openai_compat"
+    model: str = "qwen3.5:9b"
+    max_tokens: int = 12000
+    base_url: str | None = "http://127.0.0.1:11434/v1"
+    disable_thinking: bool = True
+    system_prompt: str = (
+        "你是严谨的中文试卷 OCR 清噪、切题与结构化助手，只返回 JSON。\n"
+        "你的职责不是自由总结，而是把 OCR 文本整理成可直接入库的题目结构。\n"
+        "你必须先清噪，再切题，再抽取并标准化题号、题型、题干、选项、答案、解析；若原文未提供答案或解析，可以留空，不要自行解题补全。\n"
+        "不要漏题，不要合并多题，不要臆造不存在的信息；输出结果必须是最终切题结果，后续解题会单独处理。\n"
+        "输出必须严格符合用户给定的 JSON 结构。"
     )
-    presets: list[LLMPresetConfig] = Field(default_factory=list)
+
+
+class QuestionAIStandardizerConfig(LLMEndpointSelectionConfig):
+    enabled: bool = True
+    provider: str = "openai_compat"
+    model: str = "qwen3.5:9b"
+    max_tokens: int = 4800
+    base_url: str | None = "http://127.0.0.1:11434/v1"
+    disable_thinking: bool = True
+
+
+class QuestionAutoTaggerConfig(LLMEndpointSelectionConfig):
+    enabled: bool = True
+    provider: str = "openai_compat"
+    model: str = "qwen3.5:9b"
+    max_tokens: int = 320
+    base_url: str | None = "http://127.0.0.1:11434/v1"
+    disable_thinking: bool = True
+
+
+class LLMConfig(BaseModel):
+    generator: LLMEndpointSelectionConfig = Field(default_factory=LLMEndpointSelectionConfig)
+    reviewer: LLMEndpointSelectionConfig = Field(
+        default_factory=lambda: LLMEndpointSelectionConfig(provider="openai_compat", model="deepseek-v4-flash")
+    )
+    models: list[ModelLibraryItemConfig] = Field(default_factory=list)
 
 
 class StorageConfig(BaseModel):
@@ -167,10 +216,13 @@ class SubjectConfig(BaseModel):
 class Settings(BaseModel):
     app: AppConfig = Field(default_factory=AppConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    paper_ai_cleanup: PaperAICleanupConfig = Field(default_factory=PaperAICleanupConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     db: DBConfig = Field(default_factory=DBConfig)
     ragflow: RAGFlowConfig = Field(default_factory=RAGFlowConfig)
     review: ReviewConfig = Field(default_factory=ReviewConfig)
+    question_ai_standardizer: QuestionAIStandardizerConfig = Field(default_factory=QuestionAIStandardizerConfig)
+    question_auto_tagger: QuestionAutoTaggerConfig = Field(default_factory=QuestionAutoTaggerConfig)
     subjects: list[SubjectConfig] = Field(default_factory=list)
 
 
@@ -226,6 +278,8 @@ def llm_api_key_env_candidates(endpoint: LLMEndpointConfig, target: LLMTarget | 
             candidates.append("DEEPSEEK_REVIEWER_API_KEY")
         candidates.extend(("DEEPSEEK_API_KEY", "OPENAI_API_KEY"))
     elif provider == "openai_compat":
+        if "minimax" in base_url:
+            candidates.append("MINIMAX_API_KEY")
         candidates.append("OPENAI_API_KEY")
 
     return tuple(dict.fromkeys(key for key in candidates if key))
@@ -242,10 +296,199 @@ def get_settings() -> Settings:
         raw.setdefault("db", {})["url"] = os.getenv("DB_URL")
     if os.getenv("STORAGE_ROOT"):
         raw.setdefault("storage", {})["root"] = os.getenv("STORAGE_ROOT")
-    settings = Settings.model_validate(_expand_env(raw))
+    normalized_raw = _normalize_model_library_config(raw)
+    settings = Settings.model_validate(_expand_env(normalized_raw))
+    settings = _resolve_selected_models(settings)
     settings.db.resolved_url
     settings.storage.root_path.mkdir(parents=True, exist_ok=True)
     return settings
+
+
+def _normalize_model_library_config(raw: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(raw)
+    llm_raw = dict(normalized.get("llm") or {}) if isinstance(normalized.get("llm"), dict) else {}
+    llm_raw["models"] = _normalized_model_library_items(normalized)
+    normalized["llm"] = llm_raw
+    return normalized
+
+
+def _normalized_model_library_items(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    llm_raw = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
+    explicit_models = llm_raw.get("models") if isinstance(llm_raw.get("models"), list) else []
+    legacy_presets = llm_raw.get("presets") if isinstance(llm_raw.get("presets"), list) else []
+    candidates: list[tuple[dict[str, Any], str | None]] = []
+    for item in explicit_models:
+        if isinstance(item, dict):
+            candidates.append((item, None))
+    for item in legacy_presets:
+        if isinstance(item, dict):
+            candidates.append((item, None))
+    for feature_name, label in _MODEL_LIBRARY_FEATURE_LABELS.items():
+        feature_raw = _feature_model_candidate(raw, feature_name)
+        if feature_raw:
+            candidates.append((feature_raw, label))
+
+    normalized_items: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    seen_signatures: set[tuple[str, str, int, str, str]] = set()
+    for item, fallback_name in candidates:
+        normalized = _normalize_model_library_item(item, fallback_name, used_ids)
+        if not normalized:
+            continue
+        signature = _model_signature(normalized)
+        if signature in seen_signatures:
+            continue
+        normalized_items.append(normalized)
+        seen_signatures.add(signature)
+    return normalized_items
+
+
+def _feature_model_candidate(raw: dict[str, Any], feature_name: str) -> dict[str, Any] | None:
+    if feature_name in {"generator", "reviewer"}:
+        llm_raw = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
+        feature_raw = llm_raw.get(feature_name)
+    else:
+        feature_raw = raw.get(feature_name)
+    return dict(feature_raw) if isinstance(feature_raw, dict) else None
+
+
+def _normalize_model_library_item(
+    item: dict[str, Any],
+    fallback_name: str | None,
+    used_ids: set[str],
+) -> dict[str, Any] | None:
+    provider = str(item.get("provider") or "").strip()
+    model = str(item.get("model") or "").strip()
+    if not provider or not model:
+        return None
+
+    normalized: dict[str, Any] = {
+        "provider": provider,
+        "model": model,
+        "max_tokens": _safe_int(item.get("max_tokens"), 8192),
+    }
+    base_url = str(item.get("base_url") or "").strip()
+    api_key = str(item.get("api_key") or "").strip()
+    if base_url:
+        normalized["base_url"] = base_url
+    if api_key:
+        normalized["api_key"] = api_key
+
+    name = str(item.get("name") or fallback_name or f"{provider} / {model}").strip()
+    normalized["name"] = name
+
+    raw_id = str(item.get("id") or "").strip()
+    model_id = _unique_model_identifier(raw_id or name, used_ids)
+    normalized["id"] = model_id
+    return normalized
+
+
+def _unique_model_identifier(value: str, used_ids: set[str]) -> str:
+    base = _model_identifier_base(value)
+    candidate = base
+    suffix = 2
+    while candidate.casefold() in used_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used_ids.add(candidate.casefold())
+    return candidate
+
+
+def _model_identifier_base(value: str) -> str:
+    base = re.sub(r"[^0-9a-zA-Z]+", "_", value.strip()).strip("_").lower()
+    if base:
+        return base
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
+    return f"model_{digest}"
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _resolve_selected_models(settings: Settings) -> Settings:
+    models_by_id = {item.id: item for item in settings.llm.models}
+    resolved_llm = settings.llm.model_copy(
+        update={
+            "generator": _resolve_selected_endpoint(settings.llm.generator, settings.llm.models, models_by_id),
+            "reviewer": _resolve_selected_endpoint(settings.llm.reviewer, settings.llm.models, models_by_id),
+        }
+    )
+    return settings.model_copy(
+        update={
+            "llm": resolved_llm,
+            "paper_ai_cleanup": _resolve_selected_endpoint(settings.paper_ai_cleanup, settings.llm.models, models_by_id),
+            "question_ai_standardizer": _resolve_selected_endpoint(
+                settings.question_ai_standardizer,
+                settings.llm.models,
+                models_by_id,
+            ),
+            "question_auto_tagger": _resolve_selected_endpoint(
+                settings.question_auto_tagger,
+                settings.llm.models,
+                models_by_id,
+            ),
+        }
+    )
+
+
+def _resolve_selected_endpoint(
+    endpoint: LLMEndpointSelectionConfig,
+    models: list[ModelLibraryItemConfig],
+    models_by_id: dict[str, ModelLibraryItemConfig],
+) -> LLMEndpointSelectionConfig:
+    matched_model = None
+    if endpoint.model_id and endpoint.model_id in models_by_id:
+        matched_model = models_by_id[endpoint.model_id]
+    else:
+        matched_model = _find_matching_model(endpoint, models)
+
+    if not matched_model:
+        return endpoint
+
+    return endpoint.model_copy(
+        update={
+            "model_id": matched_model.id,
+            "provider": matched_model.provider,
+            "model": matched_model.model,
+            "max_tokens": matched_model.max_tokens,
+            "base_url": matched_model.base_url,
+            "api_key": matched_model.api_key,
+        }
+    )
+
+
+def _find_matching_model(
+    endpoint: LLMEndpointConfig,
+    models: list[ModelLibraryItemConfig],
+) -> ModelLibraryItemConfig | None:
+    signature = _model_signature(
+        {
+            "provider": endpoint.provider,
+            "model": endpoint.model,
+            "max_tokens": endpoint.max_tokens,
+            "base_url": endpoint.base_url,
+            "api_key": endpoint.api_key,
+        }
+    )
+    for item in models:
+        if _model_signature(item.model_dump()) == signature:
+            return item
+    return None
+
+
+def _model_signature(item: dict[str, Any]) -> tuple[str, str, int, str, str]:
+    return (
+        str(item.get("provider") or "").strip(),
+        str(item.get("model") or "").strip(),
+        _safe_int(item.get("max_tokens"), 8192),
+        str(item.get("base_url") or "").strip(),
+        str(item.get("api_key") or "").strip(),
+    )
 
 
 def _load_platform_subject_configs() -> list[SubjectConfig]:

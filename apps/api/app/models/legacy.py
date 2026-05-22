@@ -67,12 +67,12 @@ class LegacyGenerationJob(Base):
     __tablename__ = "generation_jobs"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    context: Mapped[str] = mapped_column(Text)
+    context: Mapped[str] = mapped_column(LARGE_TEXT)
     status: Mapped[str] = mapped_column(String(32), index=True)
-    result: Mapped[str | None] = mapped_column(Text, nullable=True)
-    review: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
+    review: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
 
 
 class LegacyBackgroundTask(Base):
@@ -80,11 +80,11 @@ class LegacyBackgroundTask(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     task_type: Mapped[str] = mapped_column(String(64), index=True)
-    payload: Mapped[str] = mapped_column(Text)
+    payload: Mapped[str] = mapped_column(LARGE_TEXT)
     status: Mapped[str] = mapped_column(String(32), index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
-    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

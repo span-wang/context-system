@@ -19,6 +19,14 @@ import {
   SubjectCategoryResponse,
   SubjectResponse,
 } from "../../lib/pro-api";
+import {
+  buildParseQueryParams,
+  FALLBACK_PARSE_CAPABILITY,
+  getParsePresetDefaults,
+  getParseOutputFormatOptions,
+  getPrimaryParsePresetOptions,
+  ParseCapabilityResponse,
+} from "../../lib/parse-presets";
 
 const libraryPreviewChars = 200_000;
 
@@ -31,18 +39,10 @@ const sourceTypes = [
   ["other", "其他"],
 ];
 
-const parsePresetOptions: Array<{ value: ParsePreset; label: string }> = [
-  { value: "auto", label: "自动" },
-  { value: "fast", label: "高速" },
-  { value: "balanced", label: "均衡" },
-  { value: "accurate", label: "高精度" },
-  { value: "formula", label: "公式增强" },
-];
-
-const parseOutputFormatOptions: Array<{ value: ParseOutputFormat; label: string }> = [
-  { value: "markdown", label: "Markdown" },
-  { value: "text", label: "TXT" },
-];
+const defaultParsePresetSettings = getParsePresetDefaults(
+  FALLBACK_PARSE_CAPABILITY.default_preset,
+  FALLBACK_PARSE_CAPABILITY
+);
 
 export default function LibraryPage() {
   const [files, setFiles] = useState<LibraryFile[]>([]);
@@ -55,12 +55,19 @@ export default function LibraryPage() {
   const [parseJob, setParseJob] = useState<LibraryParseJobStatus | null>(null);
   const [reparseResult, setReparseResult] = useState<LibraryReparseResponse | null>(null);
   const [subjects, setSubjects] = useState<SubjectConfig[]>([]);
-  const [parsePreset, setParsePreset] = useState<ParsePreset>("auto");
-  const [outputFormat, setOutputFormat] = useState<ParseOutputFormat>("markdown");
-  const [forceOcr, setForceOcr] = useState(false);
-  const [pageChunkSize, setPageChunkSize] = useState("4");
+  const [parseCapability, setParseCapability] = useState<ParseCapabilityResponse>(FALLBACK_PARSE_CAPABILITY);
+  const [parsePreset, setParsePreset] = useState<ParsePreset>(FALLBACK_PARSE_CAPABILITY.default_preset);
+  const [outputFormat, setOutputFormat] = useState<ParseOutputFormat>(FALLBACK_PARSE_CAPABILITY.default_output_format);
+  const [forceOcr] = useState(true);
+  const [rawOcrMode, setRawOcrMode] = useState(false);
+  const [preservePdfImageContent, setPreservePdfImageContent] = useState(true);
+  const [renderDpi, setRenderDpi] = useState(defaultParsePresetSettings.renderDpi);
+  const [pageChunkSize, setPageChunkSize] = useState(String(FALLBACK_PARSE_CAPABILITY.default_page_chunk_size));
   const [headerRatio, setHeaderRatio] = useState("0.00");
   const [footerRatio, setFooterRatio] = useState("0.00");
+  const [trimMargins, setTrimMargins] = useState(defaultParsePresetSettings.trimMargins);
+  const [removeRepeatedLines, setRemoveRepeatedLines] = useState(defaultParsePresetSettings.removeRepeatedLines);
+  const [watermarkDetection, setWatermarkDetection] = useState(defaultParsePresetSettings.watermarkDetection);
   const [meta, setMeta] = useState({
     subject: "",
     category: "",
@@ -94,9 +101,15 @@ export default function LibraryPage() {
     setMeta((current) => normalizeMetaSubject(current, nextSubjects));
   }
 
+  async function loadParseCapability() {
+    const capability = await apiFetch<ParseCapabilityResponse>("/api/system/parse-capability");
+    setParseCapability(capability);
+  }
+
   useEffect(() => {
     loadFiles().catch((error) => setMessage(error.message));
     loadSubjects().catch((error) => setMessage(error.message));
+    loadParseCapability().catch((error) => setMessage(error.message));
   }, []);
 
   useEffect(() => {
@@ -153,16 +166,32 @@ export default function LibraryPage() {
   }
 
   function buildParseParams() {
-    const params = new URLSearchParams({
-      max_chars: String(libraryPreviewChars),
-      preset: parsePreset,
-      output_format: outputFormat,
-    });
-    if (forceOcr) params.set("force_ocr", "true");
-    if (Number(pageChunkSize) > 0) params.set("pdf_page_chunk_size", String(Number(pageChunkSize)));
-    if (Number(headerRatio) > 0) params.set("crop_header_ratio", String(Number(headerRatio)));
-    if (Number(footerRatio) > 0) params.set("crop_footer_ratio", String(Number(footerRatio)));
-    return params;
+    return buildParseQueryParams(
+      {
+        preset: parsePreset,
+        outputFormat,
+        rawOcrMode,
+        preservePdfImageContent,
+        renderDpi,
+        pageChunkSize,
+        cropHeaderRatio: headerRatio,
+        cropFooterRatio: footerRatio,
+        trimMargins,
+        removeRepeatedLines,
+        watermarkDetection,
+      },
+      parseCapability,
+      { max_chars: String(libraryPreviewChars) }
+    );
+  }
+
+  function chooseParsePreset(nextPreset: ParsePreset) {
+    const defaults = getParsePresetDefaults(nextPreset, parseCapability);
+    setParsePreset(nextPreset);
+    setRenderDpi(defaults.renderDpi);
+    setTrimMargins(defaults.trimMargins);
+    setRemoveRepeatedLines(defaults.removeRepeatedLines);
+    setWatermarkDetection(defaults.watermarkDetection);
   }
 
   async function startParseJob(file: LibraryFile, mode: LibraryParseMode) {
@@ -367,18 +396,18 @@ export default function LibraryPage() {
             <div className="row">
               <div className="field">
                 <label>解析预设</label>
-                <select value={parsePreset} onChange={(e) => setParsePreset(e.target.value as ParsePreset)}>
-                  {parsePresetOptions.map((option) => (
+                <select value={parsePreset} onChange={(e) => chooseParsePreset(e.target.value as ParsePreset)}>
+                  {getPrimaryParsePresetOptions(parseCapability).map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>
                   ))}
-                  </select>
+                </select>
               </div>
               <div className="field">
                 <label>输出格式</label>
                 <select value={outputFormat} onChange={(e) => setOutputFormat(e.target.value as ParseOutputFormat)}>
-                  {parseOutputFormatOptions.map((option) => (
+                  {getParseOutputFormatOptions(parseCapability).map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>
@@ -388,11 +417,15 @@ export default function LibraryPage() {
             </div>
             <div className="row">
               <div className="field">
-                <label>强制 OCR</label>
-                <select value={forceOcr ? "true" : "false"} onChange={(e) => setForceOcr(e.target.value === "true")}>
-                  <option value="false">否</option>
-                  <option value="true">是</option>
-                </select>
+                <label>渲染 DPI</label>
+                <input
+                  min="96"
+                  max="360"
+                  step="10"
+                  type="number"
+                  value={renderDpi}
+                  onChange={(e) => setRenderDpi(e.target.value)}
+                />
               </div>
               <div className="field">
                 <label>每批页数</label>
@@ -408,12 +441,93 @@ export default function LibraryPage() {
             </div>
             <div className="row">
               <div className="field">
+                <label>强制 OCR</label>
+                <select value={forceOcr ? "true" : "false"} disabled>
+                  <option value="true">是（固定）</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>说明</label>
+                <input value="固定开启，确保 PDF 始终走 OCR 解析链路" readOnly />
+              </div>
+            </div>
+            <div className="row">
+              <div className="field">
                 <label>页眉裁切</label>
-                <input value={headerRatio} onChange={(e) => setHeaderRatio(e.target.value)} placeholder="0.04" />
+                <input
+                  min="0"
+                  max="0.2"
+                  step="0.01"
+                  type="number"
+                  value={headerRatio}
+                  onChange={(e) => setHeaderRatio(e.target.value)}
+                />
               </div>
               <div className="field">
                 <label>页脚裁切</label>
-                <input value={footerRatio} onChange={(e) => setFooterRatio(e.target.value)} placeholder="0.05" />
+                <input
+                  min="0"
+                  max="0.2"
+                  step="0.01"
+                  type="number"
+                  value={footerRatio}
+                  onChange={(e) => setFooterRatio(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="row">
+              <div className="field">
+                <label>空白边裁切</label>
+                <select value={trimMargins ? "true" : "false"} onChange={(e) => setTrimMargins(e.target.value === "true")}>
+                  <option value="true">开启</option>
+                  <option value="false">关闭</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>重复行清理</label>
+                <select value={removeRepeatedLines ? "true" : "false"} onChange={(e) => setRemoveRepeatedLines(e.target.value === "true")}>
+                  <option value="true">开启</option>
+                  <option value="false">关闭</option>
+                </select>
+              </div>
+            </div>
+            <div className="row">
+              <div className="field">
+                <label>浅色水印弱化</label>
+                <select value={watermarkDetection ? "true" : "false"} onChange={(e) => setWatermarkDetection(e.target.value === "true")}>
+                  <option value="true">开启</option>
+                  <option value="false">关闭</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>说明</label>
+                <input value="仅适合浅灰水印，深色遮挡仍需外部清理" readOnly />
+              </div>
+            </div>
+            <div className="row">
+              <div className="field">
+                <label>原始 OCR 模式</label>
+                <select value={rawOcrMode ? "true" : "false"} onChange={(e) => setRawOcrMode(e.target.value === "true")}>
+                  <option value="false">关闭</option>
+                  <option value="true">开启</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>说明</label>
+                <input value="仅关闭 OCR 规则清噪，AI 清噪继续执行" readOnly />
+              </div>
+            </div>
+            <div className="row">
+              <div className="field">
+                <label>保留 PDF 图片内容</label>
+                <select value={preservePdfImageContent ? "true" : "false"} onChange={(e) => setPreservePdfImageContent(e.target.value === "true")}>
+                  <option value="true">开启</option>
+                  <option value="false">关闭</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>说明</label>
+                <input value="关闭后不保留 PDF 中图片的完整内容与引用" readOnly />
               </div>
             </div>
             <div className="row">
@@ -466,7 +580,7 @@ export default function LibraryPage() {
                       <td>{renderTokenStatus(file)}</td>
                       <td>
                         <div className="buttonRow">
-                          <Link className="button" href={`/analysis/papers/preview?file_id=${file.id}`} title="解析预览">
+                          <Link className="button" href={`/library/preview?file_id=${file.id}`} title="解析预览">
                             <ExternalLink size={16} />
                           </Link>
                           <button

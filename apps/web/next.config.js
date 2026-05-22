@@ -29,10 +29,11 @@ const nextConfig = {
   allowedDevOrigins: parseAllowedDevOrigins(),
   experimental: {
     proxyClientMaxBodySize: "50mb",
+    proxyTimeout: 600000,
   },
   async rewrites() {
     const apiBase = process.env.API_PROXY_TARGET || "http://127.0.0.1:8000";
-    const layoutBase = process.env.LAYOUT_PROXY_TARGET || "https://context.panspan.cloud";
+    const layoutBase = process.env.LAYOUT_PROXY_TARGET || "http://127.0.0.1:3210";
     return [
       {
         source: "/api/:path*",

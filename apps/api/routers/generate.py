@@ -159,7 +159,7 @@ async def run_review_job(job_id: str, request: ReviewRequest | None = None) -> G
         settings = get_settings()
         endpoint = settings.llm.reviewer
         llm_provider = None
-        if endpoint.provider not in {"local_template", "local_rules"}:
+        if endpoint.provider != "local_template":
             llm_provider = get_llm_provider(endpoint, target="reviewer")
         job.review = await review_result(
             job.result,
@@ -369,7 +369,7 @@ async def _run_generation(job_id: str, request: GenerationRequest | None) -> Non
 
 async def _generate_result(context: GenerationContext):
     endpoint = get_settings().llm.generator
-    if endpoint.provider in {"local_template", "local_rules"}:
+    if endpoint.provider == "local_template":
         return await get_generator(context.content_type).generate(context)
     provider = get_llm_provider(endpoint, target="generator")
     return await LLMContentGenerator(provider, endpoint).generate(context)
@@ -437,11 +437,14 @@ def _find_review_item(job: GenerationJob, item_id: str):
 
 
 def _ensure_context_size(context: GenerationContext) -> None:
-    layout_prompt = context.options.get("layout_prompt")
-    total_tokens = estimate_sources_tokens(
-        [source.text for source in context.sources],
-        "\n".join(item for item in [context.user_notes, layout_prompt if isinstance(layout_prompt, str) else None] if item),
-    )
+    layout_prompt = str(context.options.get("layout_prompt") or "").strip()
+    if layout_prompt and _layout_prompt_is_self_contained(layout_prompt):
+        total_tokens = estimate_sources_tokens([], layout_prompt)
+    else:
+        total_tokens = estimate_sources_tokens(
+            [source.text for source in context.sources],
+            "\n".join(item for item in [context.user_notes, layout_prompt] if item),
+        )
     limit = get_settings().app.context_token_limit
     if total_tokens > limit:
         raise HTTPException(
@@ -453,6 +456,18 @@ def _ensure_context_size(context: GenerationContext) -> None:
                 "suggestion": "Reduce source files, crop PDFs by chapter, or switch to RAGFlow mode.",
             },
         )
+
+
+def _layout_prompt_is_self_contained(layout_prompt: str) -> bool:
+    return any(
+        marker in layout_prompt
+        for marker in (
+            "[Library Sources]",
+            "[New Uploads]",
+            "[Source Content]",
+            "Source content:",
+        )
+    )
 
 
 def _metadata_from_form(

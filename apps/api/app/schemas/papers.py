@@ -7,6 +7,8 @@ from pydantic import Field
 
 from app.schemas.common import ORMModel
 
+PaperParseExecutionMode = Literal["ocr_only", "ai_cleanup_split", "full_chain"]
+
 
 class PaperParseResponse(ORMModel):
     paper_id: int
@@ -18,13 +20,18 @@ class PaperParseResponse(ORMModel):
     tagged_count: int
     preview: str | None = None
     provider: str | None = None
-    parse_mode: str = "rules"
     output_format: Literal["markdown", "text"] = "markdown"
     warnings: list[str] = Field(default_factory=list)
     parse_options: dict[str, object] = Field(default_factory=dict)
+    parse_runtime: dict[str, object] = Field(default_factory=dict)
+    execution_mode: PaperParseExecutionMode = "full_chain"
+    token_count: int | None = None
     dataset_sample_path: str | None = None
     dataset_auto_exported: bool = False
     dataset_export_error: str | None = None
+    ai_standardize_job_count: int = 0
+    ai_standardize_requested_count: int = 0
+    ai_standardize_job_ids: list[int] = Field(default_factory=list)
 
 
 class PaperParseJobResponse(ORMModel):
@@ -32,6 +39,7 @@ class PaperParseJobResponse(ORMModel):
     paper_id: int
     status: str
     progress: int
+    execution_mode: PaperParseExecutionMode = "full_chain"
 
 
 class AnalysisJobResponse(ORMModel):

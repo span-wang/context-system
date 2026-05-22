@@ -7,7 +7,7 @@
 
 当前 MVP 已包含 FastAPI 后端、Next.js 前端、素材库、6 种内容类型、生成历史和内容审查报告。内容审查支持纯大模型、仅依据文档、混合审查三种模式。没有 LLM Key 时会使用本地模板链路跑通流程；后续可接入 Claude/OpenAI 兼容接口。
 在 `/settings` 配置 DeepSeek、OpenAI 兼容接口或 Anthropic 后，新建的生成任务会走对应模型；本地模板/本地规则仍可作为无 Key 兜底。
-配置页支持把一组 LLM 参数保存成预设，后续可一键切换到生成模型或审查模型。
+配置页支持维护统一模型库，并为生成、审查、试卷 AI 切题、题目补全标准化、自动考点标注等功能分别选择要使用的模型。
 
 ## 本地启动
 
@@ -101,7 +101,7 @@ npm run dev
 - `/workflow`：管理选题库、内容日历、审核状态、责任人、素材引用和版本记录，并串起生成、审查、确认、导出发布包。
 - `/generate`：选择模式 A/RAGFlow 或模式 B/直通生成，提交生成任务。
 - `/history`：查看生成历史、小红书发布包和审查报告。
-- `/settings`：在前端配置生成模型和审查模型。
+- `/settings`：在前端维护模型库，并为各功能选择使用的模型。
 
 如果你已经不再保留 SQLite 作为运行库，后续只需要维护 MySQL；`data/app.db` 仅作为一次性历史数据源。
 
@@ -137,6 +137,8 @@ npm run dev
 - `GET /api/system/config`
 - `POST /api/system/config`
 - `POST /api/system/test-llm`
+- `POST /api/system/llm-models`
+- `DELETE /api/system/llm-models/{model_id}`
 - `POST /api/system/llm-presets`
 - `POST /api/system/llm-presets/{preset_name}/apply`
 - `DELETE /api/system/llm-presets/{preset_name}`

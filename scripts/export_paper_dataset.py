@@ -102,8 +102,8 @@ def main() -> int:
             if args.needs_review_only and needs_review_count <= 0:
                 continue
 
-            source_text = ((asset.parsed_text if asset else None) or "").strip()
-            if not source_text:
+            ai_source_text = ((asset.parsed_text if asset else None) or "").strip()
+            if not ai_source_text:
                 skipped_count += 1
                 print(f"[skip] paper_id={paper.id} has no asset.parsed_text to export.")
                 continue
@@ -111,7 +111,8 @@ def main() -> int:
             sample_dir = export_paper_parser_sample(
                 paper_id=paper.id,
                 paper_name=paper.paper_name,
-                source_text=source_text,
+                source_text=ai_source_text,
+                ai_source_text=ai_source_text,
                 paper_status=paper.status,
                 paper_review_status=paper.review_status,
                 exam_year=paper.exam_year,

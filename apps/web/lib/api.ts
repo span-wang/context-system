@@ -2,7 +2,7 @@ import { resolvePublicBase } from "./public-base";
 
 export const API_BASE = resolvePublicBase(process.env.NEXT_PUBLIC_API_BASE, "");
 export const LAYOUT_API_BASE = resolvePublicBase(process.env.NEXT_PUBLIC_LAYOUT_API_BASE, "/layout");
-export const LAYOUT_PUBLIC_URL = process.env.NEXT_PUBLIC_LAYOUT_PUBLIC_URL || "https://context.panspan.cloud";
+export const LAYOUT_PUBLIC_URL = process.env.NEXT_PUBLIC_LAYOUT_PUBLIC_URL || "http://127.0.0.1:3210";
 
 export type ContentType =
   | "mnemonic"
@@ -14,7 +14,7 @@ export type ContentType =
 
 export type ReviewMode = "llm_only" | "document_only" | "hybrid";
 export type ReviewItemStatus = "pending" | "confirmed" | "replaced" | "skipped";
-export type ParsePreset = "auto" | "fast" | "balanced" | "accurate" | "formula";
+export type ParsePreset = "vl15" | "v3";
 export type ParseOutputFormat = "markdown" | "text";
 export type WorkflowTopicStatus =
   | "idea"
@@ -312,10 +312,26 @@ export type LLMEndpointConfig = {
   max_tokens: number;
   base_url?: string | null;
   has_api_key: boolean;
+  model_id?: string | null;
+  model_name?: string | null;
 };
 
-export type LLMPresetConfig = LLMEndpointConfig & {
+export type LLMModelConfig = Omit<LLMEndpointConfig, "model_id" | "model_name"> & {
+  id: string;
   name: string;
+};
+
+export type LLMPresetConfig = LLMModelConfig;
+
+export type PaperAICleanupConfig = LLMEndpointConfig & {
+  enabled: boolean;
+  disable_thinking: boolean;
+  system_prompt: string;
+};
+
+export type AIFeatureEndpointConfig = LLMEndpointConfig & {
+  enabled: boolean;
+  disable_thinking: boolean;
 };
 
 export type SubjectConfig = {
@@ -356,8 +372,12 @@ export type SystemConfig = {
   llm: {
     generator: LLMEndpointConfig;
     reviewer: LLMEndpointConfig;
-    presets: LLMPresetConfig[];
+    models: LLMModelConfig[];
+    presets: LLMModelConfig[];
   };
+  paper_ai_cleanup: PaperAICleanupConfig;
+  question_ai_standardizer: AIFeatureEndpointConfig;
+  question_auto_tagger: AIFeatureEndpointConfig;
   storage: {
     type: string;
   };

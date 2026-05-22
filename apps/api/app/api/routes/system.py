@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_session, require_roles
 from app.schemas.auth import CurrentUserResponse
-from app.schemas.system import AuditLogResponse, OCRCapabilityResponse
+from app.schemas.system import AuditLogResponse, OCRCapabilityResponse, ParseCapabilityResponse
 from app.services.audit import AuditService
 from app.services.system import SystemService
 
@@ -27,6 +27,11 @@ def status():
 @router.get("/ocr-capability", response_model=OCRCapabilityResponse)
 def ocr_capability() -> OCRCapabilityResponse:
     return SystemService().get_ocr_capability()
+
+
+@router.get("/parse-capability", response_model=ParseCapabilityResponse)
+def parse_capability() -> ParseCapabilityResponse:
+    return SystemService().get_parse_capability()
 
 
 @router.get("/audit-logs", response_model=list[AuditLogResponse])

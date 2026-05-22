@@ -7,12 +7,12 @@ import logging
 import mimetypes
 import re
 import shutil
-from uuid import uuid4
-from datetime import datetime
+from datetime import datetime, timezone
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import HTTPException
 from fastapi import UploadFile
@@ -24,6 +24,7 @@ from app.repositories.papers import PaperRepository
 from app.schemas.papers import (
     PaperDeleteResponse,
     PaperDetailResponse,
+    PaperParseExecutionMode,
     PaperParseResponse,
     PaperSectionResponse,
     PaperSummary,
@@ -35,12 +36,25 @@ from app.services.paper_dataset import (
     resolve_paper_dataset_sample_dir,
     should_auto_export_paper_dataset,
 )
-from app.services.paper_parser_rules import parse_sections_with_rules
-from app.services.paper_parser_rules.engine import parse_question_block as parse_rule_question_block, parse_sections_from_text
-from library.ocr_cleaner import clean_parsed_document
+from app.services.paper_ai_cleanup import clean_and_structure_paper_source
+from app.services.paper_review_ai import normalize_analysis
+from app.services.paper_review_standardize_jobs import (
+    cancel_active_paper_review_ai_standardize_jobs,
+    start_paper_review_ai_standardize_jobs,
+)
 from library.parse_options import DocumentParseOptions
-from library.pdf_ocr_pipeline import CHECKPOINT_NAMESPACE_FILENAME, OCRPipelineOptions, _get_pdf_ocr_checkpoint_root
-from library.parser import ParsedDocument, parse_document
+from library.pdf_ocr_pipeline import (
+    CHECKPOINT_NAMESPACE_FILENAME,
+    OCRPipelineOptions,
+    _get_paddle_ocr_settings,
+    _get_pdf_ocr_checkpoint_root,
+)
+from library.parser import (
+    ParsedDocument,
+    _get_paddleocr_vl15_runtime_settings,
+    deserialize_parsed_document,
+    parse_document,
+)
 
 PaperParseProgressCallback = Callable[[str, int, dict[str, object] | None], None]
 
@@ -48,76 +62,21 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".md", ".txt"}
 ALLOWED_UPLOAD_MIME_PREFIXES = ("application/", "image/", "text/")
-QUESTION_SPLIT_PATTERN = re.compile(r"(?m)^\s*(?:#+\s*)?(?:第\s*)?([0-9]{1,3}|[一二三四五六七八九十百]{1,6})\s*[\.、．)]\s*")
-OPTION_PATTERN = re.compile(r"(?m)^\s*([A-H])[\.\、．)]\s*(.+?)(?=(?:\n\s*[A-H][\.\、．)]\s*)|\Z)", re.S)
-ANSWER_PATTERN = re.compile(
-    r"(?ms)^\s*(?:#+\s*)?(?:答案|参考答案|正确答案)\s*[:：]\s*(.+?)(?=^\s*(?:#+\s*)?(?:解析|答案解析|【解析】)\s*(?:[:：]|\n)|\Z)"
-)
-ANALYSIS_PATTERN = re.compile(r"(?ms)^\s*(?:#+\s*)?(?:解析|答案解析|【解析】)\s*(?:[:：]\s*|\n+)(.+)$")
-ANSWER_ANALYSIS_HEADER_PATTERN = re.compile(r"(?m)^\s*(?:#+\s*)?答案与解析\s*$")
-INLINE_OPTION_PATTERN = re.compile(r"(?<![A-Za-z0-9\u4e00-\u9fff])([A-H])[\.\、．)]\s*")
-OPTION_LINE_PATTERN = re.compile(r"^\s*[A-H][\.\、．)]\s*")
-TRAILING_OPTION_HINT_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-H])\s*$")
-ANSWER_HEADER_INLINE_PATTERNS = (
-    re.compile(r"(?ms)^\s*(?:#+\s*)?(?:答案|参考答案|正确答案)\s*[:：]\s*"),
-    re.compile(r"(?<![\u4e00-\u9fffA-Za-z0-9])(?:答案|参考答案|正确答案)\s*[:：]\s*"),
-)
-ANALYSIS_HEADER_INLINE_PATTERNS = (
-    re.compile(r"(?ms)^\s*(?:#+\s*)?(?:答案解析|【解析】)\s*(?:[:：]\s*|\n+)?"),
-    re.compile(r"(?ms)^\s*(?:#+\s*)?解析\s*(?:[:：]\s*|\n+)"),
-    re.compile(r"(?<![\u4e00-\u9fffA-Za-z0-9])(?:答案解析|【解析】)\s*(?:[:：]\s*|\n+)?"),
-    re.compile(r"(?<![\u4e00-\u9fffA-Za-z0-9])解析\s*[:：]\s*"),
-)
-SECTION_HEADER_PATTERN = re.compile(
-    r"(?m)^\s*(?:#+\s*)?(?:(?:第\s*[一二三四五六七八九十百0-9]+\s*部分)|(?:[一二三四五六七八九十百0-9]+\s*[、.．]))?\s*"
-    r"(?P<title>(?:单项选择题|多项选择题|不定项选择题|判断题|填空题|简答题|计算题|案例分析题|综合题|材料分析题))"
-    r"[^\n]*$"
-)
-SUBQUESTION_PATTERN = re.compile(r"(?m)^\s*[(（]([1-9][0-9]{0,2}|[一二三四五六七八九十]+)[)）]\s*")
-SUBQUESTION_LABEL_PATTERN = re.compile(r"(?m)(?:^|\s)第\s*([1-9][0-9]{0,2}|[一二三四五六七八九十]+)\s*小题")
-MATERIAL_ITEM_PATTERN = re.compile(r"(?m)^\s*(?:[(（][1-9][0-9]{0,2}[)）]|资料[一二三四五六七八九十0-9]+(?:\s*[:：]|$))")
-CASE_GROUP_PATTERN = re.compile(r"(?m)^\s*(?:#+\s*)?[（(]([一二三四五六七八九十0-9]+)[)）]\s*$")
-SHARED_STEM_CUE_PATTERN = re.compile(
-    r"(?:要求\s*[:：]?|根据上述资料|根据下列资料|阅读下列材料|分析回答下列|回答下列|下列小题|不考虑其他因素)"
-)
-QUESTION_PROMPT_PREFIX_PATTERN = re.compile(r"^(?:根据|下列|关于|对|按照|依据|计算|第\s*[0-9一二三四五六七八九十]+\s*小题)")
-EMPTY_ANSWER_SLOT_PATTERN = re.compile(r"[（(]\s*[）)]")
-BLANK_PLACEHOLDER_PATTERN = re.compile(r"[（(]?\s*(?:[_＿—–-]\s*){2,}[）)]?|[（(]\s*[）)]")
-MULTI_ANSWER_PATTERN = re.compile(r"^[A-H](?:[\s,，/、]+[A-H])+$")
-JUDGE_ANSWER_PATTERN = re.compile(r"^(?:正确|错误|对|错|√|×)$")
-SECTION_TYPE_MAP = {
-    "单项选择题": "single_choice",
-    "多项选择题": "multiple_choice",
-    "不定项选择题": "multiple_choice",
-    "判断题": "judge",
-    "填空题": "fill_blank",
-    "简答题": "short_answer",
-    "计算题": "calculation",
-    "案例分析题": "case_analysis",
-    "综合题": "composite",
-    "材料分析题": "material_analysis",
-}
-
-
-@dataclass(slots=True)
-class SplitQuestionBlock:
-    raw_text: str
-    question_no_override: str | None = None
-    stem_prefix: str | None = None
-
 
 @dataclass(slots=True)
 class ParsedSection:
     title: str
     section_type: str
     sort_order: int
-    blocks: list[SplitQuestionBlock]
 
 
 @dataclass(slots=True)
-class ParsedQuestionBlock:
+class ParsedQuestionPayload:
     question_no: str
+    node_role: str
     question_type: str
+    group_stem: str | None
+    material_text: str | None
     stem_text: str
     options_json: list[str]
     answer_text: str | None
@@ -125,8 +84,9 @@ class ParsedQuestionBlock:
     difficulty_level: int
     quality_score: float
     subquestion_count: int
-    source_section_name: str
     quality_issues: list[str]
+    source_raw_text: str
+    subquestions: list["ParsedQuestionPayload"] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -154,14 +114,20 @@ class PaperPreviewResponse:
     cleanup_report: dict[str, Any]
     cleanup_score: float | None
     parse_options: dict[str, object]
+    parse_runtime: dict[str, object]
+    execution_mode: str
+    cached_at: str | None
     warnings: list[str]
 
 
 @dataclass(slots=True)
-class AppendixSolutionEntry:
-    question_no: str
-    answer_text: str | None = None
-    analysis_text: str | None = None
+class PaperPreviewCacheSnapshot:
+    parsed_document: ParsedDocument
+    options: DocumentParseOptions
+    parse_options: dict[str, object]
+    execution_mode: str
+    token_count: int
+    saved_at: str | None
 
 
 class PaperService:
@@ -299,10 +265,11 @@ class PaperService:
         self,
         paper_id: int,
         options: DocumentParseOptions | None = None,
+        execution_mode: PaperParseExecutionMode = "full_chain",
         progress_callback: PaperParseProgressCallback | None = None,
     ) -> PaperParseResponse:
         options = options or DocumentParseOptions()
-        _emit_parse_progress(progress_callback, "prepare", 5, {"paper_id": paper_id})
+        _emit_parse_progress(progress_callback, "prepare", 5, {"paper_id": paper_id, "execution_mode": execution_mode})
         paper = self.repository.get_paper(paper_id)
         if paper is None:
             raise HTTPException(status_code=404, detail="试卷不存在")
@@ -311,59 +278,129 @@ class PaperService:
             raise HTTPException(status_code=422, detail="试卷未绑定素材")
 
         settings = get_settings()
-        storage_path = Path(asset.storage_path)
-        if not storage_path.is_absolute():
-            storage_path = settings.storage.root_path / storage_path
-        if not storage_path.exists():
-            raise HTTPException(status_code=404, detail=f"素材文件不存在：{asset.storage_path}")
+        cached_snapshot: PaperPreviewCacheSnapshot | None = None
+        effective_options = options
+        if execution_mode == "ai_cleanup_split":
+            cached_snapshot = _read_paper_parse_preview_snapshot(paper=paper, asset=asset)
 
         self._sync_parse_runtime_status(paper, asset, "prepare")
-        _emit_parse_progress(progress_callback, "read_file", 10, {"filename": asset.filename})
-        self._sync_parse_runtime_status(paper, asset, "read_file")
-        data = storage_path.read_bytes()
-        parsed_document = parse_document(
-            data,
-            asset.filename,
-            asset.mime_type,
-            options=options,
-            progress_callback=progress_callback,
-            cache_namespace=f"paper_asset_{asset.id}",
-        )
-        parsed_document = clean_parsed_document(parsed_document)
-        parsed_output = options.select_output(text=parsed_document.text, markdown=parsed_document.markdown).strip()
-        split_source_text = (parsed_document.text or parsed_output).strip()
-        if not parsed_output:
-            asset.parse_status = "empty"
-            asset.ocr_status = "empty"
-            paper.status = "parse_failed"
-            self.session.commit()
-            raise HTTPException(status_code=422, detail="未能从试卷中解析出文本")
+        if cached_snapshot is not None:
+            parsed_document = cached_snapshot.parsed_document
+            effective_options = cached_snapshot.options
+        else:
+            storage_path = Path(asset.storage_path)
+            if not storage_path.is_absolute():
+                storage_path = settings.storage.root_path / storage_path
+            if not storage_path.exists():
+                raise HTTPException(status_code=404, detail=f"素材文件不存在：{asset.storage_path}")
 
+            _emit_parse_progress(
+                progress_callback,
+                "read_file",
+                10,
+                {"filename": asset.filename, "execution_mode": execution_mode},
+            )
+            self._sync_parse_runtime_status(paper, asset, "read_file")
+            data = storage_path.read_bytes()
+            parsed_document = parse_document(
+                data,
+                asset.filename,
+                asset.mime_type,
+                options=effective_options,
+                progress_callback=progress_callback,
+                cache_namespace=f"paper_asset_{asset.id}",
+            )
+            _write_paper_parse_preview_cache(
+                paper=paper,
+                asset=asset,
+                parsed_document=parsed_document,
+                options=effective_options,
+                execution_mode=execution_mode,
+                parse_runtime=_build_parse_runtime_snapshot(
+                    effective_options,
+                    provider=parsed_document.provider,
+                    execution_mode=execution_mode,
+                ),
+            )
+
+        parsed_output = effective_options.select_output(text=parsed_document.text, markdown=parsed_document.markdown).strip()
+        source_text, raw_source_text = _select_ai_cleanup_source(parsed_document, effective_options)
+        source_text = source_text or parsed_output
+        raw_source_text = raw_source_text or source_text
+        if not source_text:
+            fallback_cached_text = (asset.parsed_text or "").strip()
+            if fallback_cached_text:
+                source_text = fallback_cached_text
+                raw_source_text = fallback_cached_text
+                parsed_document = ParsedDocument(
+                    text=fallback_cached_text,
+                    markdown=fallback_cached_text,
+                    provider="asset_parsed_text_fallback",
+                    used_ocr=True,
+                    warnings=[*parsed_document.warnings, "PDF 重新解析为空，已回退到 assets.parsed_text"],
+                    raw_text=fallback_cached_text,
+                    raw_markdown=fallback_cached_text,
+                )
+            else:
+                asset.parse_status = "empty"
+                asset.ocr_status = "empty"
+                paper.status = "parse_failed"
+                self.session.commit()
+                raise HTTPException(status_code=422, detail="未能从试卷中解析出文本")
+
+        parse_runtime = _build_parse_runtime_snapshot(
+            effective_options,
+            provider=parsed_document.provider,
+            execution_mode=execution_mode,
+        )
+        if cached_snapshot is not None:
+            parse_runtime["source_reused_from_cache"] = True
+            parse_runtime["source_execution_mode"] = cached_snapshot.execution_mode
+
+        if execution_mode == "ocr_only":
+            token_count = max(1, len(source_text) // 2)
+            if paper.status != "parsed":
+                paper.status = "source_ready"
+            if asset.parse_status != "parsed":
+                asset.parse_status = "source_ready"
+                asset.parsed_text = source_text
+            asset.ocr_status = "completed"
+            asset.token_count = token_count
+            self.session.commit()
+            _emit_parse_progress(
+                progress_callback,
+                "completed",
+                100,
+                {"execution_mode": execution_mode, "token_count": token_count},
+            )
+            return PaperParseResponse(
+                paper_id=paper.id,
+                asset_id=asset.id,
+                parse_status=asset.parse_status,
+                paper_status=paper.status,
+                question_count=paper.total_question_count,
+                section_count=len(self.repository.list_sections(paper.id)),
+                tagged_count=0,
+                preview=source_text[:300],
+                provider=parsed_document.provider,
+                output_format=effective_options.output_format,
+                warnings=list(parsed_document.warnings or [])[:10],
+                parse_options=effective_options.normalized_dump(),
+                parse_runtime=parse_runtime,
+                execution_mode=execution_mode,
+                token_count=token_count,
+            )
+
+        cancel_active_paper_review_ai_standardize_jobs(
+            self.session,
+            paper_id=paper.id,
+            reason="试卷已重新切题，旧解题任务已作废",
+        )
         tenant = self.repository.get_default_tenant(settings.app.default_tenant_code)
         if tenant is None:
             raise HTTPException(status_code=500, detail="默认租户尚未初始化")
         operator = self.repository.get_default_user(tenant.id)
         operator_id = operator.id if operator else None
-
-        _emit_parse_progress(
-            progress_callback,
-            "split_questions",
-            76,
-            {
-                "text_length": len(split_source_text),
-                "parse_mode": options.parse_mode,
-            },
-        )
-        self._sync_parse_runtime_status(paper, asset, "split_questions")
-        parsed_sections = _split_paper_sections(parsed_document, split_source_text)
-        _emit_parse_progress(
-            progress_callback,
-            "build_sections",
-            80,
-            {"section_count": len(parsed_sections), "parse_mode": options.parse_mode},
-        )
-        self.repository.delete_parse_outputs(paper.id)
-        created_sections: list[PaperSection] = []
         subject_id = paper.subject_id
         if subject_id is None:
             subject_id = asset.subject_id
@@ -375,6 +412,64 @@ class PaperService:
             raise HTTPException(status_code=422, detail="试卷或素材必须绑定学科后才能切题")
         subject = self.repository.get_subject(subject_id)
         category = self.repository.get_subject_category(paper.category_id)
+
+        _emit_parse_progress(
+            progress_callback,
+            "ai_cleanup",
+            72,
+            {
+                "text_length": len(source_text),
+                "execution_mode": execution_mode,
+            },
+        )
+        self._sync_parse_runtime_status(paper, asset, "ai_cleanup")
+        ai_cleanup = clean_and_structure_paper_source(
+            source_text,
+            raw_source_text=raw_source_text,
+            paper_name=paper.paper_name,
+            subject_name=subject.name if subject else None,
+            category_name=category.name if category else _category_from_asset_tags(asset.tags_json if asset else None),
+        )
+        if not (ai_cleanup.ai_sections or []):
+            fallback_ai_cleanup = clean_and_structure_paper_source(
+                source_text,
+                raw_source_text=raw_source_text,
+                paper_name=paper.paper_name,
+            )
+            if fallback_ai_cleanup.ai_sections:
+                merged_warnings = [*ai_cleanup.warnings, "AI 切题首次未产出有效 sections，已使用精简提示重试成功", *fallback_ai_cleanup.warnings]
+                ai_cleanup = fallback_ai_cleanup
+                ai_cleanup.warnings = merged_warnings[:20]
+        ai_source_text = ai_cleanup.ai_source_text.strip() or source_text
+        split_source_text = ai_source_text
+        ai_prediction = ai_cleanup.ai_prediction if isinstance(ai_cleanup.ai_prediction, dict) else {}
+
+        _emit_parse_progress(
+            progress_callback,
+            "split_questions",
+            76,
+            {
+                "text_length": len(split_source_text),
+                "execution_mode": execution_mode,
+            },
+        )
+        self._sync_parse_runtime_status(paper, asset, "split_questions")
+        parsed_sections, section_questions = _build_parsed_sections_from_ai_prediction(ai_prediction)
+        if not parsed_sections:
+            raise HTTPException(status_code=422, detail=_build_ai_split_failure_detail(ai_cleanup))
+        split_strategy = "ai_prediction"
+        _emit_parse_progress(
+            progress_callback,
+            "build_sections",
+            80,
+            {
+                "section_count": len(parsed_sections),
+                "split_strategy": split_strategy,
+                "execution_mode": execution_mode,
+            },
+        )
+        self.repository.delete_parse_outputs(paper.id)
+        created_sections: list[PaperSection] = []
 
         for section_index, parsed_section in enumerate(parsed_sections, start=1):
             section = self.repository.create_section(
@@ -393,7 +488,8 @@ class PaperService:
             )
             created_sections.append(section)
             self._sync_parse_runtime_status(paper, asset, "build_sections")
-            section_question_count = len(parsed_section.blocks)
+            questions_in_section = section_questions[section_index - 1] if section_index - 1 < len(section_questions) else []
+            section_question_count = sum(_count_parsed_leaf_questions(question) for question in questions_in_section)
             if section_question_count:
                 start_no = 1 if not created_sections[:-1] else (created_sections[-2].end_no or 0) + 1
                 section.start_no = start_no
@@ -402,28 +498,28 @@ class PaperService:
 
         tagged_count = 0
 
-        asset.parsed_text = parsed_output
-        asset.token_count = max(1, len(parsed_output) // 2)
+        asset.parsed_text = split_source_text
+        asset.token_count = max(1, len(split_source_text) // 2)
         asset.parse_status = "parsed"
         asset.ocr_status = "completed"
         paper.status = "parsed"
-        review_sync_count = sum(len(section.blocks) for section in parsed_sections)
+        review_sync_count = sum(
+            _count_parsed_leaf_questions(question)
+            for questions in section_questions
+            for question in questions
+        )
         review_payloads = [
             {
                 "section_id": created_section.id,
                 "title": parsed_section.title,
                 "section_type": parsed_section.section_type,
                 "sort_order": parsed_section.sort_order,
-                "blocks": [
-                    {
-                        "raw_text": block.raw_text,
-                        "question_no_override": block.question_no_override,
-                        "stem_prefix": block.stem_prefix,
-                    }
-                    for block in parsed_section.blocks
+                "questions": [
+                    _parsed_question_payload_to_dict(question)
+                    for question in (section_questions[index] if index < len(section_questions) else [])
                 ],
             }
-            for created_section, parsed_section in zip(created_sections, parsed_sections)
+            for index, (created_section, parsed_section) in enumerate(zip(created_sections, parsed_sections))
         ]
         try:
             from app.services.paper_review import PaperReviewService
@@ -440,6 +536,23 @@ class PaperService:
             logger.warning("Skip paper review sync during parse because paper_review module is unavailable: %s", exc)
         paper.total_question_count = review_sync_count
         self.session.commit()
+        ai_standardize_jobs = []
+        ai_standardize_job_warning: str | None = None
+        if execution_mode == "full_chain":
+            try:
+                ai_standardize_jobs = start_paper_review_ai_standardize_jobs(
+                    self.session,
+                    paper_id=paper.id,
+                    only_missing_solutions=True,
+                )
+            except Exception as exc:
+                ai_standardize_job_warning = f"解题任务提交失败：{str(exc)[:120]}"
+                logger.warning("Skip paper review ai standardize job submission during parse: %s", exc)
+        ai_standardize_job_ids = [job.id for job in ai_standardize_jobs]
+        ai_standardize_requested_count = sum(
+            int(((job.scope_config_json or {}).get("requested_count") or 0))
+            for job in ai_standardize_jobs
+        )
         dataset_sample_path: str | None = None
         dataset_export_error: str | None = None
         dataset_warnings: list[str] = []
@@ -448,7 +561,11 @@ class PaperService:
                 sample_dir = export_paper_parser_sample(
                     paper_id=paper.id,
                     paper_name=paper.paper_name,
-                    source_text=split_source_text,
+                    source_text=source_text,
+                    ai_source_text=ai_source_text,
+                    ai_prediction=ai_prediction,
+                    ai_cleanup_debug=ai_cleanup.debug_payload,
+                    raw_source_text=raw_source_text,
                     paper_status=paper.status,
                     paper_review_status=paper.review_status,
                     exam_year=paper.exam_year,
@@ -466,7 +583,13 @@ class PaperService:
                     asset_ocr_status=asset.ocr_status,
                     provider=parsed_document.provider,
                     markdown_image_roots=parsed_document.markdown_image_roots,
-                    parse_options=options.normalized_dump(),
+                    parse_options={
+                        **effective_options.normalized_dump(),
+                        "split_source_file": "ai_source.txt",
+                        "ai_cleanup": ai_cleanup.cleanup_report,
+                        "split_strategy": split_strategy,
+                        "execution_mode": execution_mode,
+                    },
                     stored_section_count=len([section for section in created_sections if section.start_no is not None]),
                     stored_question_count=review_sync_count,
                     stored_needs_review_count=0,
@@ -475,7 +598,17 @@ class PaperService:
             except Exception as exc:
                 dataset_export_error = str(exc)
                 dataset_warnings.append(f"样本自动导入失败：{dataset_export_error}")
-        _emit_parse_progress(progress_callback, "completed", 100, {"question_count": paper.total_question_count})
+        _emit_parse_progress(
+            progress_callback,
+            "completed",
+            100,
+            {
+                "question_count": paper.total_question_count,
+                "split_strategy": split_strategy,
+                "token_count": asset.token_count,
+                "execution_mode": execution_mode,
+            },
+        )
         return PaperParseResponse(
             paper_id=paper.id,
             asset_id=asset.id,
@@ -484,15 +617,25 @@ class PaperService:
             question_count=paper.total_question_count,
             section_count=len([section for section in created_sections if section.start_no is not None]),
             tagged_count=tagged_count,
-            preview=parsed_output[:300],
+            preview=split_source_text[:300],
             provider=parsed_document.provider,
-            parse_mode=options.parse_mode,
-            output_format=options.output_format,
-            warnings=[*dataset_warnings, *parsed_document.warnings][:10],
-            parse_options=options.normalized_dump(),
+            output_format=effective_options.output_format,
+            warnings=[*dataset_warnings, *([ai_standardize_job_warning] if ai_standardize_job_warning else []), *ai_cleanup.warnings, *parsed_document.warnings][:10],
+            parse_options={
+                **effective_options.normalized_dump(),
+                "split_source_file": "ai_source.txt",
+                "ai_cleanup": ai_cleanup.cleanup_report,
+                "split_strategy": split_strategy,
+            },
+            parse_runtime=parse_runtime,
+            execution_mode=execution_mode,
+            token_count=asset.token_count,
             dataset_sample_path=dataset_sample_path,
             dataset_auto_exported=bool(dataset_sample_path),
             dataset_export_error=dataset_export_error,
+            ai_standardize_job_count=len(ai_standardize_jobs),
+            ai_standardize_requested_count=ai_standardize_requested_count,
+            ai_standardize_job_ids=ai_standardize_job_ids,
         )
 
     def preview_paper(
@@ -501,55 +644,17 @@ class PaperService:
         options: DocumentParseOptions | None = None,
         progress_callback: PaperParseProgressCallback | None = None,
     ) -> PaperPreviewResponse:
-        options = options or DocumentParseOptions()
         paper = self.repository.get_paper(paper_id)
         if paper is None:
             raise HTTPException(status_code=404, detail="试卷不存在")
         asset = self.repository.get_asset(paper.asset_id)
         if asset is None:
             raise HTTPException(status_code=422, detail="试卷未绑定素材")
-
-        settings = get_settings()
-        storage_path = Path(asset.storage_path)
-        if not storage_path.is_absolute():
-            storage_path = settings.storage.root_path / storage_path
-        if not storage_path.exists():
-            raise HTTPException(status_code=404, detail=f"素材文件不存在：{asset.storage_path}")
-
-        _emit_parse_progress(progress_callback, "prepare", 5, {"paper_id": paper_id})
-        data = storage_path.read_bytes()
-        parsed_document = parse_document(
-            data,
-            asset.filename,
-            asset.mime_type,
-            options=options,
-            progress_callback=progress_callback,
-            cache_namespace=f"paper_asset_{asset.id}",
-        )
-        cleaned_document = clean_parsed_document(parsed_document)
-        text = cleaned_document.text or ""
-        markdown = cleaned_document.markdown or text
-        raw_text = cleaned_document.raw_text or parsed_document.text or text
-        raw_markdown = cleaned_document.raw_markdown or parsed_document.markdown or markdown
-        raw_markdown = _inline_markdown_images(raw_markdown, getattr(parsed_document, "markdown_image_roots", []) or [])
-        markdown = _inline_markdown_images(markdown, getattr(parsed_document, "markdown_image_roots", []) or [])
-        preview_text = options.select_output(text=text, markdown=markdown).strip()
-        return PaperPreviewResponse(
-            paper_id=paper.id,
-            asset_id=asset.id,
-            filename=asset.filename,
-            provider=cleaned_document.provider,
-            raw_text=raw_text,
-            raw_markdown=raw_markdown,
-            text=text,
-            markdown=markdown,
-            content=preview_text,
-            token_count=max(1, len(preview_text) // 2),
-            cleanup_report=cleaned_document.cleanup_report,
-            cleanup_score=cleaned_document.cleanup_score,
-            parse_options=options.normalized_dump(),
-            warnings=[*parsed_document.warnings, *cleaned_document.warnings][:10],
-        )
+        _emit_parse_progress(progress_callback, "cache", 70, {"paper_id": paper_id, "cache_only": True})
+        cached_preview = _read_paper_parse_preview_cache(paper=paper, asset=asset)
+        if cached_preview is None:
+            raise HTTPException(status_code=409, detail="暂无正式解析缓存，请先执行正式解析")
+        return cached_preview
 
     async def upload_paper(
         self,
@@ -843,7 +948,7 @@ class PaperService:
     def _sync_parse_runtime_status(self, paper: ExamPaper, asset: Asset, stage: str) -> None:
         paper.status = _paper_runtime_status(stage)
         asset.parse_status = _asset_runtime_status(stage)
-        if stage in {"ocr", "layout_analysis", "ocr_fallback"}:
+        if stage in {"ocr", "layout_analysis", "ocr_fallback", "vl15"}:
             asset.ocr_status = "running"
 
 
@@ -854,6 +959,8 @@ def _paper_runtime_status(stage: str) -> str:
         "ocr": "ocr_running",
         "layout_analysis": "layout_analyzing",
         "ocr_fallback": "ocr_fallback_running",
+        "vl15": "vl15_running",
+        "ai_cleanup": "ai_cleaning",
         "split_questions": "splitting_questions",
         "build_sections": "building_sections",
         "tagging": "tagging",
@@ -871,6 +978,8 @@ def _asset_runtime_status(stage: str) -> str:
         "ocr": "ocr_running",
         "layout_analysis": "layout_analyzing",
         "ocr_fallback": "ocr_fallback_running",
+        "vl15": "vl15_running",
+        "ai_cleanup": "ai_cleaning",
         "split_questions": "splitting_questions",
         "build_sections": "building_sections",
         "tagging": "tagging",
@@ -888,6 +997,23 @@ def _resolve_asset_storage_path(storage_path: str) -> Path:
     return get_settings().storage.root_path / candidate
 
 
+def _select_ai_cleanup_source(
+    parsed_document: ParsedDocument,
+    options: DocumentParseOptions,
+) -> tuple[str, str]:
+    source_text = options.select_output(
+        text=parsed_document.raw_text or parsed_document.text,
+        markdown=parsed_document.raw_markdown or parsed_document.markdown,
+    ).strip()
+    if not source_text:
+        source_text = options.select_output(
+            text=parsed_document.text,
+            markdown=parsed_document.markdown,
+        ).strip()
+    raw_source_text = (parsed_document.raw_text or source_text).strip()
+    return source_text, raw_source_text
+
+
 def _build_pdf_checkpoint_dirs(
     asset_id: int,
     asset_sha256: str,
@@ -895,8 +1021,9 @@ def _build_pdf_checkpoint_dirs(
 ) -> set[Path]:
     cache_dirs: set[Path] = set()
     root = _get_pdf_ocr_checkpoint_root()
-    parse_candidates: list[dict[str, Any]] = [*parse_option_dumps, {}, {"preset": "auto"}]
+    parse_candidates: list[dict[str, Any]] = [*parse_option_dumps, {}]
     for dump in parse_candidates:
+        raw_preset = str(dump.get("preset") or "").strip()
         try:
             options = DocumentParseOptions(**dump)
         except Exception:
@@ -920,7 +1047,7 @@ def _build_pdf_checkpoint_dirs(
                     cache_namespace=f"paper_asset_{asset_id}",
                 )
             )
-        if options.preset == "auto" and not options.should_use_pdf_ocr("paper.pdf", "application/pdf"):
+        if raw_preset == "auto" and not options.should_use_pdf_ocr("paper.pdf", "application/pdf"):
             fallback_options = OCRPipelineOptions(
                 force_ocr=True,
                 render_dpi=240,
@@ -991,222 +1118,119 @@ def _build_pdf_layout_checkpoint_dir(
     return root / "layout" / digest[:2] / digest
 
 
-def _split_paper_sections(document: ParsedDocument | None, text: str) -> list[ParsedSection]:
-    if document is not None and document.pages:
-        sections = _adapt_rule_sections(parse_sections_with_rules(document))
-    else:
-        sections = _adapt_rule_sections(parse_sections_from_text(text))
-    return _attach_appendix_solutions(sections, text)
-
-
-def _adapt_rule_sections(rule_sections: list[object]) -> list[ParsedSection]:
-    return [
-        ParsedSection(
-            title=str(getattr(section, "title", "") or "自动切题"),
-            section_type=str(getattr(section, "section_type", "mixed") or "mixed"),
-            sort_order=int(getattr(section, "sort_order", index)),
-            blocks=[
-                SplitQuestionBlock(
-                    raw_text=str(getattr(block, "raw_text", "") or ""),
-                    question_no_override=str(getattr(block, "question_no_override", "") or "").strip() or None,
-                    stem_prefix=str(getattr(block, "stem_prefix", "") or "").strip() or None,
-                )
-                for block in getattr(section, "blocks", [])
-                if str(getattr(block, "raw_text", "") or "").strip()
-            ],
+def _build_parsed_sections_from_ai_prediction(
+    prediction: dict[str, Any],
+) -> tuple[list[ParsedSection], list[list[ParsedQuestionPayload]]]:
+    raw_sections = prediction.get("sections") if isinstance(prediction.get("sections"), list) else []
+    sections: list[ParsedSection] = []
+    section_questions: list[list[ParsedQuestionPayload]] = []
+    for index, item in enumerate(raw_sections, start=1):
+        if not isinstance(item, dict):
+            continue
+        raw_questions = item.get("questions")
+        if not isinstance(raw_questions, list):
+            continue
+        questions: list[ParsedQuestionPayload] = []
+        for order, question in enumerate(raw_questions, start=1):
+            if not isinstance(question, dict):
+                continue
+            payload = _to_parsed_question_payload(question)
+            if payload is None:
+                continue
+            questions.append(payload)
+        if not questions:
+            continue
+        sections.append(
+            ParsedSection(
+                title=str(item.get("title") or "").strip() or f"分区 {index}",
+                section_type=str(item.get("section_type") or "mixed").strip() or "mixed",
+                sort_order=int(item.get("sort_order") or index),
+            )
         )
-        for index, section in enumerate(rule_sections, start=1)
-        if getattr(section, "blocks", None)
+        section_questions.append(questions)
+    return sections, section_questions
+
+
+def _to_parsed_question_payload(question: dict[str, Any]) -> ParsedQuestionPayload | None:
+    stem_text = str(question.get("stem_text") or "").strip()
+    source_raw_text = str(question.get("source_raw_text") or "").strip()
+    question_no = str(question.get("question_no") or "").strip()
+    node_role = str(question.get("node_role") or "").strip() or (
+        "group" if isinstance(question.get("subquestions"), list) and (question.get("subquestions") or []) else "standalone"
+    )
+    question_type = str(question.get("question_type") or "mixed").strip() or "mixed"
+    group_stem = str(question.get("group_stem") or question.get("shared_stem") or "").strip() or None
+    material_text = str(question.get("material_text") or "").strip() or None
+    subquestions = [
+        child_payload
+        for child_payload in (
+            _to_parsed_question_payload(child)
+            for child in (question.get("subquestions") or [])
+            if isinstance(child, dict)
+        )
+        if child_payload is not None
     ]
-
-
-def _attach_appendix_solutions(sections: list[ParsedSection], text: str) -> list[ParsedSection]:
-    appendix_entries = _extract_appendix_solution_entries(text)
-    if not appendix_entries:
-        return sections
-
-    for section in sections:
-        for block in section.blocks:
-            base_text = _strip_appendix_from_block(block.raw_text)
-            parsed = _parse_question_block(
-                SplitQuestionBlock(
-                    raw_text=base_text,
-                    question_no_override=block.question_no_override,
-                    stem_prefix=block.stem_prefix,
-                ),
-                section,
-            )
-            entry = appendix_entries.get(_normalized_question_no(parsed.question_no))
-            if entry is None:
-                continue
-            additions: list[str] = []
-            if not (parsed.answer_text or "").strip() and (entry.answer_text or "").strip():
-                additions.append(f"答案：{entry.answer_text.strip()}")
-            if not (parsed.analysis_text or "").strip() and (entry.analysis_text or "").strip():
-                additions.append(f"解析：{entry.analysis_text.strip()}")
-            if additions:
-                block.raw_text = f"{base_text.rstrip()}\n" + "\n".join(additions)
-            else:
-                block.raw_text = base_text
-    return sections
-
-
-def _extract_appendix_solution_entries(text: str) -> dict[str, AppendixSolutionEntry]:
-    entries: dict[str, AppendixSolutionEntry] = {}
-    for segment in _answer_appendix_segments(text):
-        for entry in _parse_answer_appendix_segment(segment):
-            key = _normalized_question_no(entry.question_no)
-            if not key:
-                continue
-            current = entries.get(key)
-            if current is None:
-                entries[key] = entry
-                continue
-            if not current.answer_text and entry.answer_text:
-                current.answer_text = entry.answer_text
-            if not current.analysis_text and entry.analysis_text:
-                current.analysis_text = entry.analysis_text
-    return entries
-
-
-def _strip_appendix_from_block(raw_text: str) -> str:
-    if not raw_text:
-        return raw_text
-    if not ANSWER_ANALYSIS_HEADER_PATTERN.search(raw_text):
-        return raw_text
-    appendix_start = ANSWER_ANALYSIS_HEADER_PATTERN.search(raw_text)
-    if appendix_start is None:
-        return raw_text
-    return raw_text[: appendix_start.start()].rstrip()
-
-
-def _answer_appendix_segments(text: str) -> list[str]:
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    matches = list(ANSWER_ANALYSIS_HEADER_PATTERN.finditer(normalized))
-    if not matches:
-        return []
-    segments: list[str] = []
-    for index, match in enumerate(matches):
-        start = match.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
-        segment = normalized[start:end].strip()
-        if segment:
-            segments.append(segment)
-    return segments
-
-
-def _parse_answer_appendix_segment(segment: str) -> list[AppendixSolutionEntry]:
-    pattern = re.compile(
-        r"(?ms)^\s*(?:第\s*)?(?P<no>[0-9]{1,3}|[一二三四五六七八九十百]{1,6})\s*[\.、．)]?\s*(?P<body>.+?)(?=^\s*(?:第\s*)?(?:[0-9]{1,3}|[一二三四五六七八九十百]{1,6})\s*[\.、．)]?\s*|\Z)"
-    )
-    results: list[AppendixSolutionEntry] = []
-    for match in pattern.finditer(segment):
-        question_no = str(match.group("no") or "").strip()
-        body = str(match.group("body") or "").strip()
-        if not question_no or not body:
-            continue
-        answer_text, analysis_text = _extract_appendix_answer_analysis(body)
-        if not answer_text and not analysis_text:
-            continue
-        results.append(
-            AppendixSolutionEntry(
-                question_no=question_no,
-                answer_text=answer_text,
-                analysis_text=analysis_text,
-            )
-        )
-    return results
-
-
-def _extract_appendix_answer_analysis(body: str) -> tuple[str | None, str | None]:
-    answer_match = _find_earliest_match(ANSWER_HEADER_INLINE_PATTERNS, body)
-    analysis_match = _find_earliest_match(ANALYSIS_HEADER_INLINE_PATTERNS, body)
-
-    if answer_match is not None:
-        answer_end = answer_match.end()
-        answer_stop = analysis_match.start() if analysis_match and analysis_match.start() > answer_end else len(body)
-        answer_text = _clean_solution_text(body[answer_end:answer_stop])
-        analysis_text = _clean_solution_text(body[analysis_match.end() :]) if analysis_match else None
-        return answer_text, analysis_text
-
-    first_line, _, remainder = body.partition("\n")
-    compact_first = re.sub(r"\s+", "", first_line).upper()
-    if MULTI_ANSWER_PATTERN.match(compact_first) or re.fullmatch(r"[A-H]", compact_first) or JUDGE_ANSWER_PATTERN.match(compact_first):
-        answer_text = first_line.strip() or None
-        analysis_text = _clean_solution_text(remainder)
-        return answer_text, analysis_text
-
-    if analysis_match is not None:
-        analysis_end = analysis_match.end()
-        analysis_text = _clean_solution_text(body[analysis_end:])
-        return None, analysis_text
-
-    return None, None
-
-
-def _normalized_question_no(value: str | None) -> str:
-    return re.sub(r"\s+", "", str(value or "")).strip()
-
-
-def _find_earliest_match(patterns: tuple[re.Pattern[str], ...], text: str) -> re.Match[str] | None:
-    earliest: re.Match[str] | None = None
-    for pattern in patterns:
-        match = pattern.search(text)
-        if match is None:
-            continue
-        if earliest is None or match.start() < earliest.start():
-            earliest = match
-    return earliest
-
-
-def _clean_solution_text(value: str) -> str | None:
-    text = value.strip()
-    if not text:
+    if node_role == "group":
+        stem_text = stem_text or group_stem or material_text or question_no
+        if not source_raw_text or not question_no or not stem_text:
+            return None
+    elif not stem_text or not source_raw_text or not question_no:
         return None
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text or None
-
-
-def _parse_question_block(block: SplitQuestionBlock, section: ParsedSection) -> ParsedQuestionBlock:
-    from app.services.paper_parser_rules.engine import RuleBlock, RuleSection
-
-    parsed = parse_rule_question_block(
-        RuleBlock(
-            raw_text=block.raw_text,
-            question_no_override=block.question_no_override,
-            stem_prefix=block.stem_prefix,
-        ),
-        RuleSection(
-            title=section.title,
-            section_type=section.section_type,
-            sort_order=section.sort_order,
-            blocks=[],
-        ),
-    )
-    return ParsedQuestionBlock(
-        question_no=parsed.question_no,
-        question_type=parsed.question_type,
-        stem_text=parsed.stem_text,
-        options_json=parsed.options,
-        answer_text=parsed.answer_text,
-        analysis_text=parsed.analysis_text,
-        difficulty_level=parsed.difficulty_level,
-        quality_score=parsed.quality_score,
-        subquestion_count=parsed.subquestion_count,
-        source_section_name=parsed.source_section_name,
-        quality_issues=parsed.quality_issues,
+    return ParsedQuestionPayload(
+        question_no=question_no,
+        node_role=node_role,
+        question_type=question_type,
+        group_stem=group_stem,
+        material_text=material_text,
+        stem_text=stem_text,
+        options_json=[str(option).strip() for option in (question.get("options") or []) if str(option).strip()],
+        answer_text=str(question.get("answer_text") or "").strip() or None,
+        analysis_text=normalize_analysis(question.get("analysis_text")),
+        difficulty_level=int(question.get("difficulty_level") or 3),
+        quality_score=float(question.get("quality_score") or 0.0),
+        subquestion_count=int(question.get("subquestion_count") or len(subquestions) or 0),
+        quality_issues=[str(issue).strip() for issue in (question.get("quality_issues") or []) if str(issue).strip()],
+        source_raw_text=source_raw_text,
+        subquestions=subquestions,
     )
 
 
-def _make_question_uid(
-    paper_id: int,
-    section_id: int | None,
-    question_index: int,
-    parsed: ParsedQuestionBlock,
-) -> str:
-    uid_seed = f"{paper_id}:{section_id or 0}:{question_index}:{parsed.question_no}:{parsed.stem_text[:80]}"
-    question_uid = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()[:24]
-    return f"P{paper_id}-{question_uid}"
+def _parsed_question_payload_to_dict(question: ParsedQuestionPayload) -> dict[str, Any]:
+    return {
+        "question_no": question.question_no,
+        "node_role": question.node_role,
+        "question_type": question.question_type,
+        "group_stem": question.group_stem,
+        "material_text": question.material_text,
+        "stem_text": question.stem_text,
+        "options": question.options_json,
+        "answer_text": question.answer_text,
+        "analysis_text": question.analysis_text,
+        "subquestion_count": question.subquestion_count,
+        "quality_score": question.quality_score,
+        "quality_issues": question.quality_issues,
+        "source_raw_text": question.source_raw_text,
+        "subquestions": [_parsed_question_payload_to_dict(child) for child in question.subquestions],
+    }
+
+
+def _count_parsed_leaf_questions(question: ParsedQuestionPayload) -> int:
+    if question.node_role != "group" or not question.subquestions:
+        return 1
+    return sum(_count_parsed_leaf_questions(child) for child in question.subquestions)
+
+
+def _build_ai_split_failure_detail(ai_cleanup: Any) -> str:
+    error = str(getattr(ai_cleanup, "error", "") or "").strip()
+    if error:
+        return f"AI 切题失败：{error}"
+    warnings = getattr(ai_cleanup, "warnings", None)
+    if isinstance(warnings, list):
+        for item in warnings:
+            text = str(item or "").strip()
+            if text:
+                return f"AI 切题失败：{text}"
+    return "AI 切题未生成有效结果"
 
 
 def _paper_tags(category: str | None) -> list[str]:
@@ -1240,6 +1264,174 @@ def _emit_parse_progress(
     if callback is None:
         return
     callback(stage, max(0, min(100, progress)), detail)
+
+
+def _paper_parse_preview_cache_paths(asset_id: int) -> tuple[Path, Path]:
+    cache_root = get_settings().storage.root_path / "cache" / "parsed"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_prefix = f"paper_asset_{asset_id}__latest"
+    return cache_root / f"{cache_prefix}.txt", cache_root / f"{cache_prefix}.json"
+
+
+def _write_paper_parse_preview_cache(
+    *,
+    paper: ExamPaper,
+    asset: Asset,
+    parsed_document: ParsedDocument,
+    options: DocumentParseOptions,
+    execution_mode: str,
+    parse_runtime: dict[str, object],
+) -> None:
+    text_cache_path, structured_cache_path = _paper_parse_preview_cache_paths(asset.id)
+    selected_output = options.select_output(
+        text=parsed_document.text or "",
+        markdown=parsed_document.markdown or parsed_document.text or "",
+    ).strip()
+    text_cache_path.write_text(selected_output, encoding="utf-8")
+    payload = {
+        "version": 1,
+        "paper_id": paper.id,
+        "asset_id": asset.id,
+        "filename": asset.filename,
+        "mime_type": asset.mime_type,
+        "provider": parsed_document.provider,
+        "execution_mode": execution_mode,
+        "token_count": max(1, len(selected_output) // 2),
+        "parse_options": options.normalized_dump(),
+        "parse_runtime": parse_runtime,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "document": parsed_document.to_dict(),
+    }
+    tmp_path = structured_cache_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(structured_cache_path)
+
+
+def _read_paper_parse_preview_snapshot(*, paper: ExamPaper, asset: Asset) -> PaperPreviewCacheSnapshot | None:
+    _, structured_cache_path = _paper_parse_preview_cache_paths(asset.id)
+    if not structured_cache_path.exists():
+        return None
+    try:
+        payload = json.loads(structured_cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    document_payload = payload.get("document")
+    if not isinstance(document_payload, dict):
+        return None
+    parsed_document = deserialize_parsed_document(json.dumps(document_payload, ensure_ascii=False))
+    if parsed_document is None:
+        return None
+
+    parse_options = payload.get("parse_options")
+    if not isinstance(parse_options, dict):
+        parse_options = {}
+    try:
+        options = DocumentParseOptions(**parse_options)
+    except Exception:
+        options = DocumentParseOptions()
+    return PaperPreviewCacheSnapshot(
+        parsed_document=parsed_document,
+        options=options,
+        parse_options=parse_options,
+        execution_mode=str(payload.get("execution_mode") or "full_chain").strip() or "full_chain",
+        token_count=int(payload.get("token_count") or 0),
+        saved_at=str(payload.get("saved_at") or "").strip() or None,
+    )
+
+
+def _read_paper_parse_preview_cache(*, paper: ExamPaper, asset: Asset) -> PaperPreviewResponse | None:
+    snapshot = _read_paper_parse_preview_snapshot(paper=paper, asset=asset)
+    if snapshot is None:
+        return None
+    _, structured_cache_path = _paper_parse_preview_cache_paths(asset.id)
+    try:
+        payload = json.loads(structured_cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    parse_runtime = payload.get("parse_runtime")
+    if not isinstance(parse_runtime, dict):
+        parse_runtime = {}
+
+    parsed_document = snapshot.parsed_document
+    options = snapshot.options
+    raw_text = parsed_document.raw_text or parsed_document.text or ""
+    raw_markdown = parsed_document.raw_markdown or parsed_document.markdown or raw_text
+    text = parsed_document.text or ""
+    markdown = parsed_document.markdown or text
+    selected_markdown = _inline_markdown_images(markdown, getattr(parsed_document, "markdown_image_roots", []) or [])
+    content = options.select_output(text=text, markdown=selected_markdown).strip()
+    token_count = snapshot.token_count or max(1, len(content or text or markdown) // 2)
+
+    return PaperPreviewResponse(
+        paper_id=paper.id,
+        asset_id=asset.id,
+        filename=str(payload.get("filename") or asset.filename),
+        provider=str(payload.get("provider") or parsed_document.provider or "unknown"),
+        raw_text=raw_text,
+        raw_markdown=raw_markdown,
+        text=text,
+        markdown=markdown,
+        content=content,
+        token_count=token_count,
+        cleanup_report=dict(parsed_document.cleanup_report or {}),
+        cleanup_score=parsed_document.cleanup_score,
+        parse_options=snapshot.parse_options,
+        parse_runtime=parse_runtime,
+        execution_mode=snapshot.execution_mode,
+        cached_at=snapshot.saved_at,
+        warnings=[str(item) for item in (parsed_document.warnings or []) if str(item).strip()][:10],
+    )
+
+
+def _build_parse_runtime_snapshot(
+    options: DocumentParseOptions,
+    *,
+    provider: str,
+    execution_mode: str,
+) -> dict[str, object]:
+    runtime: dict[str, object] = {
+        "provider": provider,
+        "execution_mode": execution_mode,
+        "options": options.resolved_summary(),
+    }
+    if options.preset == "vl15" or "vl_1_5" in provider.lower():
+        runtime["model_settings"] = _build_vl15_runtime_snapshot()
+        return runtime
+    ocr_settings = _get_paddle_ocr_settings()
+    runtime["model_settings"] = {
+        "engine": "paddleocr",
+        "ocr_version": str(ocr_settings.get("ocr_version") or ""),
+        "text_detection_model_name": str(ocr_settings.get("text_detection_model_name") or ""),
+        "text_recognition_model_name": str(ocr_settings.get("text_recognition_model_name") or ""),
+        "text_detection_model_dir": ocr_settings.get("text_detection_model_dir"),
+        "text_recognition_model_dir": ocr_settings.get("text_recognition_model_dir"),
+        "use_textline_orientation": bool(ocr_settings.get("use_textline_orientation")),
+        "use_doc_orientation_classify": bool(ocr_settings.get("use_doc_orientation_classify")),
+        "use_doc_unwarping": bool(ocr_settings.get("use_doc_unwarping")),
+        "device": str(ocr_settings.get("device") or ""),
+    }
+    return runtime
+
+
+def _build_vl15_runtime_snapshot() -> dict[str, object]:
+    try:
+        settings = _get_paddleocr_vl15_runtime_settings()
+    except Exception as exc:
+        return {
+            "engine": "paddleocr_vl_1_5",
+            "warning": str(exc),
+        }
+    return {
+        "engine": "paddleocr_vl_1_5",
+        "device": str(settings.get("device") or ""),
+        "cache_home": str(settings.get("cache_home") or ""),
+        "model_source": str(settings.get("model_source") or ""),
+        "disable_model_source_check": bool(settings.get("disable_model_source_check")),
+    }
 
 
 def _inline_markdown_images(markdown: str, markdown_image_roots: list[str]) -> str:

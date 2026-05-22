@@ -16,9 +16,17 @@ class QuestionBankItem(Base, ManagedEntityMixin):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     subject_id: Mapped[int | None] = mapped_column(ForeignKey("subjects.id"), nullable=True, index=True)
     category_id: Mapped[int | None] = mapped_column(ForeignKey("subject_categories.id"), nullable=True, index=True)
+    parent_question_id: Mapped[int | None] = mapped_column(
+        ForeignKey("question_bank_items.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     question_uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     content_fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    node_role: Mapped[str] = mapped_column(String(32), default="standalone", index=True)
     question_type: Mapped[str] = mapped_column(String(64), index=True)
+    group_stem: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
+    material_text: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
     stem_text: Mapped[str] = mapped_column(LARGE_TEXT)
     options_json: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     answer_text: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)

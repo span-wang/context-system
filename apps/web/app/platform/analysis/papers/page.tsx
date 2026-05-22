@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { LayoutTemplate, Sigma, Trash2, type LucideIcon } from "lucide-react";
+import { LayoutTemplate, Trash2, type LucideIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { apiFetch as legacyApiFetch } from "../../../../lib/api";
 import type { SubjectConfig, SystemConfig } from "../../../../lib/api";
@@ -13,13 +13,24 @@ import {
   ParseOutputFormat,
   PaperDeleteResponse,
   PaperDetailResponse,
+  PaperParseExecutionMode,
   PaperParseJobResponse,
+  PaperReviewAIStandardizeJobSubmitResponse,
   PaperSummary,
   PaperUploadResponse,
   ParsePreset,
 } from "../../../../lib/pro-api";
 import { LoadState } from "../../../../components/shared/LoadState";
 import { StatusBadge } from "../../../../components/shared/StatusBadge";
+import {
+  appendParseFormFields,
+  FALLBACK_PARSE_CAPABILITY,
+  getParsePresetDefaults,
+  getParseOutputFormatOptions,
+  getParsePresetSummary,
+  getPrimaryParsePresetOptions,
+  ParseCapabilityResponse,
+} from "../../../../lib/parse-presets";
 import {
   allRejected,
   firstRejectedReason,
@@ -28,29 +39,15 @@ import {
   useLatestRequestGate,
 } from "../../../../lib/request-guard";
 
-const parsePresetOptions: Array<{
-  value: ParsePreset;
-  label: string;
-  engine: string;
-  dpi: string;
-  icon: LucideIcon;
-}> = [
-  { value: "accurate", label: "高精度", engine: "PP-StructureV3", dpi: "320", icon: LayoutTemplate },
-  { value: "formula", label: "公式加强", engine: "PP-StructureV3", dpi: "340", icon: Sigma },
-];
-
-const presetDefaultDpi: Record<ParsePreset, string> = {
-  auto: "240",
-  fast: "150",
-  balanced: "220",
-  accurate: "320",
-  formula: "340",
+const parsePresetIcons: Record<ParsePreset, LucideIcon> = {
+  vl15: LayoutTemplate,
+  v3: LayoutTemplate,
 };
 
-const parseOutputFormatOptions: Array<{ value: ParseOutputFormat; label: string }> = [
-  { value: "markdown", label: "Markdown" },
-  { value: "text", label: "TXT" },
-];
+const defaultParsePresetSettings = getParsePresetDefaults(
+  FALLBACK_PARSE_CAPABILITY.default_preset,
+  FALLBACK_PARSE_CAPABILITY
+);
 
 const uploadRegionOptions = [
   "全国",
@@ -117,6 +114,7 @@ export default function PapersPage() {
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [parsingId, setParsingId] = useState<number | null>(null);
+  const [standardizingId, setStandardizingId] = useState<number | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [detailError, setDetailError] = useState("");
@@ -128,11 +126,19 @@ export default function PapersPage() {
   const [parseJob, setParseJob] = useState<AnalysisJobResponse | null>(null);
   const [ocrCapability, setOcrCapability] = useState<OCRCapabilityResponse | null>(null);
   const [ocrCapabilityError, setOcrCapabilityError] = useState("");
-  const [parsePreset, setParsePreset] = useState<ParsePreset>("accurate");
-  const [outputFormat, setOutputFormat] = useState<ParseOutputFormat>("markdown");
-  const [forceOcr, setForceOcr] = useState(false);
-  const [renderDpi, setRenderDpi] = useState(presetDefaultDpi.accurate);
-  const [pageChunkSize, setPageChunkSize] = useState("4");
+  const [parseCapability, setParseCapability] = useState<ParseCapabilityResponse>(FALLBACK_PARSE_CAPABILITY);
+  const [parsePreset, setParsePreset] = useState<ParsePreset>(FALLBACK_PARSE_CAPABILITY.default_preset);
+  const [outputFormat, setOutputFormat] = useState<ParseOutputFormat>(FALLBACK_PARSE_CAPABILITY.default_output_format);
+  const [forceOcr] = useState(true);
+  const [rawOcrMode, setRawOcrMode] = useState(false);
+  const [preservePdfImageContent, setPreservePdfImageContent] = useState(true);
+  const [renderDpi, setRenderDpi] = useState(defaultParsePresetSettings.renderDpi);
+  const [pageChunkSize, setPageChunkSize] = useState(String(FALLBACK_PARSE_CAPABILITY.default_page_chunk_size));
+  const [cropHeaderRatio, setCropHeaderRatio] = useState("0.00");
+  const [cropFooterRatio, setCropFooterRatio] = useState("0.00");
+  const [trimMargins, setTrimMargins] = useState(defaultParsePresetSettings.trimMargins);
+  const [removeRepeatedLines, setRemoveRepeatedLines] = useState(defaultParsePresetSettings.removeRepeatedLines);
+  const [watermarkDetection, setWatermarkDetection] = useState(defaultParsePresetSettings.watermarkDetection);
   const pageRequestGate = useLatestRequestGate();
   const detailRequestIdRef = useRef(0);
   const activeSubject = subjects.find((subject) => subject.id === selectedSubjectId) || null;
@@ -151,6 +157,14 @@ export default function PapersPage() {
   const parsedPaperCount = papers.filter((paper) => paper.status === "parsed").length;
   const activeFilterCount = Number(Boolean(filterSubjectId)) + Number(Boolean(filterCategory)) + Number(Boolean(filterYear));
   const selectedSubjectMeta = selected?.subject_id != null ? subjectLookup.get(selected.subject_id) || null : null;
+  const selectedActionBusy = selected != null && (parsingId === selected.id || standardizingId === selected.id);
+  const parsePresetOptions = getPrimaryParsePresetOptions(parseCapability).map((option) => ({
+    value: option.value as ParsePreset,
+    label: option.label,
+    engine: option.engine,
+    dpi: option.value === "vl15" ? "服务端" : option.dpi_hint,
+    icon: parsePresetIcons[option.value as ParsePreset],
+  }));
 
   function clearParseStateForPaper(paperId?: number | null) {
     if (paperId == null) {
@@ -265,6 +279,7 @@ export default function PapersPage() {
   useEffect(() => {
     loadPage();
     loadOcrCapability();
+    loadParseCapability();
   }, []);
 
   useEffect(() => {
@@ -314,19 +329,22 @@ export default function PapersPage() {
     }
   }
 
+  async function loadParseCapability() {
+    try {
+      const result = await apiFetch<ParseCapabilityResponse>("/api/system/parse-capability");
+      setParseCapability(result);
+    } catch (err) {
+      setError(toErrorMessage(err, "加载 Paddle 解析能力失败"));
+    }
+  }
+
   async function loadParseJob(jobId: number) {
     const job = await apiFetch<AnalysisJobResponse>(`/api/papers/parse-jobs/${jobId}`);
     setParseJob(job);
     if (job.status === "completed") {
-      const summary = job.result_summary_json || {};
-      const warnings = Array.isArray(summary.warnings) ? summary.warnings.map(String).filter(Boolean) : [];
-      const datasetSamplePath = typeof summary.dataset_sample_path === "string" ? summary.dataset_sample_path : "";
-      const datasetExportError = typeof summary.dataset_export_error === "string" ? summary.dataset_export_error : "";
       await refreshPapers(selected?.id || null);
       setParsingId(null);
-      setParseMessage(
-        `解析完成：已生成 ${Number(summary.question_count || 0)} 道题，规则命中 ${Number(summary.tagged_count || 0)} 条候选考点${warnings.length ? `；当前有 ${warnings.length} 条待复核提示` : ""}${datasetSamplePath ? `；样本已自动导入 ${datasetSamplePath}` : ""}${datasetExportError ? `；训练样本自动导入失败：${datasetExportError}` : ""}。`,
-      );
+      setParseMessage(buildParseCompletionMessage(job));
     }
     if (job.status === "failed") {
       setParsingId(null);
@@ -409,7 +427,7 @@ export default function PapersPage() {
     }
   }
 
-  async function parsePaper(id: number) {
+  async function parsePaper(id: number, executionMode: PaperParseExecutionMode) {
     setParsingId(id);
     setError("");
     setListMessage("");
@@ -417,30 +435,61 @@ export default function PapersPage() {
     setParseJob(null);
     try {
       const form = new FormData();
-      form.append("preset", parsePreset);
-      form.append("output_format", outputFormat);
-      if (forceOcr) form.append("force_ocr", "true");
-      if (Number(renderDpi) > 0) form.append("render_dpi", String(Number(renderDpi)));
-      if (Number(pageChunkSize) > 0) form.append("pdf_page_chunk_size", String(Number(pageChunkSize)));
-      form.append("parse_mode", "rules");
-      if (parsePreset === "formula") form.append("enable_formula_recognition", "true");
+      appendParseFormFields(
+        form,
+        {
+          preset: parsePreset,
+          outputFormat,
+          rawOcrMode,
+          preservePdfImageContent,
+          renderDpi,
+          pageChunkSize,
+          cropHeaderRatio,
+          cropFooterRatio,
+          trimMargins,
+          removeRepeatedLines,
+          watermarkDetection,
+        },
+        parseCapability,
+        { execution_mode: executionMode }
+      );
       const result = await apiFormFetch<PaperParseJobResponse>(`/api/papers/${id}/parse-jobs`, form);
       setParseJob({
         id: result.job_id,
         job_type: "paper_parse",
         scope_type: "paper",
-        scope_config_json: { paper_id: id, stage: "queued", parse_mode: "rules" },
+        scope_config_json: { paper_id: id, stage: "queued", execution_mode: result.execution_mode },
         status: result.status,
         progress: result.progress,
         created_at: new Date().toISOString(),
       });
-      setParseMessage(`解析任务已启动：#${result.job_id}。当前模式：规则切题。`);
-      await loadParseJob(result.job_id);
+      setParseMessage(`任务已启动：#${result.job_id}。当前步骤：${parseExecutionModeLabel(result.execution_mode)}`);
+      const job = await loadParseJob(result.job_id);
+      if (job.status === "pending" || job.status === "running") {
+        setParseMessage(`任务已启动：#${result.job_id}。当前步骤：${parseExecutionModeLabel(result.execution_mode)}`);
+      }
     } catch (err) {
       setError(toErrorMessage(err, "解析试卷失败"));
       setParsingId(null);
     } finally {
       // Completion is handled by the job poller.
+    }
+  }
+
+  async function startAsyncStandardize(paperId: number) {
+    setStandardizingId(paperId);
+    setError("");
+    setListMessage("");
+    setParseMessage("");
+    try {
+      const result = await apiFetch<PaperReviewAIStandardizeJobSubmitResponse>(`/api/paper-review/papers/${paperId}/ai-standardize-jobs`, {
+        method: "POST",
+      });
+      setParseMessage(result.message);
+    } catch (err) {
+      setError(toErrorMessage(err, "提交异步解析失败"));
+    } finally {
+      setStandardizingId(null);
     }
   }
 
@@ -470,8 +519,12 @@ export default function PapersPage() {
   }
 
   function chooseParsePreset(nextPreset: ParsePreset) {
+    const defaults = getParsePresetDefaults(nextPreset, parseCapability);
     setParsePreset(nextPreset);
-    setRenderDpi(presetDefaultDpi[nextPreset]);
+    setRenderDpi(defaults.renderDpi);
+    setTrimMargins(defaults.trimMargins);
+    setRemoveRepeatedLines(defaults.removeRepeatedLines);
+    setWatermarkDetection(defaults.watermarkDetection);
   }
 
   return (
@@ -558,7 +611,7 @@ export default function PapersPage() {
                 上传新试卷
               </button>
               <Link className="button" href={selected?.id ? `/analysis/questions?paperId=${selected.id}` : "/analysis/questions"}>
-                进入题目解析
+                进入审核工作台
               </Link>
             </div>
           </div>
@@ -738,14 +791,11 @@ export default function PapersPage() {
                     </section>
 
                     <div className="buttonRow">
-                      <button className="button primary" type="button" disabled={parsingId === selected.id} onClick={() => parsePaper(selected.id)}>
-                        {parsingId === selected.id ? "解析中..." : "解析并切题"}
-                      </button>
-                      <Link className="button" href={`/analysis/papers/preview?file_id=${selected.asset_id}`}>
+                      <Link className="button" href={`/analysis/papers/preview?paper_id=${selected.id}`}>
                         解析预览
                       </Link>
                       <Link className="button" href={`/analysis/questions?paperId=${selected.id}`}>
-                        进入题目解析
+                        进入审核工作台
                       </Link>
                       {parseMessage && <span className="muted">{parseMessage}</span>}
                     </div>
@@ -814,12 +864,73 @@ export default function PapersPage() {
                       <div className="stackList">
                         <div className="ocrControlPanel">
                           <div className="ocrControlHeader">
-                            <strong>解析模式</strong>
-                            <span>规则切题</span>
+                            <strong>解析链路</strong>
+                            <span>三步可拆分，也可自动串行</span>
+                          </div>
+                          <div className="paperPipelineGrid">
+                            <div className="paperPipelineCard">
+                              <div className="paperPipelineCardHeader">
+                                <span className="paperPipelineStep">01</span>
+                                <strong>解析</strong>
+                              </div>
+                              <p>先执行 OCR 与原文解析，适合先确认版面、页眉裁切和输出质量。</p>
+                              <button
+                                className="button small"
+                                type="button"
+                                disabled={selectedActionBusy}
+                                onClick={() => parsePaper(selected.id, "ocr_only")}
+                              >
+                                {parsingId === selected.id ? "处理中..." : "执行第 1 步"}
+                              </button>
+                            </div>
+                            <div className="paperPipelineCard">
+                              <div className="paperPipelineCardHeader">
+                                <span className="paperPipelineStep">02</span>
+                                <strong>AI 清噪切题</strong>
+                              </div>
+                              <p>基于 OCR 结果做 AI 清噪、切题和结构化入库，不自动提交异步解析。</p>
+                              <button
+                                className="button small"
+                                type="button"
+                                disabled={selectedActionBusy}
+                                onClick={() => parsePaper(selected.id, "ai_cleanup_split")}
+                              >
+                                {parsingId === selected.id ? "处理中..." : "执行第 2 步"}
+                              </button>
+                            </div>
+                            <div className="paperPipelineCard">
+                              <div className="paperPipelineCardHeader">
+                                <span className="paperPipelineStep">03</span>
+                                <strong>异步解析</strong>
+                              </div>
+                              <p>只给缺答案或缺解析的题目提交异步补全任务，适合切题完成后单独补跑。</p>
+                              <button
+                                className="button small"
+                                type="button"
+                                disabled={selectedActionBusy}
+                                onClick={() => startAsyncStandardize(selected.id)}
+                              >
+                                {standardizingId === selected.id ? "提交中..." : "执行第 3 步"}
+                              </button>
+                            </div>
+                          </div>
+                          <div className="paperPipelineAuto">
+                            <div>
+                              <strong>自动执行 1 → 2 → 3</strong>
+                              <p className="muted">适合首次入库或需要整卷从 OCR 到异步解析一口气跑完。</p>
+                            </div>
+                            <button
+                              className="button primary"
+                              type="button"
+                              disabled={selectedActionBusy}
+                              onClick={() => parsePaper(selected.id, "full_chain")}
+                            >
+                              {parsingId === selected.id ? "链路执行中..." : "自动执行整条链路"}
+                            </button>
                           </div>
                           <div className="ocrControlHeader" style={{ marginTop: 12 }}>
                             <strong>OCR 模式</strong>
-                            <span>{parsePresetSummary(parsePreset)}</span>
+                            <span>{getParsePresetSummary(parsePreset, parseCapability)}</span>
                           </div>
                           <div className="ocrModeGrid">
                             {parsePresetOptions.map((option) => {
@@ -867,20 +978,98 @@ export default function PapersPage() {
                           <div className="row">
                             <label className="field">
                               <span>强制 OCR</span>
-                              <select value={forceOcr ? "true" : "false"} onChange={(e) => setForceOcr(e.target.value === "true")}>
-                                <option value="false">否</option>
-                                <option value="true">是</option>
+                              <select value={forceOcr ? "true" : "false"} disabled>
+                                <option value="true">是（固定）</option>
                               </select>
                             </label>
                             <label className="field">
                               <span>输出格式</span>
                               <select value={outputFormat} onChange={(e) => setOutputFormat(e.target.value as ParseOutputFormat)}>
-                                {parseOutputFormatOptions.map((option) => (
+                                {getParseOutputFormatOptions(parseCapability).map((option) => (
                                   <option key={option.value} value={option.value}>
                                     {option.label}
                                   </option>
                                 ))}
                               </select>
+                            </label>
+                          </div>
+                          <div className="row">
+                            <label className="field">
+                              <span>页眉裁切</span>
+                              <input
+                                min="0"
+                                max="0.2"
+                                step="0.01"
+                                type="number"
+                                value={cropHeaderRatio}
+                                onChange={(e) => setCropHeaderRatio(e.target.value)}
+                              />
+                            </label>
+                            <label className="field">
+                              <span>页脚裁切</span>
+                              <input
+                                min="0"
+                                max="0.2"
+                                step="0.01"
+                                type="number"
+                                value={cropFooterRatio}
+                                onChange={(e) => setCropFooterRatio(e.target.value)}
+                              />
+                            </label>
+                          </div>
+                          <div className="row">
+                            <label className="field">
+                              <span>空白边裁切</span>
+                              <select value={trimMargins ? "true" : "false"} onChange={(e) => setTrimMargins(e.target.value === "true")}>
+                                <option value="true">开启</option>
+                                <option value="false">关闭</option>
+                              </select>
+                            </label>
+                            <label className="field">
+                              <span>重复行清理</span>
+                              <select value={removeRepeatedLines ? "true" : "false"} onChange={(e) => setRemoveRepeatedLines(e.target.value === "true")}>
+                                <option value="true">开启</option>
+                                <option value="false">关闭</option>
+                              </select>
+                            </label>
+                          </div>
+                          <div className="row">
+                            <label className="field">
+                              <span>浅色水印弱化</span>
+                              <select value={watermarkDetection ? "true" : "false"} onChange={(e) => setWatermarkDetection(e.target.value === "true")}>
+                                <option value="true">开启</option>
+                                <option value="false">关闭</option>
+                              </select>
+                            </label>
+                            <label className="field">
+                              <span>说明</span>
+                              <input value="仅适合浅灰水印，深色遮挡仍需外部清理" readOnly />
+                            </label>
+                          </div>
+                          <div className="row">
+                            <label className="field">
+                              <span>原始 OCR 模式</span>
+                              <select value={rawOcrMode ? "true" : "false"} onChange={(e) => setRawOcrMode(e.target.value === "true")}>
+                                <option value="false">关闭</option>
+                                <option value="true">开启</option>
+                              </select>
+                            </label>
+                            <label className="field">
+                              <span>说明</span>
+                              <input value="关闭 OCR 规则清噪，AI 清噪仍保留" readOnly />
+                            </label>
+                          </div>
+                          <div className="row">
+                            <label className="field">
+                              <span>保留 PDF 图片内容</span>
+                              <select value={preservePdfImageContent ? "true" : "false"} onChange={(e) => setPreservePdfImageContent(e.target.value === "true")}>
+                                <option value="true">开启</option>
+                                <option value="false">关闭</option>
+                              </select>
+                            </label>
+                            <label className="field">
+                              <span>说明</span>
+                              <input value="关闭后不保留 PDF 中图片的完整内容与引用" readOnly />
                             </label>
                           </div>
                         </div>
@@ -928,7 +1117,7 @@ export default function PapersPage() {
               <div className="paperCenterUploadBody">
                 <div className="calloutBox">
                   <strong>上传建议</strong>
-                  <p>支持 PDF、图片、DOCX、Markdown 与 TXT。先入库基础元数据，后续解析任务会自动接管 OCR、切题和考点识别。</p>
+                  <p>支持 PDF、图片、DOCX、Markdown 与 TXT。先入库基础元数据，上传完成后可按“解析 → AI 清噪切题 → 异步解析”逐步执行，也可以一键跑完整链路。</p>
                 </div>
                 <form className="formGrid" onSubmit={uploadPaper}>
                   <label className="field">
@@ -1130,26 +1319,27 @@ function formatMemory(value?: number | null) {
   return `${(value / 1024).toFixed(1)} GB`;
 }
 
-function parsePresetSummary(preset: ParsePreset) {
-  const summaries: Record<ParsePreset, string> = {
-    auto: "可选文本优先，扫描件自动 OCR",
-    fast: "速度优先，适合快速预览",
-    balanced: "PP-OCRv5 server，速度和精度折中",
-    accurate: "PP-StructureV3 高精度版面解析，默认模式",
-    formula: "高精度版面解析 + 公式识别，适合公式较多试卷",
+function parseExecutionModeLabel(mode?: string | null) {
+  const labels: Record<string, string> = {
+    ocr_only: "解析",
+    ai_cleanup_split: "AI 清噪切题",
+    full_chain: "自动链路",
   };
-  return summaries[preset];
+  return labels[String(mode || "")] || "解析";
 }
 
 function paperStatusLabel(status?: string) {
   const labels: Record<string, string> = {
     uploaded: "已上传",
+    source_ready: "已完成解析",
     parsing: "解析中",
     preparing: "准备文件",
     reading_file: "读取文件",
     ocr_running: "OCR 识别中",
     layout_analyzing: "版面分析中",
     ocr_fallback_running: "OCR 兜底中",
+    vl15_running: "VL1.5 解析中",
+    ai_cleaning: "AI 清噪中",
     splitting_questions: "切题中",
     building_sections: "生成分区中",
     tagging: "考点标注中",
@@ -1163,12 +1353,15 @@ function paperStatusLabel(status?: string) {
 function parseRuntimeStatusLabel(status?: string | null) {
   const labels: Record<string, string> = {
     pending: "待解析",
+    source_ready: "已完成解析",
     preparing: "准备文件",
     reading_file: "读取文件",
     parsing: "解析中",
     ocr_running: "OCR 识别中",
     layout_analyzing: "版面分析中",
     ocr_fallback_running: "OCR 兜底中",
+    vl15_running: "VL1.5 解析中",
+    ai_cleaning: "AI 清噪中",
     splitting_questions: "切题中",
     building_sections: "生成分区中",
     tagging: "考点标注中",
@@ -1210,6 +1403,8 @@ function parseStageLabel(stage?: string) {
     read_file: "读取文件",
     ocr: "OCR 切片识别",
     layout_analysis: "版面切片分析",
+    vl15: "VL1.5 服务解析",
+    ai_cleanup: "本地大模型清噪",
     split_questions: "切题",
     build_sections: "生成分区",
     tagging: "考点标注",
@@ -1223,6 +1418,8 @@ function parseStageLabel(stage?: string) {
 function parseJobDetailText(job: AnalysisJobResponse) {
   const detail = job.scope_config_json?.detail || {};
   const stage = String(job.scope_config_json?.stage || "");
+  const summary = job.result_summary_json || {};
+  const executionMode = String(summary.execution_mode || detail.execution_mode || job.scope_config_json?.execution_mode || "");
   if (stage === "ocr") {
     const done = Number(detail.done_pages || 0);
     const total = Number(detail.total_pages || 0);
@@ -1238,6 +1435,28 @@ function parseJobDetailText(job: AnalysisJobResponse) {
     const total = Number(detail.total_pages || 0);
     return total ? `版面结果触发兜底，PP-OCRv5 正在按切片复核第 ${done} / ${total} 页` : "正在执行 PP-OCRv5 兜底切片复核";
   }
+  if (stage === "vl15") {
+    const done = Number(detail.done_pages || 0);
+    const total = Number(detail.total_pages || 0);
+    const status = String(detail.status || "");
+    if (total) {
+      return `PaddleOCR-VL1.5 正在处理第 ${done} / ${total} 页${status === "restructured" ? "，正在重组全卷 Markdown" : ""}`;
+    }
+    if (status === "submitting") {
+      return "正在提交 PDF 到 PaddleOCR-VL1.5 服务。";
+    }
+    if (status === "restructured") {
+      return "PaddleOCR-VL1.5 已完成版面解析，正在重组整卷输出。";
+    }
+    return "PaddleOCR-VL1.5 服务正在解析复杂版面 PDF。";
+  }
+  if (stage === "ai_cleanup") {
+    const textLength = Number(detail.text_length || 0);
+    return textLength ? `本地大模型正在清噪并结构化 ${textLength} 字文本` : "本地大模型正在清噪并结构化试卷文本";
+  }
+  if (stage === "split_questions") {
+    return "正在执行 AI 切题";
+  }
   if (stage === "device_check") {
     const device = String(detail.device_name || "未知设备");
     const status = String(detail.capability_status || "checking");
@@ -1252,11 +1471,39 @@ function parseJobDetailText(job: AnalysisJobResponse) {
     return String(detail.section_name || "正在生成试卷分区");
   }
   if (stage === "completed") {
+    if (executionMode === "ocr_only") {
+      const tokenCount = Number(summary.token_count || detail.token_count || 0);
+      return tokenCount ? `解析完成，已缓存 ${tokenCount.toLocaleString()} Token 原文。` : "解析完成，可继续执行 AI 清噪切题。";
+    }
+    if (executionMode === "ai_cleanup_split") {
+      const questionCount = Number(detail.question_count || 0);
+      return `AI 清噪切题完成，生成 ${questionCount} 道题，未自动提交异步解析。`;
+    }
     const questionCount = Number(detail.question_count || 0);
     const taggedCount = Number(detail.tagged_count || 0);
     return `解析完成，生成 ${questionCount} 道题，规则命中 ${taggedCount} 条候选考点。`;
   }
   return "后台解析中，页面会自动刷新进度。";
+}
+
+function buildParseCompletionMessage(job: AnalysisJobResponse) {
+  const summary = job.result_summary_json || {};
+  const warnings = Array.isArray(summary.warnings) ? summary.warnings.map(String).filter(Boolean) : [];
+  const executionMode = String(summary.execution_mode || job.scope_config_json?.execution_mode || "");
+  if (executionMode === "ocr_only") {
+    const tokenCount = Number(summary.token_count || 0);
+    return `解析完成：${tokenCount ? `已缓存 ${tokenCount.toLocaleString()} Token 原文` : "已完成 OCR 与原文解析"}；可继续执行 AI 清噪切题。`;
+  }
+  if (executionMode === "ai_cleanup_split") {
+    const datasetSamplePath = typeof summary.dataset_sample_path === "string" ? summary.dataset_sample_path : "";
+    const datasetExportError = typeof summary.dataset_export_error === "string" ? summary.dataset_export_error : "";
+    return `AI 清噪切题完成：已生成 ${Number(summary.question_count || 0)} 道题${warnings.length ? `；当前有 ${warnings.length} 条待复核提示` : ""}${datasetSamplePath ? `；样本已自动导入 ${datasetSamplePath}` : ""}${datasetExportError ? `；训练样本自动导入失败：${datasetExportError}` : ""}；未自动提交异步解析。`;
+  }
+  const datasetSamplePath = typeof summary.dataset_sample_path === "string" ? summary.dataset_sample_path : "";
+  const datasetExportError = typeof summary.dataset_export_error === "string" ? summary.dataset_export_error : "";
+  const aiStandardizeJobCount = Number(summary.ai_standardize_job_count || 0);
+  const aiStandardizeRequestedCount = Number(summary.ai_standardize_requested_count || 0);
+  return `自动链路完成：已生成 ${Number(summary.question_count || 0)} 道题，规则命中 ${Number(summary.tagged_count || 0)} 条候选考点${aiStandardizeJobCount ? `；已拆分提交 ${aiStandardizeJobCount} 个异步解析任务${aiStandardizeRequestedCount ? `，覆盖 ${aiStandardizeRequestedCount} 道待补全题目/大题` : ""}` : "；当前无需追加异步解析任务"}${warnings.length ? `；当前有 ${warnings.length} 条待复核提示` : ""}${datasetSamplePath ? `；样本已自动导入 ${datasetSamplePath}` : ""}${datasetExportError ? `；训练样本自动导入失败：${datasetExportError}` : ""}。`;
 }
 
 function parseJobChunkDetailText(job: AnalysisJobResponse) {

@@ -18,13 +18,21 @@ class PaperReviewQuestion(Base, ManagedEntityMixin):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     paper_id: Mapped[int] = mapped_column(ForeignKey("exam_papers.id", ondelete="CASCADE"), index=True)
     section_id: Mapped[int | None] = mapped_column(ForeignKey("paper_sections.id", ondelete="CASCADE"), nullable=True, index=True)
+    parent_question_id: Mapped[int | None] = mapped_column(
+        ForeignKey("paper_review_questions.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     question_uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     content_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     question_no: Mapped[str] = mapped_column(String(32))
+    node_role: Mapped[str] = mapped_column(String(32), default="standalone")
     question_type: Mapped[str] = mapped_column(String(64))
     source_section_name: Mapped[str] = mapped_column(String(128))
     source_raw_text: Mapped[str] = mapped_column(LARGE_TEXT)
+    group_stem: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
+    material_text: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)
     stem_text: Mapped[str] = mapped_column(LARGE_TEXT)
     options_json: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     answer_text: Mapped[str | None] = mapped_column(LARGE_TEXT, nullable=True)

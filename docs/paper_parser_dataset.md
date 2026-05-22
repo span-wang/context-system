@@ -122,31 +122,15 @@ paper_000123_xxx/
 
 ## 3. 回归评估
 
-标注完 `gold.json` 后执行：
+原 `scripts/eval_paper_parser.py` 已下线。规则切题链路已经移除，仓库不再支持 `source.txt -> 规则 prediction` 的批量回归评估。
 
-```powershell
-python .\scripts\eval_paper_parser.py .\data\paper_parser_dataset
-```
+当前建议：
 
-可选输出 JSON 报告：
+- 继续使用 `scripts/export_paper_dataset.py` 导出最新 `ai_prediction`、`gold.template.json` 和 `meta.json`
+- 在样本目录中对照 `gold.json` 与 `gold.template.json` 做人工复核
+- 需要端到端验证时，直接走试卷解析 API 或前端页面链路
 
-```powershell
-python .\scripts\eval_paper_parser.py .\data\paper_parser_dataset --report-json .\output\paper_parser_eval.json
-```
-
-当前会输出这些核心指标：
-
-- `section_title_accuracy`
-- `section_type_accuracy`
-- `section_question_count_accuracy`
-- `question_no_accuracy`
-- `question_type_accuracy`
-- `stem_text_accuracy`
-- `options_accuracy`
-- `answer_text_accuracy`
-- `analysis_text_accuracy`
-
-这套评估默认按试卷内顺序对齐，适合发现结构性回归。
+当前这套样本更适合做结构性回归和人工抽检，而不是继续维护旧的规则评估分数。
 
 ## 4. 训练结果如何反哺
 

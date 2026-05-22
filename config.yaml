@@ -3,23 +3,72 @@ app:
   context_token_limit: 900000
 llm:
   generator:
-    provider: deepseek
-    model: deepseek-chat
-    max_tokens: 100000
-    api_key: ${DEEPSEEK_GENERATOR_API_KEY}
-    base_url: https://api.deepseek.com/v1
+    model_id: model_0ad017eb28
   reviewer:
-    provider: openai_compat
-    model: deepseek-v4-flash
-    max_tokens: 100000
-    base_url: https://api.deepseek.com/v1
-    api_key: ${DEEPSEEK_REVIEWER_API_KEY}
-  presets:
+    model_id: model_8e94eb6656
+  models:
   - provider: openai_compat
     model: deepseek-v4-flash
     max_tokens: 100000
     base_url: https://api.deepseek.com/v1
     name: DD预设
+    id: dd
+  - provider: deepseek
+    model: deepseek-chat
+    max_tokens: 100000
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_GENERATOR_API_KEY}
+    name: 生成模型
+    id: model_0ad017eb28
+  - provider: openai_compat
+    model: deepseek-v4-flash
+    max_tokens: 100000
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_REVIEWER_API_KEY}
+    name: 审查模型
+    id: model_8e94eb6656
+  - provider: openai_compat
+    model: deepseek-v4-flash
+    max_tokens: 120000
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_REVIEWER_API_KEY}
+    name: 试卷 AI 切题
+    id: ai
+  - provider: deepseek
+    model: deepseek-chat
+    max_tokens: 48000
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_STANDARDIZER_API_KEY}
+    name: 题目补全与标准化
+    id: model_1cd093f309
+  - provider: deepseek
+    model: deepseek-chat
+    max_tokens: 40000
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_TAGGER_API_KEY}
+    name: 题目自动考点标注
+    id: model_5b556de22f
+  - provider: openai_compat
+    model: qwen3.5:9b
+    max_tokens: 40000
+    base_url: http://127.0.0.1:11434/v1
+    api_key: ${LOCAL_OPENAI_COMPAT_API_KEY}
+    name: 题目自动考点标注
+    id: model_5b556de22f_2
+  - provider: openai_compat
+    model: gpt-5.4
+    max_tokens: 100000
+    base_url: https://aicli.opensora.de/v1
+    api_key: ${GPT54_API_KEY}
+    name: GPT5.4
+    id: gpt5_4
+  - provider: deepseek
+    model: deepseek-v4-pro
+    max_tokens: 40000
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_PRO_API_KEY}
+    name: pro
+    id: pro
 storage:
   type: local
   root: ./data
@@ -120,3 +169,16 @@ subjects:
   - 实务
   - 建筑
   - 化工
+paper_ai_cleanup:
+  model_id: dd
+  enabled: true
+  disable_thinking: false
+  system_prompt: '1'
+question_ai_standardizer:
+  model_id: dd
+  enabled: true
+  disable_thinking: false
+question_auto_tagger:
+  model_id: model_0ad017eb28
+  enabled: true
+  disable_thinking: true

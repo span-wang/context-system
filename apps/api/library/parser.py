@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import json
 import os
 import hashlib
@@ -28,14 +27,25 @@ from library.pdf_ocr_pipeline import (
     release_paddle_ocr_resources,
     run_pdf_ocr_pipeline,
 )
-from library.ocr_cleaner import clean_parsed_document
+from library.ocr_cleaner import maybe_clean_parsed_document
+from settings import PROJECT_ROOT
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 TEXT_CHAR_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
 FORMULA_IMAGE_REF_PATTERN = re.compile(r"img_in_formula_box_[^\s\"')>]+", re.IGNORECASE)
+PDF_IMAGE_MARKDOWN_PATTERN = re.compile(r"!\[[^\]]*\]\((?:data:[^)]*|imgs/[^)\s]+)\)")
+PDF_IMAGE_HTML_PATTERN = re.compile(r"<img[^>]*?src=[\"'](?:data:[^\"']+|imgs/[^\"']+)[\"'][^>]*>", re.IGNORECASE)
+PDF_IMAGE_PATH_PATTERN = re.compile(r"\bimgs/[^\s)\"']+")
 PDF_TEXT_CHAR_THRESHOLD = 24
 PDF_OCR_PREVIEW_MAX_PAGES = 2
+PADDLEOCR_VL15_RUNTIME_ENV = "PADDLEOCR_VL15_RUNTIME"
+PADDLEOCR_VL15_DEVICE_ENV = "PADDLEOCR_VL15_DEVICE"
+PADDLEOCR_VL15_CACHE_HOME_ENV = "PADDLE_PDX_CACHE_HOME"
+PADDLEOCR_VL15_MODEL_SOURCE_ENV = "PADDLE_PDX_MODEL_SOURCE"
+PADDLEOCR_VL15_DISABLE_MODEL_SOURCE_CHECK_ENV = "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"
+PADDLEOCR_VL15_DISABLE_DEVICE_FALLBACK_ENV = "PADDLE_PDX_DISABLE_DEVICE_FALLBACK"
+PADDLEOCR_VL15_PROVIDER = "paddleocr_vl_1_5/local"
 ParseProgressCallback = Callable[[str, int, dict[str, object] | None], None]
 
 
@@ -152,24 +162,26 @@ def parse_document(
         suffix = Path(filename).suffix.lower()
 
         if options.should_use_pdf_ocr(filename, mime):
-            return clean_parsed_document(
+            return _finalize_pdf_parsed_document(
                 _parse_pdf_with_options(
                     data,
                     filename,
                     options,
                     progress_callback=progress_callback,
                     cache_namespace=cache_namespace,
-                )
+                ),
+                options,
             )
         if suffix == ".pdf" or mime == "application/pdf":
-            return clean_parsed_document(
-                _parse_pdf(data, filename, progress_callback=progress_callback, cache_namespace=cache_namespace)
+            return _finalize_pdf_parsed_document(
+                _parse_pdf(data, filename, progress_callback=progress_callback, cache_namespace=cache_namespace),
+                options,
             )
         if suffix in {".docx", ".doc"}:
-            return clean_parsed_document(_parse_docx(data))
+            return _finalize_parsed_document(_parse_docx(data), options)
         if suffix in IMAGE_SUFFIXES or mime.startswith("image/"):
-            return clean_parsed_document(_parse_image(data, suffix or ".png"))
-        return clean_parsed_document(_parse_text_document(data))
+            return _finalize_parsed_document(_parse_image(data, suffix or ".png", options=options), options)
+        return _finalize_parsed_document(_parse_text_document(data), options)
     finally:
         release_paddle_parser_resources()
 
@@ -184,34 +196,25 @@ def parse_preview_document(
         options = options or DocumentParseOptions()
         suffix = Path(filename).suffix.lower()
         is_pdf = suffix == ".pdf" or mime == "application/pdf"
-        if is_pdf and options.is_default():
-            direct = _extract_selectable_pdf_text(data)
-            if direct is not None and _document_has_meaningful_text(direct):
-                direct.provider = "pymupdf_text"
-                direct.used_ocr = False
-                return clean_parsed_document(direct)
-
-            warning = (
-                "未检测到可直接提取的 PDF 文本。该文件可能是扫描件；"
-                "如需完整解析，请在素材库中选择 OCR 预设或开启强制 OCR。"
-            )
-            if direct is not None:
-                direct.provider = "pymupdf_text_preview"
-                direct.used_ocr = False
-                direct.warnings.append(warning)
-                return clean_parsed_document(direct)
-            return clean_parsed_document(
-                ParsedDocument(text="", markdown="", provider="pymupdf_text_preview", warnings=[warning])
+        if is_pdf:
+            return _finalize_pdf_parsed_document(
+                _parse_pdf_with_options(data, filename, options, max_pages=PDF_OCR_PREVIEW_MAX_PAGES),
+                options,
             )
 
-        if is_pdf and options.should_use_pdf_ocr(filename, mime):
-            return clean_parsed_document(
-                _parse_pdf_with_options(data, filename, options, max_pages=PDF_OCR_PREVIEW_MAX_PAGES)
-            )
-
-        return clean_parsed_document(_parse_document_inner(data, filename, mime, options=options))
+        return _finalize_parsed_document(_parse_document_inner(data, filename, mime, options=options), options)
     finally:
         release_paddle_parser_resources()
+
+
+def _finalize_parsed_document(document: ParsedDocument, options: DocumentParseOptions) -> ParsedDocument:
+    return maybe_clean_parsed_document(document, raw_ocr_mode=options.use_raw_ocr_mode())
+
+
+def _finalize_pdf_parsed_document(document: ParsedDocument, options: DocumentParseOptions) -> ParsedDocument:
+    if not options.should_preserve_pdf_image_content():
+        document = _strip_pdf_embedded_image_content(document)
+    return _finalize_parsed_document(document, options)
 
 
 def _parse_document_inner(
@@ -238,7 +241,7 @@ def _parse_document_inner(
     if suffix in {".docx", ".doc"}:
         return _parse_docx(data)
     if suffix in IMAGE_SUFFIXES or mime.startswith("image/"):
-        return _parse_image(data, suffix or ".png")
+        return _parse_image(data, suffix or ".png", options=options)
     return _parse_text_document(data)
 
 
@@ -316,6 +319,13 @@ def _parse_pdf_with_options(
     progress_callback: ParseProgressCallback | None = None,
     cache_namespace: str | None = None,
 ) -> ParsedDocument:
+    if options.should_use_vl15_pipeline():
+        return _parse_pdf_with_paddleocr_vl15(
+            data,
+            filename,
+            max_pages=max_pages,
+            progress_callback=progress_callback,
+        )
     with PADDLE_OCR_LOCK:
         pipeline_options = options.to_pipeline_options()
         pipeline_options.cache_namespace = cache_namespace
@@ -377,6 +387,433 @@ def _parse_pdf_with_options(
         return ocr_document
 
 
+def _parse_pdf_with_paddleocr_vl15(
+    data: bytes,
+    filename: str,
+    *,
+    max_pages: int | None = None,
+    progress_callback: ParseProgressCallback | None = None,
+) -> ParsedDocument:
+    settings = _get_paddleocr_vl15_runtime_settings()
+    return _parse_pdf_with_local_paddleocr_vl15(
+        data,
+        filename,
+        max_pages=max_pages,
+        progress_callback=progress_callback,
+        settings=settings,
+    )
+
+
+def _parse_pdf_with_local_paddleocr_vl15(
+    data: bytes,
+    filename: str,
+    *,
+    max_pages: int | None = None,
+    progress_callback: ParseProgressCallback | None = None,
+    settings: dict[str, Any],
+) -> ParsedDocument:
+    pipeline = _get_local_paddleocr_vl15_pipeline(settings)
+
+    total_page_count = _safe_pdf_page_count(data)
+    request_bytes = data
+    target_page_count = total_page_count
+    warnings: list[str] = []
+    if max_pages is not None:
+        request_bytes, total_page_count, target_page_count = _slice_pdf_bytes(data, max_pages=max_pages)
+        if total_page_count is not None and target_page_count is not None and total_page_count > target_page_count:
+            warnings.append(f"VL1.5 preview limited to first {target_page_count} of {total_page_count} pages.")
+
+    effective_page_count = target_page_count or total_page_count or 0
+    if progress_callback is not None:
+        progress_callback(
+            "vl15",
+            15,
+            {
+                "status": "initializing",
+                "done_pages": 0,
+                "total_pages": effective_page_count,
+                "device": settings["device"],
+            },
+        )
+
+    page_results: list[Any] = []
+    restructure_result: Any | None = None
+    restructure_warning = ""
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=Path(filename).suffix or ".pdf")
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(request_bytes)
+            tmp.flush()
+
+        with PADDLE_OCR_LOCK:
+            for index, page_result in enumerate(
+                pipeline.predict(
+                    input=tmp_path,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_layout_detection=True,
+                    use_chart_recognition=False,
+                    use_seal_recognition=False,
+                    format_block_content=False,
+                    merge_layout_blocks=True,
+                ),
+                start=1,
+            ):
+                page_results.append(page_result)
+                if progress_callback is not None:
+                    progress_callback(
+                        "vl15",
+                        min(62, 15 + int((index / max(1, effective_page_count or index)) * 47)),
+                        {
+                            "status": "page_parsed",
+                            "done_pages": index,
+                            "total_pages": effective_page_count or index,
+                            "device": settings["device"],
+                        },
+                    )
+
+            if page_results:
+                merged_results = list(
+                    pipeline.restructure_pages(
+                        page_results,
+                        merge_tables=True,
+                        relevel_titles=True,
+                        concatenate_pages=True,
+                    )
+                )
+                if merged_results:
+                    restructure_result = merged_results[0]
+    except Exception as exc:
+        raise RuntimeError(f"本地 PaddleOCR-VL1.5 GPU 解析失败：{exc}") from exc
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    if not page_results:
+        return ParsedDocument(
+            text="",
+            markdown="",
+            provider=PADDLEOCR_VL15_PROVIDER,
+            used_ocr=True,
+            warnings=["parse_preset=vl15", *warnings, "PaddleOCR-VL1.5 returned no page results."],
+        )
+
+    if progress_callback is not None:
+        progress_callback(
+            "vl15",
+            72,
+            {
+                "status": "restructured" if restructure_result is not None else "layout_ready",
+                "done_pages": len(page_results),
+                "total_pages": len(page_results),
+                "device": settings["device"],
+            },
+        )
+
+    document = _document_from_local_vl15_results(
+        page_results,
+        restructure_result,
+        source_bytes=request_bytes,
+        filename=filename,
+        warnings=warnings,
+    )
+    if restructure_warning:
+        document.warnings.append(restructure_warning)
+    document.warnings.insert(1, f"vl15_device={settings['device']}")
+    document.warnings.insert(0, "parse_preset=vl15")
+    return document
+
+
+def _document_from_local_vl15_results(
+    page_results: list[Any],
+    restructure_result: Any | None,
+    *,
+    source_bytes: bytes,
+    filename: str,
+    warnings: list[str] | None = None,
+) -> ParsedDocument:
+    pages: list[ParsedPage] = []
+    markdown_images: dict[str, Any] = {}
+
+    for fallback_page_number, page_result in enumerate(page_results, start=1):
+        page_number = _local_vl15_page_number(page_result, fallback_page_number)
+        markdown_bundle = _local_vl15_markdown_bundle(page_result)
+        page_markdown = str(markdown_bundle.get("markdown_texts") or "").strip()
+        page_markdown_images = _extract_markdown_image_payload(markdown_bundle.get("markdown_images"))
+        if page_markdown_images:
+            prefixed_images, path_mapping = _prefix_markdown_image_paths(page_markdown_images, page_number=page_number)
+            markdown_images.update(prefixed_images)
+            page_markdown = _replace_markdown_image_paths(page_markdown, path_mapping)
+        else:
+            page_markdown = _strip_pdf_image_markup(page_markdown)
+        page_blocks = _local_vl15_blocks(page_result, page_number)
+        page_text = _markdown_to_text(page_markdown).strip()
+        if not page_text:
+            page_text = "\n".join(block.text for block in page_blocks if block.text.strip()).strip()
+        if not page_blocks and page_text:
+            page_blocks = _synthetic_blocks_from_text(page_text, page_number)
+        pages.append(
+            ParsedPage(
+                page_number=page_number,
+                width=float(page_result.get("width") or 0.0),
+                height=float(page_result.get("height") or 0.0),
+                text=page_text,
+                markdown=page_markdown or page_text,
+                blocks=page_blocks,
+            )
+        )
+
+    merged_markdown = ""
+    merged_text = ""
+    if restructure_result is not None:
+        merged_markdown_bundle = _local_vl15_markdown_bundle(restructure_result)
+        merged_markdown = str(merged_markdown_bundle.get("markdown_texts") or "").strip()
+        merged_markdown_images = _extract_markdown_image_payload(merged_markdown_bundle.get("markdown_images"))
+        if merged_markdown_images:
+            prefixed_images, path_mapping = _prefix_markdown_image_paths(merged_markdown_images, page_number=0)
+            markdown_images.update(prefixed_images)
+            merged_markdown = _replace_markdown_image_paths(merged_markdown, path_mapping)
+        else:
+            merged_markdown = _strip_pdf_image_markup(merged_markdown)
+        merged_text = _markdown_to_text(merged_markdown).strip()
+
+    if not merged_markdown:
+        merged_markdown = "\n\n".join(page.markdown for page in pages if page.markdown.strip())
+    if not merged_text:
+        merged_text = _markdown_to_text(merged_markdown).strip()
+    if not merged_text:
+        merged_text = "\n\n".join(page.text for page in pages if page.text.strip())
+
+    document = ParsedDocument(
+        text=merged_text.strip(),
+        markdown=(merged_markdown.strip() or merged_text.strip()),
+        provider=PADDLEOCR_VL15_PROVIDER,
+        used_ocr=True,
+        pages=pages,
+        warnings=list(warnings or []),
+        markdown_images=markdown_images,
+    )
+    if markdown_images:
+        assets_root = _build_vl15_assets_root(source_bytes, filename)
+        roots = _persist_markdown_images(markdown_images, assets_root)
+        document.markdown_image_roots = roots
+        document.markdown_images = {}
+    return document
+
+
+def _local_vl15_page_number(result: Any, fallback_page_number: int) -> int:
+    raw_page_index = result.get("page_index")
+    if isinstance(raw_page_index, int) and raw_page_index >= 0:
+        return raw_page_index + 1
+    return fallback_page_number
+
+
+def _local_vl15_markdown_bundle(result: Any) -> dict[str, Any]:
+    payload = getattr(result, "markdown", None)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _local_vl15_blocks(result: Any, page_number: int) -> list[ParsedBlock]:
+    parsed_blocks: list[ParsedBlock] = []
+    for index, block in enumerate(result.get("parsing_res_list") or [], start=1):
+        text = _strip_pdf_image_markup(str(getattr(block, "content", "") or "")).strip()
+        block_type = str(getattr(block, "label", "") or "text")
+        bbox = [
+            float(value)
+            for value in (getattr(block, "bbox", None) or [])
+            if isinstance(value, (int, float))
+        ]
+        parsed_blocks.append(
+            ParsedBlock(
+                page_number=page_number,
+                block_id=f"p{page_number}-vl15-{index}",
+                text=text,
+                bbox=bbox if len(bbox) == 4 else [],
+                block_type=block_type,
+            )
+        )
+    return parsed_blocks
+
+
+def _get_local_paddleocr_vl15_pipeline(settings: dict[str, Any]):
+    pipeline = getattr(_get_local_paddleocr_vl15_pipeline, "_pipeline", None)
+    cached_device = getattr(_get_local_paddleocr_vl15_pipeline, "_device", None)
+    if pipeline is not None and cached_device == settings["device"]:
+        return pipeline
+
+    with PADDLE_OCR_LOCK:
+        pipeline = getattr(_get_local_paddleocr_vl15_pipeline, "_pipeline", None)
+        cached_device = getattr(_get_local_paddleocr_vl15_pipeline, "_device", None)
+        if pipeline is not None and cached_device == settings["device"]:
+            return pipeline
+
+        _prepare_local_paddleocr_vl15_env(settings)
+        from paddlex import create_pipeline
+
+        pipeline = create_pipeline(
+            pipeline="PaddleOCR-VL-1.5",
+            device=settings["device"],
+        )
+        _get_local_paddleocr_vl15_pipeline._touched = True
+        _get_local_paddleocr_vl15_pipeline._pipeline = pipeline
+        _get_local_paddleocr_vl15_pipeline._device = settings["device"]
+        return pipeline
+
+
+def _prepare_local_paddleocr_vl15_env(settings: dict[str, Any]) -> None:
+    os.environ[PADDLEOCR_VL15_CACHE_HOME_ENV] = str(settings["cache_home"])
+    os.environ[PADDLEOCR_VL15_MODEL_SOURCE_ENV] = str(settings["model_source"])
+    os.environ[PADDLEOCR_VL15_DISABLE_MODEL_SOURCE_CHECK_ENV] = (
+        "true" if settings["disable_model_source_check"] else "false"
+    )
+    os.environ[PADDLEOCR_VL15_DISABLE_DEVICE_FALLBACK_ENV] = "true"
+    import paddle
+
+    _ensure_paddle_dynamic_mode(paddle)
+    paddle.device.set_device(settings["device"])
+    _patch_paddle_bfloat16_support(settings["device"])
+
+
+def _get_paddleocr_vl15_runtime_settings() -> dict[str, Any]:
+    raw_cache_home = Path(
+        os.getenv(PADDLEOCR_VL15_CACHE_HOME_ENV, "").strip() or PROJECT_ROOT / "data" / "cache" / "paddlex"
+    )
+    raw_cache_home.mkdir(parents=True, exist_ok=True)
+    cache_home = Path(_normalize_windows_short_path(raw_cache_home))
+    cache_home.mkdir(parents=True, exist_ok=True)
+    return {
+        "device": os.getenv(PADDLEOCR_VL15_DEVICE_ENV, "").strip() or _detect_local_paddleocr_vl15_device(),
+        "cache_home": cache_home,
+        "model_source": os.getenv(PADDLEOCR_VL15_MODEL_SOURCE_ENV, "modelscope").strip() or "modelscope",
+        "disable_model_source_check": _parse_bool_env(
+            os.getenv(PADDLEOCR_VL15_DISABLE_MODEL_SOURCE_CHECK_ENV),
+            default=True,
+        ),
+    }
+
+
+def _detect_local_paddleocr_vl15_device() -> str:
+    import paddle
+
+    if paddle.device.is_compiled_with_cuda():
+        try:
+            if int(paddle.device.cuda.device_count()) > 0:
+                return "gpu:0"
+        except Exception:
+            pass
+    raise RuntimeError("当前未检测到可用 Paddle GPU 设备，VL1.5 本地模式已按 GPU 版配置，无法回退到 CPU。")
+
+
+def _parse_bool_env(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_windows_short_path(path: Path) -> str:
+    resolved = str(path.resolve())
+    if os.name != "nt":
+        return resolved
+    try:
+        from ctypes import create_unicode_buffer, windll
+    except Exception:
+        return resolved
+
+    buffer = create_unicode_buffer(4096)
+    result = windll.kernel32.GetShortPathNameW(resolved, buffer, len(buffer))
+    if result > 0 and buffer.value:
+        return buffer.value
+    return resolved
+
+
+def _ensure_paddle_dynamic_mode(paddle_module: Any) -> None:
+    if paddle_module.in_dynamic_mode():
+        return
+    paddle_module.disable_static()
+
+
+def _patch_paddle_bfloat16_support(device: str) -> None:
+    if getattr(_patch_paddle_bfloat16_support, "_patched_device", None) == device:
+        return
+
+    import paddle
+
+    original = getattr(paddle.amp, "is_bfloat16_supported", None)
+    if original is None:
+        return
+
+    def patched(place: Any = None) -> bool:
+        if place is not None:
+            return original(place)
+        try:
+            return original()
+        except TypeError:
+            pass
+        except Exception as exc:
+            if "Place(undefined:0)" not in str(exc):
+                raise
+
+        device_type, device_ids = _parse_vl15_device(device)
+        if device_type == "gpu":
+            return original(paddle.CUDAPlace(device_ids[0] if device_ids else 0))
+        if device_type == "cpu":
+            return original(paddle.CPUPlace())
+        return False
+
+    paddle.amp.is_bfloat16_supported = patched
+    _patch_paddle_bfloat16_support._patched_device = device
+
+
+def _parse_vl15_device(device: str) -> tuple[str, list[int]]:
+    raw = (device or "").strip().lower()
+    if raw.startswith("gpu"):
+        if ":" in raw:
+            try:
+                return "gpu", [int(raw.split(":", 1)[1])]
+            except ValueError:
+                return "gpu", [0]
+        return "gpu", [0]
+    if raw.startswith("cpu"):
+        return "cpu", []
+    return raw, []
+
+def _safe_pdf_page_count(data: bytes) -> int | None:
+    try:
+        return _get_pdf_page_count(data)
+    except Exception:
+        return None
+
+
+def _slice_pdf_bytes(pdf_bytes: bytes, *, max_pages: int) -> tuple[bytes, int | None, int | None]:
+    total_page_count = _safe_pdf_page_count(pdf_bytes)
+    if total_page_count is None or total_page_count <= max_pages:
+        return pdf_bytes, total_page_count, total_page_count
+    try:
+        import pymupdf
+    except Exception:
+        import fitz as pymupdf
+
+    source = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        target = pymupdf.open()
+        try:
+            target.insert_pdf(source, from_page=0, to_page=max_pages - 1)
+            return target.tobytes(garbage=4, deflate=True), total_page_count, max_pages
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+
+def _build_vl15_assets_root(source_bytes: bytes, filename: str) -> Path:
+    payload = hashlib.sha1(source_bytes).hexdigest()
+    stem = Path(filename).stem or "document"
+    safe_stem = re.sub(r"[^0-9A-Za-z._-]+", "_", stem).strip("_") or "document"
+    return _get_pdf_ocr_checkpoint_root() / "vl15_assets" / payload[:2] / f"{payload}_{safe_stem}"
 def _document_from_ocr_result(result: Any, warnings_prefix: list[str] | None = None) -> ParsedDocument:
     pages = [
         ParsedPage(
@@ -420,39 +857,22 @@ def _parse_pdf(
     progress_callback: ParseProgressCallback | None = None,
     cache_namespace: str | None = None,
 ) -> ParsedDocument:
-    direct = _extract_selectable_pdf_text(data)
-    if direct is not None and _document_has_meaningful_text(direct):
-        direct.provider = "pymupdf_text"
-        direct.used_ocr = False
-        return direct
-
-    parsed = _document_from_ocr_result(
+    return _document_from_ocr_result(
         run_pdf_ocr_pipeline(
             data,
             filename,
             options=OCRPipelineOptions(
                 force_ocr=True,
-                render_dpi=240,
+                render_dpi=320,
                 cache_namespace=cache_namespace,
                 trim_margins=True,
                 remove_repeated_lines=True,
-                watermark_detection=False,
+                watermark_detection=True,
             ),
             progress_callback=_ocr_progress_callback(progress_callback),
         ),
-        warnings_prefix=["parse_preset=auto_ocr_fallback"],
+        warnings_prefix=["parse_preset=v3"],
     )
-    if _document_has_meaningful_text(parsed):
-        if direct is not None:
-            parsed.warnings.insert(0, "Selectable PDF text was insufficient; OCR fallback was used.")
-        return parsed
-
-    warnings = ["Selectable PDF text was insufficient and OCR fallback returned no text."]
-    warnings.extend(parsed.warnings)
-    if direct is not None:
-        direct.warnings.extend(warnings)
-        return direct
-    return ParsedDocument(text="", markdown="", provider="unavailable", warnings=warnings)
 
 
 def _ocr_progress_callback(
@@ -491,7 +911,7 @@ def _parse_docx(data: bytes) -> ParsedDocument:
         return ParsedDocument(text=warning, markdown=warning, provider="docx_text", warnings=[warning])
 
 
-def _parse_image(data: bytes, suffix: str) -> ParsedDocument:
+def _parse_image(data: bytes, suffix: str, *, options: DocumentParseOptions | None = None) -> ParsedDocument:
     with PADDLE_OCR_LOCK:
         parsed = _parse_with_pp_structure(data, suffix or ".png")
         if parsed is not None:
@@ -1218,6 +1638,35 @@ def _replace_markdown_image_paths(content: str, path_mapping: dict[str, str]) ->
     return updated
 
 
+def _strip_pdf_embedded_image_content(document: ParsedDocument) -> ParsedDocument:
+    document.text = _strip_pdf_image_markup(document.text)
+    document.markdown = _strip_pdf_image_markup(document.markdown)
+    document.raw_text = _strip_pdf_image_markup(document.raw_text)
+    document.raw_markdown = _strip_pdf_image_markup(document.raw_markdown)
+    document.markdown_images = {}
+    document.markdown_image_roots = []
+    for page in document.pages:
+        page.text = _strip_pdf_image_markup(page.text)
+        page.markdown = _strip_pdf_image_markup(page.markdown)
+        for block in page.blocks:
+            block.text = _strip_pdf_image_markup(block.text)
+    for table in document.tables:
+        table.markdown = _strip_pdf_image_markup(table.markdown)
+        table.html = PDF_IMAGE_HTML_PATTERN.sub("", table.html or "").strip()
+    return document
+
+
+def _strip_pdf_image_markup(content: str) -> str:
+    if not content:
+        return content
+    updated = PDF_IMAGE_MARKDOWN_PATTERN.sub("", content)
+    updated = PDF_IMAGE_HTML_PATTERN.sub("", updated)
+    updated = PDF_IMAGE_PATH_PATTERN.sub("", updated)
+    updated = re.sub(r"[ \t]+\n", "\n", updated)
+    updated = re.sub(r"\n{3,}", "\n\n", updated)
+    return updated.strip()
+
+
 def _persist_markdown_images(markdown_images: dict[str, Any], output_root: Path) -> list[str]:
     if not markdown_images:
         return []
@@ -1227,6 +1676,20 @@ def _persist_markdown_images(markdown_images: dict[str, Any], output_root: Path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if hasattr(image, "save"):
             image.save(target_path)
+            continue
+        if isinstance(image, (bytes, bytearray)):
+            target_path.write_bytes(bytes(image))
+            continue
+        if isinstance(image, str):
+            raw = image.strip()
+            if not raw:
+                continue
+            if raw.startswith("data:") and "," in raw:
+                raw = raw.split(",", 1)[1]
+            try:
+                target_path.write_bytes(base64.b64decode(raw))
+            except Exception:
+                continue
     return [str(output_root)]
 
 
@@ -1295,9 +1758,22 @@ def release_paddle_parser_resources() -> None:
             getattr(_get_pp_structure_pipeline, "_pipeline", None) is not None
             or getattr(_get_pp_structure_pipeline, "_touched", False)
         )
+        local_vl15_pipeline = getattr(_get_local_paddleocr_vl15_pipeline, "_pipeline", None)
+        had_local_vl15 = (
+            local_vl15_pipeline is not None
+            or getattr(_get_local_paddleocr_vl15_pipeline, "_touched", False)
+        )
+        if local_vl15_pipeline is not None and hasattr(local_vl15_pipeline, "close"):
+            try:
+                local_vl15_pipeline.close()
+            except Exception:
+                pass
+        _get_local_paddleocr_vl15_pipeline._pipeline = None
+        _get_local_paddleocr_vl15_pipeline._device = None
+        _get_local_paddleocr_vl15_pipeline._touched = False
         _get_pp_structure_pipeline._pipeline = None
         _get_pp_structure_pipeline._touched = False
-        release_paddle_ocr_resources(force_clear_cache=had_pp_structure)
+        release_paddle_ocr_resources(force_clear_cache=(had_pp_structure or had_local_vl15))
 
 
 def _patch_paddleocr_common_args() -> None:
